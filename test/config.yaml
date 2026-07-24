@@ -1,0 +1,101 @@
+# Formal Native/Agent performance campaign on three dedicated physical cores.
+
+libvirt:
+  uri: qemu:///system
+  template_image: /var/lib/libvirt/images/aoa-lab/template.qcow2
+  runtime_dir: /tmp/aoa-test-runs
+  ssh_user: root
+  ssh_key: test/.local/ssh/test_ed25519
+  ssh_port: 22
+  guest_output_dir: /bench_out
+  network: default
+  vm_warmup_seconds: 2
+  boot_timeout_seconds: 90
+  timeout_extra_seconds: 30
+  cpu_mode: host-passthrough
+  required_cpu_features:
+    - topoext
+
+machines:
+  formal_performance:
+    vcpus: 6
+    memory: 3G
+    pin_cpus: "6-11"
+    emulator_cpus: "0-5"
+    topology:
+      sockets: 1
+      cores: 3
+      threads: 2
+    frequency:
+      governor: performance
+      khz: 3300000
+
+schedulers:
+  default:
+    kind: builtin
+
+  adaptive_agent_performance:
+    kind: agent
+    tool_socket: /run/adaptive-os-agent-tools.sock
+    command: /opt/Adaptive-OS-Agent/adaptive-os-agent
+    args:
+      - --config
+      - /opt/Adaptive-OS-Agent/configs/agent.performance.toml
+      - --scheduler-bin
+      - /opt/Adaptive-OS-Agent/scx_adaptive
+      - --snapshot-file
+      - /bench_out/scheduler-snapshot.json
+    expected_ops: scx_adaptive
+    snapshot_file: /bench_out/scheduler-snapshot.json
+    warmup_seconds: 3
+    stop_signal: TERM
+    stop_timeout_seconds: 60
+    timeout_extra_seconds: 90
+    require_process_llm: true
+    require_thread_llm: true
+    files:
+      - source: Adaptive-OS-Agent/target/release/adaptive-os-agent
+        target: /opt/Adaptive-OS-Agent/adaptive-os-agent
+        executable: true
+      - source: test/configs/agent.performance.toml
+        target: /opt/Adaptive-OS-Agent/configs/agent.performance.toml
+      - source: scheduler/rust/target/release/scx_adaptive
+        target: /opt/Adaptive-OS-Agent/scx_adaptive
+        executable: true
+    secret_files:
+      - source: Adaptive-OS-Agent/configs/deepseek.env
+        target: /run/aoa-secrets/deepseek.env
+        required_env: DEEPSEEK_API_KEY
+
+performance:
+  machine: formal_performance
+  variants:
+    native: default
+    agent: adaptive_agent_performance
+  repeats: 3
+  seed: 20260721
+  warmup_seconds: 20
+  measurement_seconds: 60
+  cooldown_seconds: 3
+  sample_interval_seconds: 1
+  require_perf: true
+  perf_events:
+    - task-clock
+    - context-switches
+    - cpu-migrations
+    - page-faults
+    - cycles
+    - instructions
+    - cache-references
+    - cache-misses
+  bootstrap_samples: 2000
+  workload:
+    kind: baked-real-apps
+    service: aoa-real-workload-autostart.service
+    result_root: /bench_out/benchmark/real-workloads
+    ready_file: /run/aoa-scheduler-ready
+    window_file: /run/aoa-workload-window
+    targets_file: /bench_out/benchmark/real-workloads/targets.jsonl
+  collector:
+    source: test/guest_tools/benchmark_collector.py
+    target: /opt/aoa-test/bin/benchmark_collector.py

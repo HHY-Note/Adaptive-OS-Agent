@@ -1,0 +1,14 @@
+[Unit]
+Description=AOA real application workload dispatcher
+After=network.target sshd.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/aoa-real-workload --from-dmi
+TimeoutStartSec=infinity
+KillMode=control-group
+SendSIGKILL=yes
+RemainAfterExit=no
+
+[Install]
+WantedBy=multi-user.target

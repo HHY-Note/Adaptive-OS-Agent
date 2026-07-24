@@ -1,0 +1,38 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Rust build output
+target/
+
+# Local Agent config
+Adaptive-OS-Agent/configs/*.local.toml
+Adaptive-OS-Agent/configs/deepseek.env
+.env
+.env.*
+!.env.example
+
+# Test runtime output and local VM login keys
+test/output/
+test/.local/
+
+# VM and installer artifacts
+*.qcow2
+*.iso
+*.img
+*.raw
+*.seed
+
+# External reference projects / cloned upstream repositories
+scx_agent/
+
+# Editor and OS files
+.git/
+.agents/
+.codex/
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store

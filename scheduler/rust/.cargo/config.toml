@@ -1,0 +1,6 @@
+[env]
+# The development host's unversioned clang is 14, which corrupts sched_ext's
+# 64-bit enum constants for BPF. Callers may still override this environment
+# variable explicitly when the locked clang 17 toolchain is available.
+BPF_CLANG = { value = "clang-16", force = false }
+

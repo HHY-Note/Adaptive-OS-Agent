@@ -1,0 +1,9 @@
+[deepseek]
+api_key_file = "/run/aoa-secrets/deepseek.env"
+max_retries = 1
+worker_count = 3
+
+[classification]
+# Keep behavior fallback outside the t=20 classification snapshot so the
+# snapshot reports semantic process/thread results rather than forced locks.
+behavior_lock_timeout_secs = 240

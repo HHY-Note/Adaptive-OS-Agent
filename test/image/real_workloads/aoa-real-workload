@@ -1,0 +1,457 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# This dispatcher deliberately does not set affinity, nice values, cgroups, or
+# scheduler knobs.  It creates pressure solely by running ordinary applications.
+readonly RESULT_ROOT=/bench_out/benchmark/real-workloads
+readonly RUNTIME_ROOT=/var/tmp/aoa-real-workloads
+readonly RUN_ROOT=/run/aoa-real-workloads
+readonly READY_FILE=/run/aoa-scheduler-ready
+readonly WINDOW_FILE=/run/aoa-workload-window
+readonly BIN_ROOT=/opt/aoa-workloads/bin
+readonly LLVM_CORPUS=/opt/openEuler/llvm-toolset-21/root/usr/lib64/libLLVM.so.21.1
+
+server_pids=()
+job_pids=()
+job_names=()
+VCPUS=1
+PRESSURE_CPUS=1
+CLIENT_THREADS=1
+CLIENTS=2
+
+log() {
+    printf '[aoa-workload] %s\n' "$*"
+}
+
+profile_from_dmi() {
+    local serial
+    serial="$(tr -d '\n' </sys/class/dmi/id/product_serial 2>/dev/null || true)"
+    case "$serial" in
+        aoa-profile-latency) printf 'latency' ;;
+        aoa-profile-throughput) printf 'throughput' ;;
+        aoa-profile-mix) printf 'mix' ;;
+        *) return 1 ;;
+    esac
+}
+
+cleanup() {
+    local pid
+    for pid in "${job_pids[@]:-}" "${server_pids[@]:-}"; do
+        [ -n "$pid" ] || continue
+        kill -TERM "$pid" 2>/dev/null || true
+    done
+    sleep 1
+    for pid in "${job_pids[@]:-}" "${server_pids[@]:-}"; do
+        [ -n "$pid" ] || continue
+        kill -KILL "$pid" 2>/dev/null || true
+        wait "$pid" 2>/dev/null || true
+    done
+}
+trap cleanup EXIT INT TERM
+
+scaled_rate() {
+    local base="$1"
+    local rate=$((base * PRESSURE_CPUS / 5))
+    [ "$rate" -ge 1 ] || rate=1
+    printf '%s\n' "$rate"
+}
+
+start_server() {
+    local name="$1"
+    shift
+    log "starting server: $name"
+    "$@" >"$RESULT_ROOT/${name}.stdout" 2>"$RESULT_ROOT/${name}.stderr" &
+    server_pids+=("$!")
+}
+
+wait_for() {
+    local label="$1"
+    shift
+    local attempt
+    for attempt in $(seq 1 100); do
+        if "$@" >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 0.1
+    done
+    log "server did not become ready: $label"
+    return 1
+}
+
+write_target() {
+    local pid="$1" name="$2" role="$3"
+    local start_ticks
+    start_ticks="$(awk '{print $22}' "/proc/$pid/stat" 2>/dev/null || printf 0)"
+    # Each record is smaller than PIPE_BUF and is appended by a direct child.
+    printf '{"pid":%s,"start_ticks":%s,"name":"%s","role":"%s"}\n' \
+        "$pid" "$start_ticks" "$name" "$role" \
+        >>"$RESULT_ROOT/targets.jsonl"
+}
+
+run_job() {
+    local name="$1" role="$2" phase="$3"
+    shift 3
+    local directory="$RESULT_ROOT/apps/$name"
+    install -d -m 0755 "$directory"
+    printf '%s\n' "$role" >"$directory/role"
+    printf '%s\n' "$phase" >"$directory/phase"
+    (
+        set +e
+        /usr/bin/time -q -f '%e' -o "$directory/elapsed_seconds" \
+            "$@" >"$directory/stdout" 2>"$directory/stderr" &
+        local_pid=$!
+        if [ "$phase" = measurement ]; then
+            write_target "$local_pid" "$name" "$role"
+        fi
+        wait "$local_pid"
+        printf '%s\n' "$?" >"$directory/exit_code"
+    ) &
+    job_pids+=("$!")
+    job_names+=("$name")
+}
+
+wait_jobs() {
+    local failed=0
+    local index rc
+    for index in "${!job_pids[@]}"; do
+        wait "${job_pids[$index]}" || true
+        rc="$(cat "$RESULT_ROOT/apps/${job_names[$index]}/exit_code" 2>/dev/null || printf 255)"
+        if [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ]; then
+            log "job failed: ${job_names[$index]} rc=$rc"
+            failed=1
+        fi
+    done
+    job_pids=()
+    job_names=()
+    return "$failed"
+}
+
+redis_job() {
+    local name="$1" role="$2" phase="$3" duration="$4" rate="$5"
+    run_job "$name" "$role" "$phase" "$BIN_ROOT/memtier_benchmark" \
+        --server=127.0.0.1 --port=16379 --protocol=redis \
+        --threads="$CLIENT_THREADS" --clients="$CLIENTS" --ratio=1:9 --data-size=256 \
+        --key-minimum=1 --key-maximum=20000 --key-pattern=R:R \
+        --rate-limiting="$rate" --test-time="$duration" \
+        --print-percentiles=50,90,99,99.9,99.99 \
+        --json-out-file="$RESULT_ROOT/apps/$name/result.json" \
+        --hdr-file-prefix="$RESULT_ROOT/apps/$name/latency"
+}
+
+memcached_job() {
+    local name="$1" phase="$2" duration="$3" rate="$4"
+    run_job "$name" latency "$phase" "$BIN_ROOT/memtier_benchmark" \
+        --server=127.0.0.1 --port=11212 --protocol=memcache_binary \
+        --threads="$CLIENT_THREADS" --clients="$CLIENTS" --ratio=1:9 --data-size=256 \
+        --key-minimum=1 --key-maximum=20000 --key-pattern=R:R \
+        --rate-limiting="$rate" --test-time="$duration" \
+        --print-percentiles=50,90,99,99.9,99.99 \
+        --json-out-file="$RESULT_ROOT/apps/$name/result.json" \
+        --hdr-file-prefix="$RESULT_ROOT/apps/$name/latency"
+}
+
+nginx_job() {
+    local name="$1" phase="$2" duration="$3" rate="$4"
+    local connections=$((CLIENT_THREADS * 8))
+    run_job "$name" latency "$phase" "$BIN_ROOT/wrk2" -t"$CLIENT_THREADS" \
+        -c"$connections" -d"${duration}s" -R"$rate" --latency \
+        http://127.0.0.1:18080/index.html
+}
+
+postgres_job() {
+    local name="$1" phase="$2" duration="$3" rate="$4"
+    local clients=$((CLIENTS * 2))
+    run_job "$name" latency "$phase" /usr/bin/pgbench \
+        -h 127.0.0.1 -p 15432 -U postgres -d aoa_bench \
+        -c"$clients" -j"$CLIENT_THREADS" -T"$duration" -R"$rate" \
+        --latency-limit=20 --log --log-prefix="$RESULT_ROOT/apps/$name/pgbench_log"
+}
+
+nats_job() {
+    local name="$1" phase="$2" duration="$3"
+    run_job "$name" balanced "$phase" bash -c '
+deadline=$((SECONDS + $1)); iterations=0; batch_size=100000
+while [ "$SECONDS" -lt "$deadline" ]; do
+    "$2" bench pub aoa.mix --server=nats://127.0.0.1:14222 \
+        --msgs="$batch_size" --size=128 >/dev/null || exit $?
+    iterations=$((iterations + 1))
+done
+printf "iterations=%s\nwork_units=%s\n" \
+    "$iterations" "$((iterations * batch_size))"
+' aoa-nats "$duration" "$BIN_ROOT/nats"
+}
+
+etcd_job() {
+    local name="$1" phase="$2" duration="$3"
+    run_job "$name" balanced "$phase" env ETCDCTL_API=3 timeout --signal=TERM --kill-after=2 \
+        "$duration" /usr/bin/etcdctl --endpoints=http://127.0.0.1:12379 check perf
+}
+
+clear_etcd_perf_state() {
+    ETCDCTL_API=3 /usr/bin/etcdctl --endpoints=http://127.0.0.1:12379 \
+        del --prefix /etcdctl-check-perf/ >/dev/null
+}
+
+ffmpeg_job() {
+    local name="$1" phase="$2" duration="$3" threads="$4"
+    run_job "$name" throughput "$phase" bash -c '
+deadline=$((SECONDS + $1)); iterations=0
+while [ "$SECONDS" -lt "$deadline" ]; do
+    ffmpeg -nostdin -hide_banner -loglevel error -f lavfi \
+        -i testsrc2=size=1920x1080:rate=60 -t 2 \
+        -c:v mpeg4 -q:v 4 -threads "$2" -f null - || exit $?
+    iterations=$((iterations + 1))
+done
+printf "iterations=%s\\n" "$iterations"
+' aoa-ffmpeg "$duration" "$threads"
+}
+
+rocksdb_job() {
+    local name="$1" phase="$2" duration="$3" threads="$4"
+    run_job "$name" throughput "$phase" "$BIN_ROOT/db_bench" \
+        --db="$RUNTIME_ROOT/rocksdb" --benchmarks=readrandomwriterandom \
+        --duration="$duration" --threads="$threads" --num=200000 \
+        --value_size=256 --cache_size=134217728 --statistics=0
+}
+
+zstd_job() {
+    local name="$1" role="$2" phase="$3" duration="$4" threads="$5"
+    run_job "$name" "$role" "$phase" bash -c '
+deadline=$((SECONDS + $1)); iterations=0
+while [ "$SECONDS" -lt "$deadline" ]; do
+    zstd -q -T"$2" -c "$3" >/dev/null || exit $?
+    iterations=$((iterations + 1))
+done
+printf "iterations=%s\\n" "$iterations"
+' aoa-zstd "$duration" "$threads" "$LLVM_CORPUS"
+}
+
+openssl_job() {
+    local name="$1" phase="$2" duration="$3" workers="$4"
+    run_job "$name" throughput "$phase" /usr/bin/openssl speed -elapsed \
+        -seconds "$duration" -multi "$workers" -evp aes-256-gcm -bytes 16384
+}
+
+imagemagick_job() {
+    local name="$1" phase="$2" duration="$3"
+    run_job "$name" throughput "$phase" bash -c '
+deadline=$((SECONDS + $1)); iterations=0
+while [ "$SECONDS" -lt "$deadline" ]; do
+    magick -size 1920x1080 plasma:fractal -blur 0x2 -resize 1280x720 null: || exit $?
+    iterations=$((iterations + 1))
+done
+printf "iterations=%s\\n" "$iterations"
+' aoa-imagemagick "$duration"
+}
+
+build_job() {
+    local name="$1" phase="$2" duration="$3" threads="$4"
+    run_job "$name" throughput "$phase" bash -c '
+deadline=$((SECONDS + $1)); iterations=0
+while [ "$SECONDS" -lt "$deadline" ]; do
+    make -C /opt/aoa-workloads/src/memtier clean >/dev/null || exit $?
+    make -C /opt/aoa-workloads/src/memtier -j"$2" >/dev/null || exit $?
+    iterations=$((iterations + 1))
+done
+printf "iterations=%s\\n" "$iterations"
+' aoa-build "$duration" "$threads"
+}
+
+launch_jobs() {
+    local profile="$1" duration="$2" phase="$3"
+    rm -rf "$RESULT_ROOT/apps"
+    install -d -m 0755 "$RESULT_ROOT/apps"
+    : >"$RESULT_ROOT/targets.jsonl"
+    if [ "$profile" = mix ]; then
+        clear_etcd_perf_state
+    fi
+    case "$profile" in
+        latency)
+            redis_job redis latency "$phase" "$duration" "$(scaled_rate 3500)"
+            memcached_job memcached "$phase" "$duration" "$(scaled_rate 3000)"
+            nginx_job nginx "$phase" "$duration" "$(scaled_rate 6000)"
+            postgres_job postgresql "$phase" "$duration" "$(scaled_rate 300)"
+            zstd_job zstd-background throughput "$phase" "$duration" 1
+            ;;
+        throughput)
+            redis_job redis-sentinel throughput "$phase" "$duration" "$(scaled_rate 750)"
+            ffmpeg_job ffmpeg "$phase" "$duration" "$CLIENT_THREADS"
+            [ "$PRESSURE_CPUS" -ge 2 ] && rocksdb_job rocksdb "$phase" "$duration" "$CLIENT_THREADS"
+            [ "$PRESSURE_CPUS" -ge 3 ] && zstd_job zstd throughput "$phase" "$duration" "$CLIENT_THREADS"
+            [ "$PRESSURE_CPUS" -ge 4 ] && openssl_job openssl "$phase" "$duration" "$CLIENT_THREADS"
+            [ "$PRESSURE_CPUS" -ge 5 ] && imagemagick_job imagemagick "$phase" "$duration"
+            ;;
+        mix)
+            redis_job redis latency "$phase" "$duration" "$(scaled_rate 2000)"
+            nginx_job nginx "$phase" "$duration" "$(scaled_rate 3500)"
+            postgres_job postgresql "$phase" "$duration" "$(scaled_rate 180)"
+            ffmpeg_job ffmpeg "$phase" "$duration" 1
+            [ "$PRESSURE_CPUS" -ge 2 ] && rocksdb_job rocksdb "$phase" "$duration" 1
+            [ "$PRESSURE_CPUS" -ge 3 ] && zstd_job zstd throughput "$phase" "$duration" 1
+            [ "$PRESSURE_CPUS" -ge 4 ] && imagemagick_job imagemagick "$phase" "$duration"
+            [ "$PRESSURE_CPUS" -ge 5 ] && etcd_job etcd "$phase" "$duration"
+            [ "$PRESSURE_CPUS" -ge 5 ] && nats_job nats "$phase" "$duration"
+            ;;
+    esac
+    wait_jobs
+    if [ "$phase" = warmup ]; then
+        rm -rf "$RESULT_ROOT/apps"
+    fi
+}
+
+start_profile_servers() {
+    local profile="$1"
+    start_server redis runuser -u aoa-workload -- /usr/bin/redis-server /etc/aoa-workloads/redis.conf
+    if [ "$profile" = latency ]; then
+        start_server memcached runuser -u aoa-workload -- /usr/bin/memcached -p 11212 -m 128 -c 1024 -U 0
+    fi
+    if [ "$profile" = mix ]; then
+        start_server etcd runuser -u aoa-workload -- /usr/bin/etcd \
+            --name=aoa --data-dir="$RUNTIME_ROOT/etcd" \
+            --listen-client-urls=http://127.0.0.1:12379 \
+            --advertise-client-urls=http://127.0.0.1:12379 \
+            --listen-peer-urls=http://127.0.0.1:12380 \
+            --initial-advertise-peer-urls=http://127.0.0.1:12380 \
+            --initial-cluster=aoa=http://127.0.0.1:12380
+    fi
+    if [ "$profile" != throughput ]; then
+        start_server nginx runuser -u aoa-workload -- /usr/sbin/nginx -e stderr \
+            -c /etc/aoa-workloads/nginx.conf -g 'daemon off;'
+        start_server postgresql runuser -u postgres -- /usr/bin/postgres \
+            -D /var/lib/aoa-workloads/postgres -k "$RUN_ROOT/pg" -p 15432 \
+            -c listen_addresses=127.0.0.1 -c shared_buffers=128MB \
+            -c fsync=off -c synchronous_commit=off -c full_page_writes=off
+    fi
+    if [ "$profile" = mix ]; then
+        start_server nats runuser -u aoa-workload -- "$BIN_ROOT/nats-server" \
+            --addr 127.0.0.1 --port 14222
+    fi
+
+    wait_for redis /usr/bin/redis-cli -h 127.0.0.1 -p 16379 ping
+    if [ "$profile" = latency ]; then
+        wait_for memcached bash -c 'exec 3<>/dev/tcp/127.0.0.1/11212'
+    fi
+    if [ "$profile" = mix ]; then
+        wait_for etcd env ETCDCTL_API=3 /usr/bin/etcdctl --endpoints=http://127.0.0.1:12379 endpoint health
+    fi
+    if [ "$profile" != throughput ]; then
+        wait_for nginx /usr/bin/curl --fail --silent http://127.0.0.1:18080/index.html
+        wait_for postgresql /usr/bin/pg_isready -h 127.0.0.1 -p 15432
+    fi
+    if [ "$profile" = mix ]; then
+        wait_for nats bash -c 'exec 3<>/dev/tcp/127.0.0.1/14222'
+    fi
+}
+
+prepare_data() {
+    local profile="$1"
+    "$BIN_ROOT/memtier_benchmark" --server=127.0.0.1 --port=16379 \
+        --protocol=redis --ratio=1:0 --requests=20000 --clients="$CLIENTS" \
+        --data-size=256 --key-minimum=1 --key-maximum=20000 \
+        --key-pattern=S:S >/dev/null
+    if [ "$profile" = latency ]; then
+        "$BIN_ROOT/memtier_benchmark" --server=127.0.0.1 --port=11212 \
+            --protocol=memcache_binary --ratio=1:0 --requests=20000 --clients="$CLIENTS" \
+            --data-size=256 --key-minimum=1 --key-maximum=20000 \
+            --key-pattern=S:S >/dev/null
+    fi
+    if [ "$profile" != latency ] && [ "$PRESSURE_CPUS" -ge 2 ]; then
+        "$BIN_ROOT/db_bench" --db="$RUNTIME_ROOT/rocksdb" --benchmarks=fillseq \
+            --num=200000 --value_size=256 --threads=1 --statistics=0 >/dev/null
+    fi
+}
+
+write_pressure_plan() {
+    python3 - "$RESULT_ROOT/pressure-plan.json" "$VCPUS" "$PRESSURE_CPUS" \
+        "$CLIENT_THREADS" "$CLIENTS" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+Path(sys.argv[1]).write_text(json.dumps({
+    "schema_version": 1,
+    "online_vcpus": int(sys.argv[2]),
+    "pressure_cpu_budget": int(sys.argv[3]),
+    "reserved_latency_cpu": 1 if int(sys.argv[2]) > 1 else 0,
+    "client_threads": int(sys.argv[4]),
+    "clients_per_thread": int(sys.argv[5]),
+}, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+PY
+}
+
+main() {
+    local profile="${1:-}"
+    if [ "$profile" = --from-dmi ]; then
+        if ! profile="$(profile_from_dmi)"; then
+            log 'no AOA workload profile in SMBIOS; staying idle'
+            return 0
+        fi
+    fi
+    case "$profile" in
+        latency|throughput|mix) ;;
+        *) printf 'usage: %s {latency|throughput|mix|--from-dmi}\n' "$0" >&2; return 2 ;;
+    esac
+
+    exec 9>/run/aoa-real-workload.lock
+    flock -n 9 || { log 'another workload run is active'; return 1; }
+    VCPUS="$(getconf _NPROCESSORS_ONLN)"
+    [ "$VCPUS" -ge 1 ] || VCPUS=1
+    PRESSURE_CPUS=$((VCPUS > 1 ? VCPUS - 1 : 1))
+    CLIENT_THREADS=$(((PRESSURE_CPUS + 1) / 2))
+    CLIENTS=$((CLIENT_THREADS * 2))
+    umask 022
+    rm -rf "$RESULT_ROOT" "$RUNTIME_ROOT" "$RUN_ROOT"
+    install -d -m 0755 "$RESULT_ROOT" "$RUNTIME_ROOT" "$RUN_ROOT" "$RUN_ROOT/pg"
+    chown -R aoa-workload:aoa-workload "$RUNTIME_ROOT" "$RUN_ROOT"
+    chown postgres:postgres "$RUN_ROOT/pg"
+    printf '%s\n' "$profile" >"$RESULT_ROOT/profile"
+    write_pressure_plan
+
+    start_profile_servers "$profile"
+    prepare_data "$profile"
+    touch "$RESULT_ROOT/SERVERS_READY"
+    log "servers and data are ready; vcpus=$VCPUS pressure_cpus=$PRESSURE_CPUS"
+    for _ in $(seq 1 360); do
+        [ -f "$READY_FILE" ] && [ -f "$WINDOW_FILE" ] && break
+        sleep 0.5
+    done
+    [ -f "$READY_FILE" ] && [ -f "$WINDOW_FILE" ] || { log 'scheduler readiness timed out'; return 1; }
+
+    read -r warmup_seconds measurement_seconds <"$WINDOW_FILE"
+    [[ "$warmup_seconds" =~ ^[0-9]+$ && "$measurement_seconds" =~ ^[0-9]+$ ]]
+    [ "$measurement_seconds" -ge 1 ]
+    if [ "$warmup_seconds" -gt 0 ]; then
+        log "warmup profile=$profile seconds=$warmup_seconds"
+        launch_jobs "$profile" "$warmup_seconds" warmup
+    fi
+
+    # Start all measured jobs before publishing the timestamp so the collector
+    # sees real application PIDs immediately when the measurement opens.
+    launch_jobs "$profile" "$measurement_seconds" measurement &
+    jobs_waiter=$!
+    for _ in $(seq 1 100); do
+        [ -s "$RESULT_ROOT/targets.jsonl" ] && break
+        sleep 0.05
+    done
+    python3 -c 'import json,time; print(json.dumps({"start_ns":time.monotonic_ns()}))' \
+        >"$RESULT_ROOT/measurement-window.json"
+    touch "$RESULT_ROOT/MEASUREMENT_STARTED"
+    log "measurement profile=$profile seconds=$measurement_seconds"
+    wait "$jobs_waiter"
+    /usr/local/libexec/aoa-summarize-workloads "$RESULT_ROOT"
+    python3 - "$RESULT_ROOT/measurement-window.json" <<'PY'
+import json
+import sys
+import time
+from pathlib import Path
+
+path = Path(sys.argv[1])
+value = json.loads(path.read_text(encoding="utf-8"))
+value["end_ns"] = time.monotonic_ns()
+path.write_text(json.dumps(value, sort_keys=True) + "\n", encoding="utf-8")
+PY
+    touch "$RESULT_ROOT/COMPLETE"
+    log 'measurement complete'
+}
+
+main "$@"

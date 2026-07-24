@@ -1,0 +1,37 @@
+schema_version: 2
+
+upstream:
+  scx:
+    repository: https://github.com/sched-ext/scx.git
+    checkout: scheduler/scx
+    tag: v1.0.19
+    commit: 85f140fd5e2cbc9385272003058278ee13574f9f
+    clone_mode: shallow-tag
+
+target:
+  distribution: openEuler 24.03 LTS-SP4
+  architecture: x86_64
+  kernel: 6.6.0-scx
+  template_sha256: 32300bfd7a75deed1d5502fb8786e9374356a0de6c0f03d1f4dfa523b6944c7b
+
+toolchain:
+  clang: 17.0.6
+  llvm: 17.0.6
+  gcc: 12.3.1
+  rustc: 1.96.0
+  cargo: 1.96.0
+  libbpf: 1.6.0
+  bpftool: 7.6.0
+
+llm:
+  provider: DeepSeek
+  base_url: https://api.deepseek.com
+  default_model: deepseek-v4-flash
+  api_format: openai-compatible-chat-completions
+  credential_env: DEEPSEEK_API_KEY
+  documentation_checked: 2026-07-22
+
+policy:
+  allow_upstream_modifications: false
+  require_performance_campaign_on_update: true
+  forbid_committed_api_keys: true
