@@ -96,7 +96,7 @@ Runnable   = TaskKey + enqueue_sequence
 
 | Class | 初始请求 | 主要目标 |
 | --- | ---: | --- |
-| Latency | 1 ms | 降低唤醒到运行的尾延迟 |
+| Latency | 250 us | 降低唤醒到运行的尾延迟 |
 | Balanced | 4 ms | 未知和通用负载的稳定折中 |
 | Throughput | 8 ms | 保持 CPU/缓存局部性并减少切换 |
 
@@ -213,7 +213,7 @@ root_vruntime + class_base_request
 eligible class 中选择最早 deadline；没有 eligible class 时把 root virtual time 前移到最小
 vruntime。休眠后重新活跃的 class 最多保留一个 base request 的正 lag。
 
-root base request 固定为 1/4/8 ms。Latency 的短 root deadline 提供低延迟，但 EEVDF 服务记账
+root base request 固定为 0.25/4/8 ms。Latency 的短 root deadline 提供低延迟，但 EEVDF 服务记账
 防止其无限占用 CPU。
 
 ### 4.5 Latency urgent lane
@@ -223,6 +223,8 @@ root base request 固定为 1/4/8 ms。Latency 的短 root deadline 提供低延
 - 目标 CPU 在线且正在运行已知普通 class；
 - CPU 不 idle；
 - victim 是 Balanced 或 Throughput；
+- victim 已连续运行至少 250 us；
+- 该 CPU 距上次快路径抢占至少 5 ms。
 - urgent slot 当前为空；
 - Latency root entity 没有超过 root virtual time 一个 Latency request。
 
@@ -242,12 +244,13 @@ Throughput 从 8 ms 开始。连续耗尽且保持 runnable 时按以下序列�
 - 主动阻塞；
 - dequeue/cancel；
 - exec；
-- class 变化。
+- class 变化；
+- 系统中已有其他已分类任务排队。
 
 提前打断且剩余时间不少于 250 us 时，保留原 deadline 和剩余 request，不把打断误判成完整 epoch。
 
-当 dispatch 回调看到同一 Throughput prev 仍可运行，并且同 CPU 没有 local、class、normal 或
-urgent 工作时，可直接续接下一个 epoch：
+当 dispatch 回调看到同一 Throughput prev 仍可运行，并且全局没有已分类排队任务、
+同 CPU 也没有 local、class、normal 或 urgent 工作时，可直接续接下一个 epoch：
 
 - task 必须仍在同 CPU 且 affinity 允许；
 - task 必须是快路径 Throughput；
@@ -310,7 +313,7 @@ Rust 慢路径请求范围：
 
 | Class | 最小 | 最大 |
 | --- | ---: | ---: |
-| Latency | 250 us | 1 ms |
+| Latency | 250 us | 250 us |
 | Balanced | 500 us | 4 ms |
 | Throughput | 2 ms | 8 ms |
 
@@ -403,9 +406,10 @@ task.tgid == usersched_pid
 task.tgid == agent_pid
 ~~~
 
-它们不查 task_control、不进入 class DSQ、不参与自定义 victim 选择，直接进入 SCX_DSQ_GLOBAL。
-scheduler 自身在 usersched_needed 时也由 dispatch callback 显式插入 GLOBAL，避免等待自己做出的
-用户态决策。
+它们不查 task_control、不进入 class DSQ、不参与自定义 victim 选择。当当前 CPU 仍在线且
+符合 affinity 时，fallback 直接进入该 CPU 的 local DSQ；只有本地目标无效时才进入
+SCX_DSQ_GLOBAL。scheduler 自身在 usersched_needed 时仍由 dispatch callback 显式插入 GLOBAL，
+避免等待自己做出的用户态决策。
 
 ### 7.2 heartbeat
 
@@ -518,7 +522,7 @@ Rust 读取 global_stats 时对计数器做 saturating sum，对 max_normal_stag
 
 | 配置 | 默认值 |
 | --- | ---: |
-| latency_slice_ns | 1,000,000 |
+| latency_slice_ns | 250,000 |
 | balanced_slice_ns | 4,000,000 |
 | throughput_slice_ns | 8,000,000 |
 | min_slice_ns | 250,000 |
@@ -528,7 +532,7 @@ Rust 读取 global_stats 时对计数器做 saturating sum，对 max_normal_stag
 | preemption_min_runtime_ns | 250,000 |
 | latency_target_ns | 2,000,000 |
 | latency_guarantee_percent | 10 |
-| preemption_budget_percent | 2 |
+| preemption_budget_percent | 5 |
 | heartbeat_timeout | 250 ms |
 | poll_interval | 1 ms |
 | latency_max_wait_ns | 10,000,000 |
@@ -583,8 +587,10 @@ JSON envelope。control thread 只负责 framing、校验和有界转发，Sched
 | 已分类 BPF fast path | 移除每次运行的 Rust round trip | 完整 task_control identity/generation |
 | Locked 事件抑制 | 降低 queue、usersched 和 JSON 观测开销 | 仅 Locked；生命周期事件仍保留 |
 | CPU_STATE 1 ms 合并 | 减少 idle churn | map 状态立即更新，hotplug/必要唤醒不合并 |
-| Throughput 8..64 ms epoch | 降低切换与重新入队开销 | 无本地竞争、上限 64 ms、阻塞即复位 |
-| prev continuation | 避免完整 dispatch cycle | Locked Throughput 且 CPU 无其他工作 |
+| Throughput 8..64 ms epoch | 降低切换与重新入队开销 | 全局无分类排队竞争、上限 64 ms、阻塞即复位 |
+| prev continuation | 避免完整 dispatch cycle | Locked Throughput 且全局/本地均无其他工作 |
+| fallback 本地化 | 降低未分类与 safe task 的迁移/控制面开销 | CPU 在线且 affinity 允许，否则 GLOBAL |
+| 快路径抢占限流 | 避免短 victim 和连续 IPI 抖动 | victim >=250 us，每 CPU 间隔 >=5 ms |
 | 有界 rotating steal | 改善负载不均 | 8 CPU 上限、source claim、保留 source 工作 |
 | PERCPU stats | 消除全局统计 cache-line 竞争 | Rust 聚合并饱和计数 |
 | 单次 stats lookup 记 enqueue | 缩短热路径 | 仅合并相同生命周期的计数 |
@@ -604,11 +610,13 @@ GetSnapshot 同时返回 Rust SchedulerStats 和聚合后的 BPF DataPlaneStats�
 - fast_path_events_suppressed；
 - cpu_state_events_suppressed；
 - fast_path_preemptions；
+- fast_path_preemption_throttles；
 - fallback_dispatches、stale_heartbeat_fallbacks、event_overflows；
 - commands_rejected 与 identity/slot reject。
 
-fallback_dispatches 包含 PF_KTHREAD、Agent、scheduler 等预期 safe-task GLOBAL 插入，不能单独视为
-故障；liveness 应结合 stale_heartbeat_fallbacks、event_overflows 和 detach 状态判断。
+fallback_dispatches 包含 PF_KTHREAD、Agent、scheduler 等预期 safe-task 插入，不能单独视为
+故障；它可能进入 local 或 GLOBAL DSQ。liveness 应结合 stale_heartbeat_fallbacks、
+event_overflows 和 detach 状态判断。
 
 出现以下组合时需要停止调参并先排查正确性：
 
@@ -622,31 +630,34 @@ fallback_dispatches 包含 PF_KTHREAD、Agent、scheduler 等预期 safe-task GL
 
 ## 14. 当前性能证据与验收规则
 
-20260724-formal-fastpath-v10 是当前代码的正式三轮结果。Guest 独占 3 个物理核、6 个 SMT
-线程，每个 run 预热 20 s、测量 60 s；18/18 run 有效。9 个 Agent run 的 process/thread
-观察覆盖率、有效分类正确率和 generation 应用率均为 100%；thread 最终解析覆盖率为 88.10%，
-已解析项正确率为 100%。
+`20260725-120702-620116` 是当前代码的单轮全场景候选结果。Guest 独占 3 个物理核、
+6 个 SMT 线程，每个 run 预热 20 s、测量 60 s；6/6 run 有效。这些数据用于迭代取舍，
+不构成正式置信区间。
 
 | 场景 | Native | Agent | Agent 相对 Native |
 | --- | ---: | ---: | ---: |
-| latency P99 | 660.851 us | 662.875 us | 回退 0.31%，CI [-0.37%, +0.95%] |
-| throughput | 2.962616 B ops/s | 2.955817 B ops/s | 低 0.23%，CI [-0.25%, -0.19%] |
-| mix P99 | 2579.392 us | 702.954 us | 改善 72.73%，CI [+70.11%, +73.51%] |
-| mix throughput | 2.744758 B ops/s | 2.703488 B ops/s | 低 1.46%，CI [-1.52%, -1.37%] |
+| latency P99 | 2,074.713 us | 21,996.078 us | 低 960.20% |
+| throughput | 1,073.059 units/s | 977.614 units/s | 低 8.89% |
+| mix P99 | 7,679.252 us | 25,406.212 us | 低 230.84% |
+| mix throughput | 13.102 units/s | 12.908 units/s | 低 1.47% |
 
-与本轮优化前的 fastpath-v3 单轮 Agent 结果相比，当前正式中位数为：
+与同一天的优化前单轮基线 `single-round-20260724-222443` 相比：
 
-- latency P99 从 679.595 us 降至 662.875 us，约改善 2.46%；
-- throughput 从 2.915813 B 提升至 2.955817 B ops/s，约提升 1.37%；
-- mix throughput 从 2.679676 B 提升至 2.703488 B ops/s，约提升 0.89%；
-- mix P99 从 698.441 us 变为 702.954 us，约回退 0.65%。
+- 纯 Throughput 相对 Native 的差距从 20.24% 收窄到 8.89%；
+- Mix P99 从 287,953.686 us 降到 25,406.212 us，约降低 91.18%；
+- Mix P99/Native 比值从约 37.22 倍降到 3.31 倍；
+- Mix 的 scheduler CPU 从约 15.01 s 降到 6.42 s，events 从约 190 万降到 137 万，
+  CPU migration 从约 44.1 万降到 18.5 万；
+- 纯 Latency 仍为最大缺口，当前 P99 约为 Native 的 10.60 倍，不能被 Mix 改善掩盖。
 
-用各自 Native 配对值归一化后，纯 Latency 从 fastpath-v3 的低 1.35% 收敛为正式中位低 0.31%，
-改善 1.04 个百分点；纯 Throughput 从低 1.62% 收敛为低 0.23%，改善 1.39 个百分点。
+独立纯 Throughput 复验 `20260725-120145-308125` 中，fallback 本地化将 CPU migration 从
+130,134 降到 49,055，scheduler CPU 从 3.94 s 降到 1.95 s，同时将相对 Native 的差距从
+9.78% 收窄到 8.53%。
 
-fastpath-v3 是单轮迭代基线，因此只能证明当前候选相对原实现的提升方向，不能提供正式置信区间。
-当前正式 campaign 证明实现稳定且 Mix 延迟显著优于 Native，但纯 Latency/Throughput 尚未稳定
-超过 Native。后续候选必须继续运行默认三轮 paired campaign，并同时满足：
+分类 snapshot 是测量期内的时点观测，可能早于异步 LLM 批次提交；因此必须与最终 class
+dispatch 计数、Locked 行为纠错和 scheduler log 一起解读，不能把早期 snapshot 当成全程分类。
+
+后续候选必须继续运行默认三轮 paired campaign，并同时满足：
 
 1. 所有 Native/Agent paired run 有效；
 2. 分类覆盖率、正确率和 generation 应用率为 100%；
@@ -710,10 +721,10 @@ scheduler/scx 是锁定的上游 sched_ext 构建与兼容依赖，不承载本�
 
 ## 17. 修改时必须保持的不变量
 
-1. safe task 判定和 GLOBAL 路径不能因性能调参被旁路。
+1. safe task 判定和 usersched 显式 GLOBAL 逃生路径不能因性能调参被旁路。
 2. Latency victim 只能是 Balanced 或 Throughput。
 3. direct dispatch 必须先成功 claim idle CPU，并确认没有本地工作。
-4. Throughput continuation 必须在没有任何本地竞争时停止增长。
+4. Throughput epoch/continuation 必须在存在任何全局已分类排队竞争时停止增长。
 5. 所有 slice 必须位于 250 us..64 ms。
 6. 所有 BPF 扫描、repeat 和 map 容量必须有静态上界。
 7. normal/urgent lane 每 CPU 各最多一个 reservation。

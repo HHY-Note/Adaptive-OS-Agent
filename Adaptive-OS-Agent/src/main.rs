@@ -848,6 +848,12 @@ fn commit_actions(
                     break;
                 }
             }
+            Ok(response) if response.error_code.as_deref() == Some("unknown_identity") => {
+                let removed = registry.reject_unknown_identity(action);
+                debug!(
+                    "discarded classification for scheduler-confirmed exited identity removed={removed} action={action:?}"
+                );
+            }
             Ok(response) => {
                 warn!(
                     "scheduler rejected classification [{}]: {}",

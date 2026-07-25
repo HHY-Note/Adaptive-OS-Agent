@@ -23,6 +23,8 @@ pub struct ProcessInstanceKey {
 pub struct ProcessMetadata {
     /// Pre-cookie process instance identity.
     pub instance: ProcessInstanceKey,
+    /// Exact parent lifetime when it remained visible during this proc read.
+    pub parent: Option<ProcessInstanceKey>,
     /// Short executable comm from `/proc/<tgid>/comm`.
     pub comm: String,
     /// Bounded argv values from `/proc/<tgid>/cmdline`.
@@ -134,6 +136,8 @@ pub struct ThreadMetadata {
 /// Parsed task flags and start time from `/proc/<pid>/stat`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct StatIdentity {
+    /// Numeric parent process ID from field 4.
+    parent_tgid: u32,
     /// Kernel task flags including PF_KTHREAD.
     flags: u64,
     /// Numeric-ID lifetime discriminator.
@@ -159,11 +163,13 @@ pub fn read_process(tgid: u32) -> io::Result<Option<ProcessMetadata>> {
         .map(|path| bounded_string(path.to_string_lossy().as_ref(), 1024));
     let cgroups = read_cgroups(root.join("cgroup")).unwrap_or_default();
     let uid = read_real_uid(root.join("status")).ok().flatten();
+    let parent = read_process_instance(stat.parent_tgid);
     let metadata = ProcessMetadata {
         instance: ProcessInstanceKey {
             tgid,
             start_time_ticks: stat.start_time_ticks,
         },
+        parent,
         comm,
         command,
         executable,
@@ -218,11 +224,25 @@ fn read_stat_identity(path: &Path) -> io::Result<StatIdentity> {
             "stat record ends before start_time",
         ));
     }
+    let parent_tgid = fields[1].parse::<u32>().map_err(invalid_number)?;
     let flags = fields[6].parse::<u64>().map_err(invalid_number)?;
     let start_time_ticks = fields[19].parse::<u64>().map_err(invalid_number)?;
     Ok(StatIdentity {
+        parent_tgid,
         flags,
         start_time_ticks,
+    })
+}
+
+/// Reads a stable parent lifetime, rejecting PID 0, kernel threads, and exit races.
+fn read_process_instance(tgid: u32) -> Option<ProcessInstanceKey> {
+    if tgid == 0 {
+        return None;
+    }
+    let stat = read_stat_identity(&PathBuf::from(format!("/proc/{tgid}/stat"))).ok()?;
+    (stat.flags & PF_KTHREAD == 0).then_some(ProcessInstanceKey {
+        tgid,
+        start_time_ticks: stat.start_time_ticks,
     })
 }
 
@@ -287,12 +307,20 @@ fn invalid_number(error: impl std::fmt::Display) -> io::Error {
 
 #[cfg(test)]
 mod tests {
-    use super::{bounded_string, read_task_start_time, redact_command};
+    use super::{bounded_string, read_process, read_task_start_time, redact_command};
 
     #[test]
     fn reads_current_thread_start_time() {
         let pid = std::process::id();
         assert!(read_task_start_time(pid, pid).unwrap() > 0);
+    }
+
+    #[test]
+    fn reads_exact_parent_lifetime() {
+        let metadata = read_process(std::process::id()).unwrap().unwrap();
+        let parent = metadata.parent.expect("test process has a visible parent");
+        assert_ne!(parent.tgid, 0);
+        assert_ne!(parent.start_time_ticks, 0);
     }
 
     /// Metadata bounds never split a multi-byte UTF-8 character.

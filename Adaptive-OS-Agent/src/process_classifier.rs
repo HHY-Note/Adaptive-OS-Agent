@@ -93,6 +93,7 @@ mod tests {
                 tgid,
                 start_time_ticks,
             },
+            parent: None,
             comm: format!("process-{tgid}"),
             command: vec![format!("/usr/bin/process-{tgid}")],
             executable: Some(format!("/usr/bin/process-{tgid}")),

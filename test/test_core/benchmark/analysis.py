@@ -380,6 +380,10 @@ def _scheduler_metrics(bench_dir: Path, start_ns: int, end_ns: int) -> dict[str,
         "fast_path_dispatches": ("data_plane", "fast_path_dispatches"),
         "fast_path_dispatch_failures": ("data_plane", "fast_path_dispatch_failures"),
         "fast_path_preemptions": ("data_plane", "fast_path_preemptions"),
+        "fast_path_preemption_throttles": (
+            "data_plane",
+            "fast_path_preemption_throttles",
+        ),
         "fast_path_local_dispatches": (
             "data_plane",
             "fast_path_local_dispatches",

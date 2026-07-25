@@ -66,10 +66,10 @@ pub struct SchedulerConfig {
 }
 
 impl Default for SchedulerConfig {
-    /// Builds 1/4/8 ms request ceilings and bounded refill defaults.
+    /// Builds 0.25/4/8 ms request ceilings and bounded refill defaults.
     fn default() -> Self {
         Self {
-            latency_slice_ns: NSEC_PER_MSEC,
+            latency_slice_ns: 250_000,
             balanced_slice_ns: 4 * NSEC_PER_MSEC,
             throughput_slice_ns: 8 * NSEC_PER_MSEC,
             min_slice_ns: 250_000,
@@ -79,7 +79,7 @@ impl Default for SchedulerConfig {
             preemption_min_runtime_ns: 250_000,
             latency_target_ns: 2 * NSEC_PER_MSEC,
             latency_guarantee_percent: 10,
-            preemption_budget_percent: 2,
+            preemption_budget_percent: 5,
             heartbeat_timeout: Duration::from_millis(250),
             poll_interval: Duration::from_millis(1),
             latency_max_wait_ns: 10 * NSEC_PER_MSEC,
@@ -202,6 +202,13 @@ impl SchedulerConfig {
             crate::identity::TaskClass::Throughput => self.throughput_max_wait_ns,
         }
     }
+
+    /// Minimum wall-clock spacing that keeps urgent disruption within budget.
+    pub fn fast_preemption_interval_ns(&self) -> u64 {
+        self.preemption_min_runtime_ns
+            .saturating_mul(100)
+            .div_ceil(u64::from(self.preemption_budget_percent))
+    }
 }
 
 /// Actionable configuration validation failures.
@@ -280,7 +287,7 @@ mod tests {
         );
         assert_eq!(
             config.request_for_estimate(crate::identity::TaskClass::Latency, 500_000),
-            1_000_000
+            250_000
         );
         assert_eq!(
             config.request_for_estimate(crate::identity::TaskClass::Balanced, 600_000),
@@ -290,5 +297,6 @@ mod tests {
             config.request_for_estimate(crate::identity::TaskClass::Throughput, 20_000_000),
             8_000_000
         );
+        assert_eq!(config.fast_preemption_interval_ns(), 5_000_000);
     }
 }

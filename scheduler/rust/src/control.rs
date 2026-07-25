@@ -193,6 +193,7 @@ impl Serialize for DataPlaneStats {
             fast_path_steal_claim_conflicts: u64,
             cpu_state_events_suppressed: u64,
             fast_path_empty_steal_skips: u64,
+            fast_path_preemption_throttles: u64,
         }
 
         Fields {
@@ -220,6 +221,7 @@ impl Serialize for DataPlaneStats {
             fast_path_steal_claim_conflicts: self.fast_path_steal_claim_conflicts,
             cpu_state_events_suppressed: self.cpu_state_events_suppressed,
             fast_path_empty_steal_skips: self.fast_path_empty_steal_skips,
+            fast_path_preemption_throttles: self.fast_path_preemption_throttles,
         }
         .serialize(serializer)
     }

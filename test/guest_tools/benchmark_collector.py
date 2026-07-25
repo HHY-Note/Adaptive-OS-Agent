@@ -380,6 +380,7 @@ def _scheduler_sample(stats: dict[str, Any], observed_ns: int) -> dict[str, Any]
                 "fast_path_steal_claim_conflicts",
                 "cpu_state_events_suppressed",
                 "fast_path_empty_steal_skips",
+                "fast_path_preemption_throttles",
             )
         },
     }

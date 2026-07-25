@@ -2466,14 +2466,14 @@ mod tests {
             })
             .unwrap();
         let first = engine.refill(1_000).remove(0);
-        assert_eq!(first.slice_ns, 1_000_000);
+        assert_eq!(first.slice_ns, 250_000);
 
         let mut running = event(EventKind::Running, 11, 1, first.dispatch_id);
         running.timestamp_ns = 2_000;
         engine.handle_event(running);
         let mut stop = event(EventKind::Stop, 11, 1, first.dispatch_id);
-        stop.timestamp_ns = 802_000;
-        stop.runtime_ns = 800_000;
+        stop.timestamp_ns = 202_000;
+        stop.runtime_ns = 200_000;
         stop.flags = crate::bpf_intf::SCX_ADAPTIVE_EVENT_FLAG_RUNNABLE as u64;
         engine.handle_event(stop);
 

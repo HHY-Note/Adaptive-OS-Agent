@@ -247,7 +247,7 @@ fn classification_get(
                 "identity": record.identity,
                 "class": record.default_class,
                 "stage": "process_default",
-                "source": semantic_source(record.semantic),
+                "source": semantic_source(record.semantic, record.inherited_from.is_some()),
                 "confidence": semantic_confidence(record.semantic),
                 "generation": record.class_generation,
                 "applied_generation": record.applied_generation,
@@ -326,7 +326,10 @@ fn parse_arguments<T: for<'de> Deserialize<'de>>(arguments: &Value) -> Result<T,
     serde_json::from_value(arguments.clone()).map_err(|error| error.to_string())
 }
 
-fn semantic_source(state: SemanticState) -> &'static str {
+fn semantic_source(state: SemanticState, inherited: bool) -> &'static str {
+    if inherited {
+        return "parent_default";
+    }
     match state {
         SemanticState::Classified { .. } => "llm",
         SemanticState::Unknown | SemanticState::Failed => "fallback",
