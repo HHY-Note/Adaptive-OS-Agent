@@ -367,6 +367,7 @@ fn initial_cpu_state(online: bool) -> bpf_intf::adaptive_cpu_state {
         last_idle_event_ns: 0,
         running_started_ns: 0,
         last_preemption_ns: 0,
+        last_remote_latency_ns: 0,
         accepted_commands: 0,
         rejected_commands: 0,
         root_virtual_time_ns: 0,

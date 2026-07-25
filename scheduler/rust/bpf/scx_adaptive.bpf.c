@@ -31,9 +31,13 @@ const volatile u64 preemption_min_runtime_ns = 250000ULL;
 const volatile u64 fast_preemption_interval_ns = 5000000ULL;
 
 #define FAST_CLASS_DSQ_BASE 0x10000ULL
+#define FAST_LATENCY_SHARED_DSQ \
+	(FAST_CLASS_DSQ_BASE + \
+	 (u64)SCX_ADAPTIVE_CLASS_COUNT * SCX_ADAPTIVE_MAX_CPUS)
 #define FAST_BPF_URGENT_DISPATCH_ID (~0ULL)
 #define FAST_NO_RUNNING_CLASS SCX_ADAPTIVE_CLASS_COUNT
 #define FAST_STEAL_SCAN_LIMIT 8U
+#define FAST_SHARED_LOCALITY_SCAN_LIMIT 8U
 #define CPU_STATE_EVENT_INTERVAL_NS 1000000ULL
 
 /* Non-zero monotonic source shared by task and process cookie allocation. */
@@ -190,7 +194,7 @@ static __always_inline struct adaptive_global_stats *stats_value(void)
 		stats->field++;                                                \
 } while (0)
 
-/** Returns one CPU-owned virtual-deadline queue for a workload class. */
+/** Returns the virtual-deadline queue for a workload class. */
 static __always_inline u64 class_dsq(u32 class_id, u32 cpu)
 {
 	return FAST_CLASS_DSQ_BASE +
@@ -237,10 +241,7 @@ static __always_inline u64 next_throughput_epoch(
 /** Decrements custom-DSQ population after a successful move-to-local. */
 static __always_inline void account_class_dequeue(void)
 {
-	u64 queued = __sync_fetch_and_add(&class_queued_tasks, 0);
-
-	if (queued)
-		__sync_bool_compare_and_swap(&class_queued_tasks, queued, queued - 1);
+	__sync_fetch_and_sub(&class_queued_tasks, 1);
 }
 
 /** Looks up one class state after validating its dense index. */
@@ -676,11 +677,13 @@ static __always_inline bool fast_enqueue(struct task_struct *p,
 		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | owner_cpu,
 				   taskc->request_ns, enq_flags);
 	} else {
+		__sync_fetch_and_add(&class_queued_tasks, 1);
 		scx_bpf_dsq_insert_vtime(p,
-				  class_dsq(control->class_id, owner_cpu),
+				  control->class_id == SCX_ADAPTIVE_CLASS_LATENCY ?
+					  FAST_LATENCY_SHARED_DSQ :
+					  class_dsq(control->class_id, owner_cpu),
 				  taskc->request_ns,
 				  taskc->request_deadline_ns, enq_flags);
-		__sync_fetch_and_add(&class_queued_tasks, 1);
 	}
 	record_fast_enqueue(control->class_id, direct,
 			    !taskc->observe_fast_events);
@@ -901,9 +904,14 @@ static __always_inline s32 select_fast_class(
 	for (class_id = 0; class_id < SCX_ADAPTIVE_CLASS_COUNT; class_id++) {
 		u64 effective;
 		u64 deadline;
+		s64 queued;
 
-		if ((excluded & (1U << class_id)) ||
-		    scx_bpf_dsq_nr_queued(class_dsq(class_id, queue_cpu)) <= 0)
+		if (excluded & (1U << class_id))
+			continue;
+		queued = scx_bpf_dsq_nr_queued(class_dsq(class_id, queue_cpu));
+		if (class_id == SCX_ADAPTIVE_CLASS_LATENCY)
+			queued += scx_bpf_dsq_nr_queued(FAST_LATENCY_SHARED_DSQ);
+		if (queued <= 0)
 			continue;
 		effective = activate_root_entity(cpuc, class_id);
 		deadline = effective + class_slice(class_id);
@@ -927,12 +935,49 @@ static __always_inline s32 select_fast_class(
 	return next;
 }
 
-/** Moves one task from a CPU-owned class queue into the caller's local DSQ. */
+/** Moves a nearby shared latency task while bounding deadline inversion. */
+static __always_inline bool dispatch_shared_latency_home(s32 dst_cpu)
+{
+	struct task_struct *p;
+	u32 scanned = 0;
+	bool dispatched = false;
+
+	bpf_rcu_read_lock();
+	bpf_for_each(scx_dsq, p, FAST_LATENCY_SHARED_DSQ, 0) {
+		if (scanned++ >= FAST_SHARED_LOCALITY_SCAN_LIMIT)
+			break;
+		p = bpf_task_from_pid(p->pid);
+		if (!p)
+			continue;
+		if (scx_bpf_task_cpu(p) == dst_cpu &&
+		    bpf_cpumask_test_cpu(dst_cpu, p->cpus_ptr))
+			dispatched = scx_bpf_dsq_move(
+				BPF_FOR_EACH_ITER, p, SCX_DSQ_LOCAL, 0);
+		bpf_task_release(p);
+		if (dispatched)
+			break;
+	}
+	bpf_rcu_read_unlock();
+	return dispatched;
+}
+
+/** Bounds cache-disrupting shared dispatch while private work is available. */
+static __always_inline bool remote_latency_allowed(
+	const struct adaptive_cpu_state *cpuc, u64 now)
+{
+	u64 interval = latency_slice_ns * 2;
+
+	return !cpuc->last_remote_latency_ns || now < cpuc->last_remote_latency_ns ||
+		now - cpuc->last_remote_latency_ns >= interval;
+}
+
+/** Moves one task from a class queue into the caller's local DSQ. */
 static __always_inline bool dispatch_fast_class(
 	s32 dst_cpu, s32 src_cpu, u32 class_id, bool remote)
 {
 	struct adaptive_cpu_state *dst = cpu_state_for(dst_cpu);
 	u64 vruntime;
+	bool private_work;
 
 	if (!dst || src_cpu < 0 || src_cpu >= num_possible_cpus ||
 	    class_id >= SCX_ADAPTIVE_CLASS_COUNT)
@@ -942,6 +987,24 @@ static __always_inline bool dispatch_fast_class(
 		account_class_dequeue();
 		record_fast_dispatch(class_id, remote);
 		return true;
+	}
+	if (class_id == SCX_ADAPTIVE_CLASS_LATENCY &&
+	    dispatch_shared_latency_home(dst_cpu)) {
+		account_class_dequeue();
+		record_fast_dispatch(class_id, false);
+		return true;
+	}
+	if (class_id == SCX_ADAPTIVE_CLASS_LATENCY) {
+		private_work = fast_queued_on_cpu(dst_cpu) > 0;
+		if ((remote || !private_work ||
+		     remote_latency_allowed(dst, bpf_ktime_get_ns())) &&
+		    scx_bpf_dsq_move_to_local(FAST_LATENCY_SHARED_DSQ)) {
+			if (!remote && private_work)
+				dst->last_remote_latency_ns = bpf_ktime_get_ns();
+			account_class_dequeue();
+			record_fast_dispatch(class_id, true);
+			return true;
+		}
 	}
 	set_root_vruntime(dst, class_id, vruntime);
 	STAT_INC(fast_path_dispatch_failures);
@@ -971,7 +1034,7 @@ static __always_inline u64 fast_queued_on_cpu(s32 cpu)
 	return queued;
 }
 
-/** Allows stealing only when a source retains work for its own CPU. */
+/** Preserves a lone latency successor while still draining real backlog. */
 static __always_inline bool source_can_spare(s32 cpu)
 {
 	struct adaptive_cpu_state *cpuc = cpu_state_for(cpu);
@@ -981,7 +1044,10 @@ static __always_inline bool source_can_spare(s32 cpu)
 		return false;
 	if (!cpuc->online)
 		return true;
-	return !cpuc->idle || queued > 1;
+	if (queued > 1)
+		return true;
+	return !cpuc->idle &&
+		cpuc->running_class != SCX_ADAPTIVE_CLASS_LATENCY;
 }
 
 /** Scans once from a rotating origin and serializes movers per source CPU. */
@@ -993,9 +1059,8 @@ static __always_inline bool steal_fast_task(s32 dst_cpu)
 
 	if (!dst || num_possible_cpus <= 1)
 		return false;
-	u64 queued_at_start;
 
-	if ((queued_at_start = __sync_fetch_and_add(&class_queued_tasks, 0)) == 0) {
+	if (__sync_fetch_and_add(&class_queued_tasks, 0) == 0) {
 		STAT_INC(fast_path_empty_steal_skips);
 		return false;
 	}
@@ -1038,8 +1103,6 @@ static __always_inline bool steal_fast_task(s32 dst_cpu)
 		if (dispatched)
 			return true;
 	}
-	if (num_possible_cpus <= FAST_STEAL_SCAN_LIMIT + 1)
-		__sync_bool_compare_and_swap(&class_queued_tasks, queued_at_start, 0);
 	return false;
 }
 
@@ -1206,6 +1269,7 @@ s32 BPF_STRUCT_OPS(adaptive_select_cpu, struct task_struct *p, s32 prev_cpu,
 selected:
 	if (cpu >= 0 && taskc->selected_idle_cpu == cpu &&
 	    control->class_id == SCX_ADAPTIVE_CLASS_LATENCY &&
+	    !cpu_has_local_work(cpu, cpu_state_for(cpu)) &&
 	    fast_enqueue(p, taskc, control, 0, bpf_ktime_get_ns(), cpu, true))
 		return cpu;
 	taskc->target_cpu = cpu;
@@ -1742,6 +1806,9 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(adaptive_init)
 				return ret;
 		}
 	}
+	ret = scx_bpf_create_dsq(FAST_LATENCY_SHARED_DSQ, -1);
+	if (ret)
+		return ret;
 	return 0;
 }
 

@@ -149,6 +149,7 @@ struct adaptive_cpu_state {
 	u64 last_idle_event_ns;
 	u64 running_started_ns;
 	u64 last_preemption_ns;
+	u64 last_remote_latency_ns;
 	u64 accepted_commands;
 	u64 rejected_commands;
 	u64 root_virtual_time_ns;
@@ -189,7 +190,7 @@ _Static_assert(sizeof(struct dispatch_command) == 72,
 	       "dispatch_command ABI size changed");
 _Static_assert(sizeof(struct task_control_value) == 40,
 	       "task_control_value ABI size changed");
-_Static_assert(sizeof(struct adaptive_cpu_state) == 112,
+_Static_assert(sizeof(struct adaptive_cpu_state) == 120,
 	       "adaptive_cpu_state ABI size changed");
 _Static_assert(sizeof(struct adaptive_global_stats) == 216,
 	       "adaptive_global_stats ABI size changed");

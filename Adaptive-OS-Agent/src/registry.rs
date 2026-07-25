@@ -342,22 +342,27 @@ impl ClassificationRegistry {
         }
     }
 
-    /// Marks one failed process batch Unknown exactly once; it is never requeued.
+    /// Marks one failed process batch as fallback exactly once; it is never requeued.
     pub fn mark_process_batch_failed(&mut self, plan: &ProcessBatchPlan) {
         for process in &plan.processes {
-            if self.process_request_ids.get(&process.instance) != Some(&plan.request_id) {
-                continue;
-            }
-            self.process_request_ids.remove(&process.instance);
-            self.process_semantics
-                .insert(process.instance, SemanticState::Failed);
-            for record in self
-                .processes
-                .values_mut()
-                .filter(|record| record.instance == Some(process.instance))
-            {
-                record.semantic = SemanticState::Failed;
-            }
+            self.mark_process_request_failed(process.instance, plan.request_id);
+        }
+    }
+
+    /// Finalizes one exact request item that failed or disappeared before inference.
+    fn mark_process_request_failed(&mut self, instance: ProcessInstanceKey, request_id: u64) {
+        if self.process_request_ids.get(&instance) != Some(&request_id) {
+            return;
+        }
+        self.process_request_ids.remove(&instance);
+        self.process_semantics
+            .insert(instance, SemanticState::Failed);
+        for record in self
+            .processes
+            .values_mut()
+            .filter(|record| record.instance == Some(instance))
+        {
+            record.semantic = SemanticState::Failed;
         }
     }
 
@@ -661,6 +666,16 @@ impl ClassificationRegistry {
                     classified.push((identity, class));
                 }
             }
+        }
+        let missing: Vec<_> = self
+            .process_request_ids
+            .iter()
+            .filter_map(|(instance, active_request)| {
+                (*active_request == request_id).then_some(*instance)
+            })
+            .collect();
+        for instance in missing {
+            self.mark_process_request_failed(instance, request_id);
         }
         let mut actions = Vec::new();
         for (identity, class) in &classified {
@@ -1030,12 +1045,6 @@ impl ClassificationRegistry {
             correction_semantic,
             SemanticState::Classified { .. } | SemanticState::Unknown | SemanticState::Failed
         );
-        if !semantic_ready && !timed_out {
-            return Vec::new();
-        }
-        if !semantic_ready {
-            task.semantic = SemanticState::Failed;
-        }
 
         let semantic_confidence = match correction_semantic {
             SemanticState::Classified {
@@ -1046,8 +1055,9 @@ impl ClassificationRegistry {
         };
         let final_class = if let Some(candidate) = candidate {
             let contradicts_semantics = candidate != task.effective_class;
-            let threshold = if contradicts_semantics
-                && semantic_confidence >= (config.high_confidence_threshold * 1000.0) as u16
+            let threshold = if !semantic_ready
+                || (contradicts_semantics
+                    && semantic_confidence >= (config.high_confidence_threshold * 1000.0) as u16)
             {
                 config.high_confidence_correction_windows
             } else {
@@ -1713,10 +1723,10 @@ mod tests {
         ));
     }
 
-    /// Behavior evidence gathered during an LLM request is retained, but cannot
-    /// change scheduler state until semantic classification finishes.
+    /// Strong local evidence resolves a task after five windows even while its
+    /// remote semantic request remains pending.
     #[test]
-    fn pending_semantics_accumulate_behavior_without_early_actions() {
+    fn pending_semantics_fall_back_to_strong_behavior() {
         let mut registry = ClassificationRegistry::default();
         let process = ProcessKey {
             tgid: 111,
@@ -1747,12 +1757,6 @@ mod tests {
         let record = registry.tasks.get_mut(&task).unwrap();
         assert_eq!(record.behavior.windows, 4);
         assert_eq!(record.stage, ClassStage::Inherited);
-        record.semantic = SemanticState::Classified {
-            class: TaskClass::Latency,
-            confidence_per_mille: 900,
-        };
-        record.effective_class = TaskClass::Latency;
-        record.stage = ClassStage::Semantic;
 
         assert!(matches!(
             registry
@@ -1764,6 +1768,9 @@ mod tests {
                 ..
             }]
         ));
+        let record = registry.task(task).unwrap();
+        assert_eq!(record.semantic, SemanticState::Failed);
+        assert_eq!(record.stage, ClassStage::Locked);
     }
 
     /// Process-level semantics provide enough confidence context for local
@@ -1882,6 +1889,29 @@ mod tests {
             registry.process(process).unwrap().semantic,
             SemanticState::Failed
         );
+    }
+
+    #[test]
+    fn omitted_process_results_enter_fallback_instead_of_staying_requested() {
+        let mut registry = ClassificationRegistry::default();
+        let metadata = process_metadata(21, 23, None);
+        let process = ProcessKey {
+            tgid: metadata.instance.tgid,
+            process_cookie: 22,
+            exec_generation: 1,
+        };
+        registry.remember_metadata(metadata.clone());
+        registry.on_process_discovered(process, Some(metadata), 0);
+        let plan = registry.take_process_batches(16, usize::MAX).remove(0);
+
+        assert!(registry
+            .apply_process_proposals(plan.request_id, Vec::new())
+            .is_empty());
+        assert_eq!(
+            registry.process(process).unwrap().semantic,
+            SemanticState::Failed
+        );
+        assert!(registry.take_process_batches(16, usize::MAX).is_empty());
     }
 
     /// Thread semantic work waits until the owning process request has

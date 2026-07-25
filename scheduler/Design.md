@@ -1,6 +1,6 @@
 # scx_adaptive 当前实现设计
 
-本文档描述 2026-07-24 工作区中的实际实现。源码是最终事实来源：
+本文档描述 2026-07-25 工作区中的实际实现。源码是最终事实来源：
 
 - BPF 数据面：rust/bpf/scx_adaptive.bpf.c
 - Rust/BPF ABI：rust/bpf/intf.h
@@ -174,11 +174,15 @@ urgent slot 工作时，直接完成 local DSQ 插入。这条路径省去 enque
 
 所有 runnable 记账由 begin_enqueue 统一完成，避免快慢路径重复维护 sequence 和时间戳。
 
-快路径为每个可能 CPU 创建三个 custom DSQ。DSQ ID 为：
+快路径为每个可能 CPU 保留三个 class DSQ ID：
 
 ~~~text
 FAST_CLASS_DSQ_BASE + class_id * MAX_CPUS + cpu
 ~~~
+
+Balanced 和 Throughput 插入目标 CPU 的 class DSQ。非 direct 的 Latency 插入一个共享 vtime DSQ；
+共享队列消除初始 CPU 放置错误造成的长时间排队，同时仍按 task deadline 排序。select_cpu 已原子取得
+空闲 CPU 且该 CPU 没有私有积压时，Latency 仍可直接插入 local DSQ。
 
 task 在 class 内携带：
 
@@ -192,8 +196,8 @@ deadline = vruntime + request
 class 变化时把 source lag 限制在 source/target 各自一个 request 内再转换，不能清零历史服务来
 获得无限信用。
 
-如果 select_cpu 已确认目标 CPU 空闲且该 CPU 没有本地积压，任务直接进入 local DSQ。否则任务
-进入目标 CPU 对应的 class DSQ。
+每次 custom DSQ 插入前精确增加 `class_queued_tasks`，只有成功 move-to-local 后才减少；该计数是
+Throughput epoch、空扫描跳过和 liveness 判断共享的总体积压不变量。
 
 ### 4.4 每 CPU root EEVDF
 
@@ -261,15 +265,25 @@ Throughput 从 8 ms 开始。连续耗尽且保持 runnable 时按以下序列�
 
 这条路径减少停止、重新入队、再次 dispatch 和上下文切换，但任何本地竞争都会立即阻止续跑。
 
-### 4.7 有界 steal
+### 4.7 共享 Latency 调度与有界 steal
+
+每个 CPU 的 root EEVDF 都能看到共享 Latency backlog。选择 Latency 后按以下顺序搬运一个 task：
+
+1. 尝试兼容旧状态的本 CPU Latency class DSQ；
+2. 扫描共享队列头部最多 8 项，优先选择 home CPU 等于当前 CPU 且 affinity 允许的 task；
+3. 若当前 CPU 没有私有 Balanced/Throughput 积压，直接取共享队首以保持 work-conserving；
+4. 若已有私有工作，非 home fallback 每 `2 * latency_slice_ns` 最多一次（默认 500 us）。
+
+这个结构把 Latency 的跨核可执行性与 Balanced/Throughput 的缓存局部性分开控制。跨核 fallback 仍计入
+remote dispatch 统计，所有 move 成功后都更新精确 custom DSQ 总数。
 
 本 CPU 没有可运行 class 后才尝试 steal：
 
 - class_queued_tasks 为零时直接跳过扫描；
 - 每次最多扫描 8 个 source CPU；
 - 起点由每 CPU steal_cursor 轮转；
-- source 在线且 idle 时必须至少保留一个自己的 queued task；
-- source 繁忙或 offline 时允许搬运其等待任务；
+- source 只有一个等待任务时，仅当它正在运行非 Latency 工作才允许搬运，避免移走唯一 Latency successor；
+- source 有多个等待任务或 offline 时允许搬运；
 - 每个 source 使用原子 steal_claim，避免多个 destination 同时搬运；
 - class 仍由 destination 的 root EEVDF 选择；
 - 一次 dispatch 最多搬运一个 task。
@@ -283,7 +297,7 @@ adaptive_dispatch 的固定顺序是：
 1. 如有 usersched_needed，请求运行 Rust scheduler；
 2. 消费当前 CPU 的 BPF Latency urgent sentinel；
 3. 在最多 64 次 verifier-bounded 循环中消费 Rust command；
-4. 从当前 CPU 的三个 class DSQ 运行 root EEVDF；
+4. 通过 root EEVDF 从共享 Latency DSQ 或当前 CPU 的 Balanced/Throughput class DSQ 取任务；
 5. 尝试无竞争 Throughput prev continuation；
 6. 仍无本地工作时执行一次有界 steal。
 

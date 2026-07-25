@@ -386,8 +386,11 @@ stop new semantic work
 
 ### 8.1 worker pool
 
-`ClassifierPool` 创建两个容量都为 `llm_pending_batches=32` 的 bounded channel。工作线程数为
-`worker_count`，名称为 `adaptive-agent-llm-<index>`。
+`ClassifierPool` 把 `llm_pending_batches=32` 平分为独立的进程和线程 bounded channel（当前各 16），
+结果 channel 容量为 `max(llm_pending_batches, worker_count, 1)`。工作线程数为 `worker_count`，名称为
+`adaptive-agent-llm-<index>`。当 worker 多于一个时，index 0 只消费进程请求，其他 worker 使用
+process-first 的 biased select；单 worker 也优先消费进程请求。这样线程批次积压不会阻塞决定整组
+task 默认值的进程分类。
 
 ```text
 ClassificationWork
@@ -401,6 +404,10 @@ ClassificationOutcome
 
 主线程使用 `try_send`；Full/Disconnected 都返回 false，Registry 把对应 `Requested` 恢复为
 `Pending`。worker 结果使用 1 s `send_timeout`，超时或结果通道断开即结束该 worker。
+
+进程 worker 发起 HTTP 前重新读取每个 TGID 的 `/proc` 元数据，只保留
+`ProcessInstanceKey(tgid,start_time_ticks)` 仍精确匹配的生命期。全部失效时不访问模型；部分失效时
+仅发送仍存活项。返回结果遗漏的请求项统一进入 `Failed` fallback，不能永久停留在 `Requested`。
 
 ### 8.2 HTTP request
 
@@ -591,6 +598,7 @@ take_process_batches(batch_size, max_batches)
 - `apply_process_proposals`：必须匹配 instance 的当前 request ID。保留 proposal，更新 semantic。
   对每个已绑定进程，如果结果为 Classified 且 class 不同或 generation 为 0，则
   `expected=applied_generation`、`class_generation += 1`，生成 `SetProcessDefault`。
+- 同一 request ID 中未被模型结果覆盖的 instance 标记为 `Failed`，并同步已绑定进程记录。
 - process action 同时把该进程下所有 `Inherited` task 的 effective class 和 desired generation 镜像更新。
 
 `on_process_discovered` 创建初始 `balanced/generation=0/applied=0`。如果预先完成的匹配 proposal 有效，
@@ -717,10 +725,11 @@ Locked -- no outgoing transition
 1. task/process 完整身份必须匹配，stage 不得是 Locked。
 2. sequence 必须大于已见值；重复/逆序丢弃。sequence 不连续先清 evidence。
 3. `quality=bad`、有 pending action 或 desired != applied 都清 evidence 并停止。
-4. semantic 只有 Classified/Unknown/Failed 时视为 ready；未 ready 且未超时则等待。
-5. task age 到 `behavior_lock_timeout_secs` 时视为超时；未 ready 的 semantic 先改为 Failed。
-6. proposal 的 task/process 必须与 window 相同，否则当 None。
-7. 同一候选 class 的连续窗口计数；class 改变则从 1 开始，None 清零。
+4. task semantic 为 Pending/Requested 且 stage 为 Inherited 时，先使用 process semantic 判断是否 ready。
+5. semantic 未 ready 不阻塞本地强证据：候选必须连续达到高置信修正窗口数才可 lock；没有候选时仍等待超时。
+6. task age 到 `behavior_lock_timeout_secs` 时视为超时；lock 时未完成的 task semantic 改为 Failed。
+7. proposal 的 task/process 必须与 window 相同，否则当 None。
+8. 同一候选 class 的连续窗口计数；class 改变则从 1 开始，None 清零。
 
 达到 lock 的阈值：
 

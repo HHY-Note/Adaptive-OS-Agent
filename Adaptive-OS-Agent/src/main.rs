@@ -16,7 +16,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
+use crossbeam_channel::{
+    bounded, select_biased, Receiver, RecvError, Sender, TryRecvError, TrySendError,
+};
 use log::{debug, info, warn};
 use simplelog::{ColorChoice, Config as LogConfig, LevelFilter, TermLogger, TerminalMode};
 
@@ -25,7 +27,9 @@ use adaptive_os_agent::config::AgentConfig;
 use adaptive_os_agent::discovery::scan_processes;
 use adaptive_os_agent::identity::TaskClass;
 use adaptive_os_agent::limits::RuntimeLimits;
-use adaptive_os_agent::metadata::{read_process, read_task_start_time, read_threads};
+use adaptive_os_agent::metadata::{
+    read_process, read_task_start_time, read_threads, ProcessMetadata,
+};
 use adaptive_os_agent::registry::{
     ClassificationRegistry, ProcessBatchPlan, RegistryAction, ThreadBatchPlan,
 };
@@ -111,7 +115,8 @@ enum ClassificationOutcome {
 
 /// Small fixed worker pool. All registry mutation remains on Agent main.
 struct ClassifierPool {
-    work_tx: Option<Sender<ClassificationWork>>,
+    process_work_tx: Option<Sender<ClassificationWork>>,
+    thread_work_tx: Option<Sender<ClassificationWork>>,
     outcomes: Receiver<ClassificationOutcome>,
     workers: Vec<JoinHandle<()>>,
     shutdown: Arc<AtomicBool>,
@@ -119,25 +124,38 @@ struct ClassifierPool {
 
 impl ClassifierPool {
     fn spawn(client: DeepSeekClient, workers: usize, capacity: usize) -> Result<Self> {
-        let (work_tx, work_rx) = bounded(capacity);
-        let (outcome_tx, outcomes) = bounded(capacity);
+        let process_capacity = capacity.saturating_sub(capacity / 2).max(1);
+        let thread_capacity = (capacity / 2).max(1);
+        let (process_work_tx, process_work_rx) = bounded(process_capacity);
+        let (thread_work_tx, thread_work_rx) = bounded(thread_capacity);
+        let (outcome_tx, outcomes) = bounded(capacity.max(workers).max(1));
         let shutdown = Arc::new(AtomicBool::new(false));
         let mut handles = Vec::with_capacity(workers);
         for index in 0..workers {
+            let process_only = workers > 1 && index == 0;
             let worker_client = client.clone();
-            let worker_rx = work_rx.clone();
+            let worker_process_rx = process_work_rx.clone();
+            let worker_thread_rx = thread_work_rx.clone();
             let worker_outcomes = outcome_tx.clone();
             let worker_shutdown = shutdown.clone();
             let handle = thread::Builder::new()
                 .name(format!("adaptive-agent-llm-{index}"))
                 .spawn(move || {
-                    worker_loop(worker_client, worker_rx, worker_outcomes, worker_shutdown)
+                    worker_loop(
+                        worker_client,
+                        worker_process_rx,
+                        worker_thread_rx,
+                        worker_outcomes,
+                        worker_shutdown,
+                        process_only,
+                    )
                 })
                 .context("spawn Agent semantic worker")?;
             handles.push(handle);
         }
         Ok(Self {
-            work_tx: Some(work_tx),
+            process_work_tx: Some(process_work_tx),
+            thread_work_tx: Some(thread_work_tx),
             outcomes,
             workers: handles,
             shutdown,
@@ -145,7 +163,11 @@ impl ClassifierPool {
     }
 
     fn submit(&self, work: ClassificationWork) -> bool {
-        let Some(work_tx) = self.work_tx.as_ref() else {
+        let work_tx = match &work {
+            ClassificationWork::Process { .. } => self.process_work_tx.as_ref(),
+            ClassificationWork::Thread { .. } => self.thread_work_tx.as_ref(),
+        };
+        let Some(work_tx) = work_tx else {
             return false;
         };
         match work_tx.try_send(work) {
@@ -160,7 +182,8 @@ impl ClassifierPool {
 
     fn shutdown(mut self) {
         self.shutdown.store(true, Ordering::Release);
-        self.work_tx.take();
+        self.process_work_tx.take();
+        self.thread_work_tx.take();
         let deadline = Instant::now() + WORKER_SHUTDOWN_GRACE;
         while self.workers.iter().any(|worker| !worker.is_finished()) && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(20));
@@ -177,21 +200,38 @@ impl ClassifierPool {
 
 fn worker_loop(
     client: DeepSeekClient,
-    work_rx: Receiver<ClassificationWork>,
+    process_work_rx: Receiver<ClassificationWork>,
+    thread_work_rx: Receiver<ClassificationWork>,
     outcomes: Sender<ClassificationOutcome>,
     shutdown: Arc<AtomicBool>,
+    process_only: bool,
 ) {
     let process_skill = ProcessSemanticClassificationSkill;
     let thread_skill = ThreadSemanticClassificationSkill;
-    while let Ok(work) = work_rx.recv() {
+    while let Ok(work) =
+        receive_classification_work(&process_work_rx, &thread_work_rx, process_only)
+    {
         if shutdown.load(Ordering::Acquire) {
             break;
         }
         let outcome = match work {
             ClassificationWork::Process { plan } => {
-                let result = process_skill
-                    .propose(&client, &plan.processes)
-                    .map_err(|error| format!("{error:#}"));
+                let processes = refresh_live_processes(&plan.processes);
+                if processes.len() != plan.processes.len() {
+                    debug!(
+                        "discarded stale process semantic items request_id={} stale={} live={}",
+                        plan.request_id,
+                        plan.processes.len().saturating_sub(processes.len()),
+                        processes.len()
+                    );
+                }
+                let result = if processes.is_empty() {
+                    Ok(Vec::new())
+                } else {
+                    process_skill
+                        .propose(&client, &processes)
+                        .map_err(|error| format!("{error:#}"))
+                };
                 ClassificationOutcome::Process { plan, result }
             }
             ClassificationWork::Thread { plan, threads } => {
@@ -208,6 +248,39 @@ fn worker_loop(
             break;
         }
     }
+}
+
+/// Receives process work first when both bounded semantic queues are ready.
+fn receive_classification_work<T>(
+    process_work_rx: &Receiver<T>,
+    thread_work_rx: &Receiver<T>,
+    process_only: bool,
+) -> std::result::Result<T, RecvError> {
+    if process_only {
+        return process_work_rx.recv();
+    }
+    match process_work_rx.try_recv() {
+        Ok(work) => return Ok(work),
+        Err(TryRecvError::Disconnected) => return thread_work_rx.recv(),
+        Err(TryRecvError::Empty) => {}
+    }
+    select_biased! {
+        recv(process_work_rx) -> work => work,
+        recv(thread_work_rx) -> work => work,
+    }
+}
+
+/// Refreshes metadata and removes exact process lifetimes that already exited.
+fn refresh_live_processes(processes: &[ProcessMetadata]) -> Vec<ProcessMetadata> {
+    processes
+        .iter()
+        .filter_map(|planned| {
+            read_process(planned.instance.tgid)
+                .ok()
+                .flatten()
+                .filter(|current| current.instance == planned.instance)
+        })
+        .collect()
 }
 
 fn init_logging(debug_enabled: bool) -> Result<()> {
@@ -921,7 +994,52 @@ fn write_snapshot(path: &Path, snapshot: &serde_json::Value) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::write_snapshot;
+    use crossbeam_channel::bounded;
+
+    use super::{receive_classification_work, refresh_live_processes, write_snapshot};
+    use adaptive_os_agent::metadata::read_process;
+
+    #[test]
+    fn process_semantics_precede_queued_thread_work() {
+        let (process_tx, process_rx) = bounded(1);
+        let (thread_tx, thread_rx) = bounded(1);
+        thread_tx.send("thread").unwrap();
+        process_tx.send("process").unwrap();
+
+        assert_eq!(
+            receive_classification_work(&process_rx, &thread_rx, false).unwrap(),
+            "process"
+        );
+        assert_eq!(
+            receive_classification_work(&process_rx, &thread_rx, false).unwrap(),
+            "thread"
+        );
+    }
+
+    #[test]
+    fn reserved_worker_consumes_only_process_semantics() {
+        let (process_tx, process_rx) = bounded(1);
+        let (thread_tx, thread_rx) = bounded(1);
+        thread_tx.send("thread").unwrap();
+        process_tx.send("process").unwrap();
+
+        assert_eq!(
+            receive_classification_work(&process_rx, &thread_rx, true).unwrap(),
+            "process"
+        );
+        assert_eq!(thread_rx.try_recv().unwrap(), "thread");
+    }
+
+    #[test]
+    fn semantic_worker_drops_reused_process_lifetimes() {
+        let current = read_process(std::process::id()).unwrap().unwrap();
+        let mut stale = current.clone();
+        stale.instance.start_time_ticks = stale.instance.start_time_ticks.saturating_add(1);
+
+        let live = refresh_live_processes(&[stale, current.clone()]);
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].instance, current.instance);
+    }
 
     /// Snapshot publication writes valid JSON at the requested final path.
     #[test]
