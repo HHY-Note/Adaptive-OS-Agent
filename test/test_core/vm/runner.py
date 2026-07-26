@@ -174,6 +174,7 @@ def _guest_timeout(spec: RunSpec) -> int:
         int(spec.benchmark["warmup_seconds"])
         + int(spec.benchmark["measurement_seconds"])
         + int(spec.benchmark["cooldown_seconds"])
+        + int(spec.scheduler.get("startup_timeout_seconds", 30))
         + int(spec.scheduler.get("warmup_seconds", 0))
         + int(spec.libvirt.get("vm_warmup_seconds", 0))
         + int(spec.scheduler.get("timeout_extra_seconds", 30))

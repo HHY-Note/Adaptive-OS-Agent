@@ -57,6 +57,8 @@ class BenchmarkConfigTests(unittest.TestCase):
         self.assertEqual(self.performance["repeats"], 3)
         self.assertEqual(self.performance["warmup_seconds"], 20)
         self.assertEqual(self.performance["measurement_seconds"], 60)
+        agent = self.config["schedulers"][self.performance["variants"]["agent"]]
+        self.assertEqual(agent["startup_timeout_seconds"], 20)
         self.assertEqual(self.performance["workload"]["kind"], "baked-real-apps")
         self.assertNotIn("scenarios", self.performance)
         machine = self.config["machines"][self.performance["machine"]]
@@ -87,12 +89,15 @@ class BenchmarkConfigTests(unittest.TestCase):
         self.assertEqual(completed.stdout.count(" repeat=1 "), 8)
 
     def test_single_scenario_argument_has_one_native_agent_pair(self) -> None:
+        template_image = Path("/tmp/aoa-controlled-image.qcow2")
         completed = subprocess.run(
             [
                 sys.executable,
                 TEST_ROOT / "scripts" / "benchmark.py",
                 "throughput",
                 "--single-round",
+                "--template-image",
+                template_image,
                 "--dry-run",
             ],
             check=True,
@@ -104,6 +109,7 @@ class BenchmarkConfigTests(unittest.TestCase):
         self.assertNotIn("scenario=latency", completed.stdout)
         self.assertNotIn("scenario=balanced", completed.stdout)
         self.assertNotIn("scenario=mix", completed.stdout)
+        self.assertIn(f"template_image: {template_image}", completed.stdout)
 
     def test_guest_scripts_use_image_workload_and_valid_shell(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -128,6 +134,9 @@ class BenchmarkConfigTests(unittest.TestCase):
                         'set(collector.get("target_apps", [])) != target_apps', script
                     )
                     self.assertIn("aoa-real-workload-autostart.service", script)
+                    self.assertIn(
+                        'wait_for_scheduler "$SCHEDULER_START_TIMEOUT_SECONDS"', script
+                    )
                     self.assertNotIn("taskbench", script)
                     self.assertNotIn("workload-build", script)
                     if variant == "agent":

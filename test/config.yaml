@@ -47,6 +47,7 @@ schedulers:
       - /bench_out/scheduler-snapshot.json
     expected_ops: scx_adaptive
     snapshot_file: /bench_out/scheduler-snapshot.json
+    startup_timeout_seconds: 20
     warmup_seconds: 3
     stop_signal: TERM
     stop_timeout_seconds: 60

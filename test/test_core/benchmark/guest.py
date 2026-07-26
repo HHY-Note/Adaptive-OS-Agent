@@ -25,6 +25,7 @@ def build_guest_script(spec: RunSpec) -> str:
     measurement = int(benchmark["measurement_seconds"])
     cooldown = int(benchmark["cooldown_seconds"])
     scheduler_warmup = int(scheduler.get("warmup_seconds", 0))
+    scheduler_start_timeout = int(scheduler.get("startup_timeout_seconds", 30))
     expected_ops = str(scheduler.get("expected_ops", ""))
     snapshot_file = str(scheduler.get("snapshot_file", ""))
     tool_socket = str(scheduler.get("tool_socket", ""))
@@ -70,6 +71,7 @@ STOP_SIGNAL={shlex.quote(stop_signal)}
 STOP_TIMEOUT_SECONDS={stop_timeout}
 VM_WARMUP_SECONDS={int(spec.libvirt.get('vm_warmup_seconds', 0))}
 SCHEDULER_WARMUP_SECONDS={scheduler_warmup}
+SCHEDULER_START_TIMEOUT_SECONDS={scheduler_start_timeout}
 WARMUP_SECONDS={warmup}
 MEASUREMENT_SECONDS={measurement}
 COOLDOWN_SECONDS={cooldown}
@@ -129,6 +131,21 @@ check_scheduler() {{
         return
     fi
     process_alive && [ "$state" = enabled ] && ops_matches "$(read_scx_ops)"
+}}
+
+wait_for_scheduler() {{
+    seconds="$1"
+    count=0
+    limit=$((seconds * 10))
+    while [ "$count" -lt "$limit" ]; do
+        check_scheduler && return 0
+        if [ "$SCHEDULER_KIND" != builtin ] && ! process_alive; then
+            return 1
+        fi
+        sleep 0.1
+        count=$((count + 1))
+    done
+    check_scheduler
 }}
 
 stop_scheduler() {{
@@ -256,9 +273,13 @@ environment_rc="$?"
 
     execution = f'''
 {scheduler_start}
-[ "$SCHEDULER_WARMUP_SECONDS" -eq 0 ] || sleep "$SCHEDULER_WARMUP_SECONDS"
-check_scheduler
+wait_for_scheduler "$SCHEDULER_START_TIMEOUT_SECONDS"
 scheduler_start_rc="$?"
+if [ "$scheduler_start_rc" -eq 0 ] && [ "$SCHEDULER_WARMUP_SECONDS" -gt 0 ]; then
+    sleep "$SCHEDULER_WARMUP_SECONDS"
+    check_scheduler
+    scheduler_start_rc="$?"
+fi
 
 if [ "$environment_rc" -eq 0 ] && [ "$workload_ready_rc" -eq 0 ] && [ "$scheduler_start_rc" -eq 0 ]; then
     printf '%s %s\n' "$WARMUP_SECONDS" "$MEASUREMENT_SECONDS" >"$WINDOW_FILE"
@@ -363,7 +384,10 @@ if duration_seconds < expected_duration * 0.8 or duration_seconds > maximum_dura
 
 metrics = []
 apps_root = real / "apps"
-for directory in sorted(path for path in apps_root.iterdir() if path.is_dir()):
+if not apps_root.is_dir():
+    errors.append("application metrics directory is missing")
+directories = sorted(path for path in apps_root.iterdir() if path.is_dir()) if apps_root.is_dir() else []
+for directory in directories:
     metric = load_json(directory / "metrics.json")
     if metric:
         metrics.append(metric)

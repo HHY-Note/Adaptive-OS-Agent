@@ -218,6 +218,11 @@ def _validate_schedulers(schedulers: dict[str, Any]) -> None:
         warmup = scheduler.get("warmup_seconds", 0)
         if not isinstance(warmup, int) or warmup < 0:
             raise ConfigError(f"schedulers.{name}.warmup_seconds must be a non-negative integer")
+        startup_timeout = scheduler.get("startup_timeout_seconds", 30)
+        if not isinstance(startup_timeout, int) or startup_timeout < 1:
+            raise ConfigError(
+                f"schedulers.{name}.startup_timeout_seconds must be a positive integer"
+            )
         stop_timeout = scheduler.get("stop_timeout_seconds", 5)
         if not isinstance(stop_timeout, int) or stop_timeout < 1:
             raise ConfigError(f"schedulers.{name}.stop_timeout_seconds must be a positive integer")

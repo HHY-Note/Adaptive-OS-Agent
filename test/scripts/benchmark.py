@@ -78,6 +78,10 @@ def main(argv: list[str] | None = None) -> int:
             )
             for repeat, scenario, variant in schedule
         ]
+        if args.template_image is not None:
+            template_image = str(args.template_image.expanduser().resolve())
+            for spec in specs:
+                spec.libvirt["template_image"] = template_image
     except ConfigError as exc:
         print(f"config error: {exc}", file=sys.stderr)
         return 2
@@ -153,6 +157,11 @@ def _parser() -> argparse.ArgumentParser:
         help="只运行一种镜像内真实应用负载；默认 all",
     )
     parser.add_argument("--output", type=Path)
+    parser.add_argument(
+        "--template-image",
+        type=Path,
+        help="override the configured VM image for this controlled campaign",
+    )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--analyze-only", type=Path)
     parser.add_argument(
@@ -205,6 +214,7 @@ def _manifest(
         "config_path": config["__config_path"],
         "machine": performance["machine"],
         "profile": profile,
+        "template_image": specs[0].libvirt["template_image"] if specs else None,
         "variants": dict(performance["variants"]),
         "schedule": [
             {
@@ -223,6 +233,8 @@ def _manifest(
 def _print_schedule(profile: str, specs: list[Any]) -> None:
     print(f"profile: {profile}")
     print(f"runs: {len(specs)}")
+    if specs:
+        print(f"template_image: {specs[0].libvirt['template_image']}")
     for index, spec in enumerate(specs, start=1):
         print(
             f"  {index:03d} repeat={spec.benchmark['repeat']} "

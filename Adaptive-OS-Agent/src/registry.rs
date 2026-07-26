@@ -1500,7 +1500,7 @@ impl ClassificationRegistry {
             semantic_evidence(task.semantic),
             semantic_evidence(process_semantic),
         ];
-        let final_decision = if let Some((candidate, _)) = candidate {
+        let evidence_decision = if let Some((candidate, _)) = candidate {
             let latency_objective_known = candidate != TaskClass::Latency
                 || process_default_class == TaskClass::Latency
                 || semantic_evidence
@@ -1510,46 +1510,52 @@ impl ClassificationRegistry {
                         *class == TaskClass::Latency && *confidence >= specialization_confidence
                     });
             if !latency_objective_known {
-                return Vec::new();
-            }
-            let supports_candidate = semantic_evidence
-                .iter()
-                .flatten()
-                .any(|(class, _)| *class == candidate);
-            let contradiction_confidence = semantic_evidence
-                .iter()
-                .flatten()
-                .filter_map(|(class, confidence)| {
-                    (*class != candidate && *class != TaskClass::Balanced).then_some(*confidence)
-                })
-                .max()
-                .unwrap_or(0);
-            let unsupported_contradiction = contradiction_confidence > 0 && !supports_candidate;
-            let threshold = if (unsupported_contradiction
-                && contradiction_confidence >= (config.high_confidence_threshold * 1000.0) as u16)
-                || (candidate == TaskClass::Balanced && task.behavior.confidence_per_mille < 800)
-            {
-                config.high_confidence_correction_windows
+                None
             } else {
-                config.low_confidence_correction_windows
-            };
-            (task.behavior.windows >= threshold).then_some((
-                if unsupported_contradiction {
-                    TaskClass::Balanced
+                let supports_candidate = semantic_evidence
+                    .iter()
+                    .flatten()
+                    .any(|(class, _)| *class == candidate);
+                let contradiction_confidence = semantic_evidence
+                    .iter()
+                    .flatten()
+                    .filter_map(|(class, confidence)| {
+                        (*class != candidate && *class != TaskClass::Balanced)
+                            .then_some(*confidence)
+                    })
+                    .max()
+                    .unwrap_or(0);
+                let unsupported_contradiction = contradiction_confidence > 0 && !supports_candidate;
+                let threshold = if (unsupported_contradiction
+                    && contradiction_confidence
+                        >= (config.high_confidence_threshold * 1000.0) as u16)
+                    || (candidate == TaskClass::Balanced
+                        && task.behavior.confidence_per_mille < 800)
+                {
+                    config.high_confidence_correction_windows
                 } else {
-                    candidate
-                },
-                Some(if unsupported_contradiction {
-                    task.behavior
-                        .confidence_per_mille
-                        .min(contradiction_confidence)
-                } else {
-                    task.behavior.confidence_per_mille
-                }),
-            ))
+                    config.low_confidence_correction_windows
+                };
+                (task.behavior.windows >= threshold).then_some((
+                    if unsupported_contradiction {
+                        TaskClass::Balanced
+                    } else {
+                        candidate
+                    },
+                    Some(if unsupported_contradiction {
+                        task.behavior
+                            .confidence_per_mille
+                            .min(contradiction_confidence)
+                    } else {
+                        task.behavior.confidence_per_mille
+                    }),
+                ))
+            }
         } else {
-            timed_out.then_some((task.effective_class, None))
+            None
         };
+        let final_decision =
+            evidence_decision.or_else(|| timed_out.then_some((task.effective_class, None)));
         let Some((final_class, behavior_confidence_per_mille)) = final_decision else {
             return Vec::new();
         };
@@ -2762,6 +2768,51 @@ mod tests {
                 ..
             }]
         ));
+    }
+
+    /// The observation deadline locks the current class when a candidate has
+    /// not accumulated enough consecutive evidence to justify a correction.
+    #[test]
+    fn behavior_timeout_bounds_weak_candidate_observation() {
+        let mut registry = ClassificationRegistry::default();
+        let process = ProcessKey {
+            tgid: 101,
+            process_cookie: 102,
+            exec_generation: 1,
+        };
+        let task = TaskKey {
+            tid: 103,
+            task_cookie: 104,
+        };
+        registry.on_task_discovered(task, process, 1);
+        registry.tasks.get_mut(&task).unwrap().semantic = SemanticState::Unknown;
+        let config = ClassificationConfig::default();
+        let proposal = BehaviorClassificationProposal {
+            task,
+            process,
+            class: TaskClass::Throughput,
+            confidence_per_mille: 900,
+        };
+        let timeout_ns = config.behavior_lock_timeout_secs * 1_000_000_000;
+        let mut before_timeout = behavior_window(task, process, 1);
+        before_timeout.task_age_ns = timeout_ns - 1;
+        assert!(registry
+            .apply_behavior_window(before_timeout, Some(proposal), &config)
+            .is_empty());
+
+        let mut at_timeout = behavior_window(task, process, 2);
+        at_timeout.task_age_ns = timeout_ns;
+        assert!(matches!(
+            registry
+                .apply_behavior_window(at_timeout, Some(proposal), &config)
+                .as_slice(),
+            [RegistryAction::SetTaskClass {
+                class: TaskClass::Balanced,
+                stage: ClassStage::Locked,
+                ..
+            }]
+        ));
+        assert_eq!(registry.task(task).unwrap().stage, ClassStage::Locked);
     }
 
     /// Strong local evidence resolves a task after three windows even while its
