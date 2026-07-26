@@ -377,7 +377,7 @@ for directory in sorted(path for path in apps_root.iterdir() if path.is_dir()):
 role_counts = Counter(str(metric.get("role")) for metric in metrics)
 minimums = {
     "latency": {"latency": 4, "throughput": 1},
-    "throughput": {"throughput": 5},
+    "throughput": {"latency": 1, "throughput": 5},
     "mix": {"latency": 3, "throughput": 4, "balanced": 2},
 }[scenario]
 for role, minimum in minimums.items():
@@ -417,7 +417,7 @@ if agent_required:
         errors.append("classification snapshot was not collected")
     else:
         classification = load_json(bench / "observations" / "classification-snapshot.json")
-        if classification.get("schema_version") != 1 or not isinstance(classification.get("processes"), list) or not isinstance(classification.get("threads"), list):
+        if classification.get("schema_version") not in {1, 2} or not isinstance(classification.get("processes"), list) or not isinstance(classification.get("threads"), list):
             errors.append("classification snapshot structure is invalid")
     scheduler_rows = [row for row in load_jsonl(bench / "observations" / "scheduler-stats.jsonl") if start_ns <= int(row.get("observed_ns", 0)) <= end_ns]
     epochs = {row.get("scheduler_epoch") for row in scheduler_rows if row.get("scheduler_epoch") is not None}

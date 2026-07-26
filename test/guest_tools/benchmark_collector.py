@@ -130,15 +130,15 @@ def _load_process_targets(
 
     targets: dict[tuple[int, int], dict[str, Any]] = {}
     for root_pid, root in roots.items():
-        process_ids = {root_pid}
+        process_depths = {root_pid: 0}
         changed = True
         while changed:
-            descendants = {
-                pid for pid, parent in parent_by_pid.items() if parent in process_ids
-            }
-            changed = not descendants.issubset(process_ids)
-            process_ids.update(descendants)
-        for pid in process_ids:
+            changed = False
+            for pid, parent in parent_by_pid.items():
+                if pid not in process_depths and parent in process_depths:
+                    process_depths[pid] = process_depths[parent] + 1
+                    changed = True
+        for pid, process_depth in process_depths.items():
             task_root = Path(f"/proc/{pid}/task")
             try:
                 tids = [int(entry.name) for entry in task_root.iterdir() if entry.name.isdigit()]
@@ -152,45 +152,69 @@ def _load_process_targets(
                     "mode": root["mode"],
                     "worker": f"{root['name']}:{tid}",
                     "app": root["name"],
+                    "root_pid": root_pid,
+                    "process_depth": process_depth,
+                    "process_role": "root" if process_depth == 0 else "descendant",
                 }
     return targets, set(targets)
 
 
-def _map_identities(
+def _map_classification_entries(
     items: list[Any], targets: dict[tuple[int, int], dict[str, Any]]
 ) -> tuple[
     dict[tuple[int, int], dict[str, Any]],
     dict[int, dict[str, Any]],
 ]:
-    task_identities: dict[tuple[int, int], dict[str, Any]] = {}
-    process_identities: dict[int, dict[str, Any]] = {}
+    task_entries: dict[tuple[int, int], dict[str, Any]] = {}
+    process_entries: dict[int, dict[str, Any]] = {}
+    target_processes = {pid for pid, _tid in targets}
     for item in items:
-        if not isinstance(item, dict) or item.get("kind") != "task":
+        if not isinstance(item, dict):
             continue
         identity = item.get("identity")
-        process = item.get("process")
-        if not isinstance(identity, dict) or not isinstance(process, dict):
+        if not isinstance(identity, dict):
             continue
-        try:
-            key = (int(process["tgid"]), int(identity["tid"]))
-        except (KeyError, TypeError, ValueError):
-            continue
-        if key in targets:
-            task_identities[key] = identity
-            process_identities[key[0]] = process
-    return task_identities, process_identities
+        if item.get("kind") == "process":
+            try:
+                pid = int(identity["tgid"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if pid in target_processes:
+                process_entries[pid] = item
+        elif item.get("kind") == "task":
+            process = item.get("process")
+            if not isinstance(process, dict):
+                continue
+            try:
+                key = (int(process["tgid"]), int(identity["tid"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+            if key in targets:
+                task_entries[key] = item
+                process_entries.setdefault(key[0], {"identity": process})
+    return task_entries, process_entries
 
 
 def _process_targets(
     targets: dict[tuple[int, int], dict[str, Any]],
-) -> dict[int, str]:
-    modes: dict[int, set[str]] = {}
+) -> dict[int, dict[str, Any]]:
+    grouped: dict[int, list[dict[str, Any]]] = {}
     for (pid, _tid), target in targets.items():
-        modes.setdefault(pid, set()).add(str(target["mode"]))
-    return {
-        pid: next(iter(values)) if len(values) == 1 else "mixed"
-        for pid, values in modes.items()
-    }
+        grouped.setdefault(pid, []).append(target)
+    result: dict[int, dict[str, Any]] = {}
+    for pid, rows in grouped.items():
+        modes = {str(row["mode"]) for row in rows}
+        apps = {str(row.get("app", "unknown")) for row in rows}
+        roots = {int(row.get("root_pid", pid)) for row in rows}
+        depths = {int(row.get("process_depth", 0)) for row in rows}
+        result[pid] = {
+            "expected_class": next(iter(modes)) if len(modes) == 1 else "mixed",
+            "app": next(iter(apps)) if len(apps) == 1 else "mixed",
+            "root_pid": next(iter(roots)) if len(roots) == 1 else None,
+            "process_depth": min(depths) if depths else None,
+            "process_role": "root" if depths == {0} else "descendant",
+        }
+    return result
 
 
 def _classification_snapshot(
@@ -201,29 +225,46 @@ def _classification_snapshot(
     expected_workers: int,
 ) -> dict[str, Any]:
     started_ns = time.monotonic_ns()
-    active_targets = {key: targets[key] for key in active}
-    task_identities: dict[tuple[int, int], dict[str, Any]] = {}
-    process_identities: dict[int, dict[str, Any]] = {}
+    snapshot_targets = dict(targets)
+    task_entries: dict[tuple[int, int], dict[str, Any]] = {}
+    process_entries: dict[int, dict[str, Any]] = {}
     errors: list[dict[str, Any]] = []
     try:
-        listing = client.query("workload.list", {"scope": "task", "limit": 1000})
-        task_identities, process_identities = _map_identities(
-            listing.get("items", []), active_targets
+        listing = client.query(
+            "workload.list",
+            {
+                "scope": "all",
+                "limit": 1000,
+                "tgids": sorted({pid for pid, _tid in snapshot_targets}),
+            },
+        )
+        task_entries, process_entries = _map_classification_entries(
+            listing.get("items", []), snapshot_targets
         )
     except (OSError, RuntimeError, ValueError) as exc:
         errors.append({"scope": "list", "error": str(exc)})
 
     processes = []
-    for pid, expected_class in sorted(_process_targets(active_targets).items()):
+    active_processes = {pid for pid, _tid in active}
+    for pid, target in sorted(_process_targets(snapshot_targets).items()):
         row: dict[str, Any] = {
             "pid": pid,
-            "expected_class": expected_class,
+            **target,
+            "active_at_snapshot": pid in active_processes,
             "observed": False,
         }
-        identity = process_identities.get(pid)
-        if identity is not None:
+        entry = process_entries.get(pid)
+        if entry is not None:
             try:
-                row.update(client.query("classification.get", {"process": identity}))
+                classification = entry.get("classification")
+                if isinstance(classification, dict):
+                    row.update(classification)
+                else:
+                    row.update(
+                        client.query(
+                            "classification.get", {"process": entry["identity"]}
+                        )
+                    )
                 row["observed"] = True
             except (OSError, RuntimeError, ValueError) as exc:
                 row["error"] = str(exc)
@@ -231,19 +272,32 @@ def _classification_snapshot(
         processes.append(row)
 
     threads = []
-    for key, target in sorted(active_targets.items()):
+    for key, target in sorted(snapshot_targets.items()):
         pid, tid = key
         row = {
             "pid": pid,
             "tid": tid,
             "worker": target["worker"],
+            "app": target.get("app", "unknown"),
+            "root_pid": target.get("root_pid", pid),
+            "process_depth": target.get("process_depth", 0),
+            "process_role": target.get("process_role", "root"),
             "expected_class": target["mode"],
+            "active_at_snapshot": key in active,
             "observed": False,
         }
-        identity = task_identities.get(key)
-        if identity is not None:
+        entry = task_entries.get(key)
+        if entry is not None:
             try:
-                row.update(client.query("classification.get", {"task": identity}))
+                classification = entry.get("classification")
+                if isinstance(classification, dict):
+                    row.update(classification)
+                else:
+                    row.update(
+                        client.query(
+                            "classification.get", {"task": entry["identity"]}
+                        )
+                    )
                 row["observed"] = True
             except (OSError, RuntimeError, ValueError) as exc:
                 row["error"] = str(exc)
@@ -253,7 +307,7 @@ def _classification_snapshot(
         threads.append(row)
 
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "scheduled_ns": scheduled_ns,
         "started_ns": started_ns,
         "completed_ns": time.monotonic_ns(),
@@ -273,10 +327,19 @@ def _write_json_atomic(path: Path, value: dict[str, Any]) -> None:
 
 
 def _read_schedstat(target: dict[str, Any]) -> dict[str, Any] | None:
-    path = Path(f"/proc/{target['pid']}/task/{target['tid']}/schedstat")
+    task_root = Path(f"/proc/{target['pid']}/task/{target['tid']}")
     try:
-        fields = path.read_text(encoding="utf-8").split()
+        fields = (task_root / "schedstat").read_text(encoding="utf-8").split()
+        sched = (task_root / "sched").read_text(encoding="utf-8")
         run_ns, wait_ns, timeslices = (int(value) for value in fields[:3])
+        migrations = next(
+            (
+                int(line.split(":", 1)[1])
+                for line in sched.splitlines()
+                if line.strip().startswith("se.nr_migrations")
+            ),
+            0,
+        )
     except (OSError, ValueError):
         return None
     return {
@@ -284,6 +347,7 @@ def _read_schedstat(target: dict[str, Any]) -> dict[str, Any] | None:
         "run_ns": run_ns,
         "wait_ns": wait_ns,
         "timeslices": timeslices,
+        "migrations": migrations,
     }
 
 
@@ -381,6 +445,7 @@ def _scheduler_sample(stats: dict[str, Any], observed_ns: int) -> dict[str, Any]
                 "cpu_state_events_suppressed",
                 "fast_path_empty_steal_skips",
                 "fast_path_preemption_throttles",
+                "fast_path_latency_backlog_boosts",
             )
         },
     }
@@ -416,6 +481,33 @@ def collect(args: argparse.Namespace) -> int:
             targets, active = _load_process_targets(targets_path)
             seen_targets.update(targets)
 
+            if (
+                client is not None
+                and classification_snapshot is None
+                and args.classification_snapshot_at_ns
+                and observed_ns >= args.classification_snapshot_at_ns
+                and active
+            ):
+                classification_snapshot = _classification_snapshot(
+                    client,
+                    seen_targets,
+                    active,
+                    args.classification_snapshot_at_ns,
+                    args.expected_workers or len(active),
+                )
+                _write_json_atomic(
+                    output_dir / "classification-snapshot.json",
+                    classification_snapshot,
+                )
+                for error in classification_snapshot["errors"]:
+                    writers["errors"].write(
+                        {
+                            "observed_ns": classification_snapshot["started_ns"],
+                            **error,
+                        }
+                    )
+                tool_errors += len(classification_snapshot["errors"])
+
             for key in sorted(active):
                 target = targets[key]
                 row = _read_schedstat(target)
@@ -445,31 +537,6 @@ def collect(args: argparse.Namespace) -> int:
                         {"observed_ns": observed_ns, "error": str(exc)}
                     )
 
-                if (
-                    classification_snapshot is None
-                    and args.classification_snapshot_at_ns
-                    and observed_ns >= args.classification_snapshot_at_ns
-                    and active
-                ):
-                    classification_snapshot = _classification_snapshot(
-                        client,
-                        targets,
-                        active,
-                        args.classification_snapshot_at_ns,
-                        args.expected_workers or len(active),
-                    )
-                    _write_json_atomic(
-                        output_dir / "classification-snapshot.json",
-                        classification_snapshot,
-                    )
-                    for error in classification_snapshot["errors"]:
-                        writers["errors"].write(
-                            {
-                                "observed_ns": classification_snapshot["started_ns"],
-                                **error,
-                            }
-                        )
-                    tool_errors += len(classification_snapshot["errors"])
             samples += 1
             next_sample += args.interval_seconds
             if next_sample <= now:

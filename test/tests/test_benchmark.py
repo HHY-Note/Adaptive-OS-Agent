@@ -19,6 +19,7 @@ if str(TEST_ROOT) not in sys.path:
 from test_core.benchmark.analysis import (
     _classification_scope_metrics,
     _comparisons,
+    _schedstat_metrics,
     analyze_run,
 )
 from test_core.benchmark.config import build_spec, campaign_schedule, load_performance
@@ -217,6 +218,9 @@ class CollectorTests(unittest.TestCase):
             self.assertIn((pid, pid), active)
             self.assertEqual(targets[(pid, pid)]["app"], "unit-app")
             self.assertEqual(targets[(pid, pid)]["mode"], "latency")
+            self.assertEqual(targets[(pid, pid)]["root_pid"], pid)
+            self.assertEqual(targets[(pid, pid)]["process_depth"], 0)
+            self.assertEqual(targets[(pid, pid)]["process_role"], "root")
 
             path.write_text(
                 json.dumps(
@@ -237,6 +241,14 @@ class CollectorTests(unittest.TestCase):
                     "source": "llm",
                     "generation": 2,
                     "applied_generation": 2,
+                    "process_role": "root",
+                    "app": "latency-app",
+                    "timing": {
+                        "request_delay_ns": 1_000_000_000,
+                        "semantic_latency_ns": 2_000_000_000,
+                        "decision_delay_ns": 3_000_000_000,
+                        "apply_delay_ns": 4_000_000_000,
+                    },
                 },
                 {
                     "observed": True,
@@ -246,6 +258,13 @@ class CollectorTests(unittest.TestCase):
                     "source": "behavior",
                     "generation": 3,
                     "applied_generation": 2,
+                    "process_role": "descendant",
+                    "app": "throughput-app",
+                    "timing": {
+                        "behavior_delay_ns": 2_000_000_000,
+                        "decision_delay_ns": 4_000_000_000,
+                        "lock_delay_ns": 4_000_000_000,
+                    },
                 },
             ],
             2,
@@ -253,6 +272,46 @@ class CollectorTests(unittest.TestCase):
         )
         self.assertEqual(metrics["effective_accuracy"], 1.0)
         self.assertEqual(metrics["generation_applied_ratio"], 0.5)
+        self.assertEqual(metrics["confusion_matrix"]["latency"]["latency"], 1)
+        self.assertEqual(metrics["accuracy_by_source"]["behavior"]["accuracy"], 1.0)
+        self.assertEqual(
+            metrics["accuracy_by_process_role"]["descendant"]["accuracy"], 1.0
+        )
+        self.assertEqual(metrics["timing"]["decision_delay"]["samples"], 2)
+        self.assertEqual(metrics["timing"]["decision_delay"]["median_seconds"], 3.5)
+
+        process_metrics = _classification_scope_metrics(
+            [
+                {
+                    "observed": True,
+                    "expected_class": "latency",
+                    "class": "latency",
+                    "source": "behavior",
+                    "generation": 1,
+                    "applied_generation": 1,
+                },
+                {
+                    "observed": True,
+                    "expected_class": "balanced",
+                    "class": "balanced",
+                    "source": "semantic_cache",
+                    "generation": 2,
+                    "applied_generation": 2,
+                },
+                {
+                    "observed": True,
+                    "expected_class": "throughput",
+                    "class": "throughput",
+                    "source": "local_metadata",
+                    "generation": 1,
+                    "applied_generation": 1,
+                },
+            ],
+            3,
+            scope="process",
+        )
+        self.assertEqual(process_metrics["resolved_coverage"], 1.0)
+        self.assertEqual(process_metrics["resolved_accuracy"], 1.0)
 
     def test_classification_snapshot_queries_each_process_once(self) -> None:
         class Client:
@@ -280,21 +339,98 @@ class CollectorTests(unittest.TestCase):
                 }
 
         targets = {
-            (10, tid): {"mode": "latency", "worker": f"app:{tid}"}
+            (10, tid): {
+                "mode": "latency",
+                "worker": f"app:{tid}",
+                "app": "app",
+                "root_pid": 10,
+                "process_depth": 0,
+                "process_role": "root",
+            }
             for tid in (11, 12)
         }
         client = Client()
         snapshot = _classification_snapshot(client, targets, set(targets), 100, 2)
         self.assertEqual(len(snapshot["processes"]), 1)
         self.assertEqual(len(snapshot["threads"]), 2)
+        self.assertEqual(snapshot["schema_version"], 2)
+        self.assertEqual(snapshot["processes"][0]["app"], "app")
+        self.assertEqual(snapshot["processes"][0]["process_role"], "root")
         self.assertEqual(snapshot["errors"], [])
         self.assertEqual(
             [tool for tool, _arguments in client.calls],
             ["workload.list", "classification.get", "classification.get", "classification.get"],
         )
 
+    def test_classification_snapshot_uses_batched_list_projection(self) -> None:
+        process = {"tgid": 10, "process_cookie": 1, "exec_generation": 1}
+
+        class Client:
+            def __init__(self) -> None:
+                self.calls: list[str] = []
+
+            def query(self, tool: str, _arguments: dict[str, object]) -> dict[str, object]:
+                self.calls.append(tool)
+                if tool != "workload.list":
+                    raise AssertionError(f"unexpected per-item query: {tool}")
+                process_classification = {
+                    "class": "latency",
+                    "source": "llm",
+                    "generation": 1,
+                    "applied_generation": 1,
+                }
+                items: list[dict[str, object]] = [
+                    {
+                        "kind": "process",
+                        "identity": process,
+                        "classification": process_classification,
+                    }
+                ]
+                for tid in (11, 12):
+                    items.append(
+                        {
+                            "kind": "task",
+                            "identity": {"tid": tid, "task_cookie": tid},
+                            "process": process,
+                            "classification": {
+                                **process_classification,
+                                "stage": "semantic",
+                            },
+                        }
+                    )
+                return {"items": items}
+
+        targets = {
+            (10, tid): {
+                "mode": "latency",
+                "worker": f"app:{tid}",
+                "app": "app",
+                "root_pid": 10,
+                "process_depth": 0,
+                "process_role": "root",
+            }
+            for tid in (11, 12)
+        }
+        client = Client()
+        snapshot = _classification_snapshot(client, targets, set(targets), 100, 2)
+
+        self.assertEqual(client.calls, ["workload.list"])
+        self.assertTrue(all(row["observed"] for row in snapshot["processes"]))
+        self.assertTrue(all(row["observed"] for row in snapshot["threads"]))
+
 
 class WorkloadSummaryTests(unittest.TestCase):
+    def test_throughput_profile_keeps_redis_as_latency_sentinel(self) -> None:
+        dispatcher = (
+            TEST_ROOT / "image" / "real_workloads" / "aoa-real-workload"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            'redis_job redis-sentinel latency "$phase" "$duration"', dispatcher
+        )
+        self.assertNotIn(
+            'redis_job redis-sentinel throughput "$phase" "$duration"', dispatcher
+        )
+
     def test_rocksdb_rate_ignores_initial_zero(self) -> None:
         output = (
             "Read rate: 0 ops/second\n"
@@ -333,6 +469,44 @@ class SSHTransferTests(unittest.TestCase):
 
 
 class AnalysisTests(unittest.TestCase):
+    def test_schedstat_metrics_break_down_existing_samples(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bench_dir = Path(directory)
+            observations = bench_dir / "observations"
+            observations.mkdir()
+            rows = [
+                {
+                    "observed_ns": observed_ns,
+                    "app": app,
+                    "mode": mode,
+                    "pid": pid,
+                    "tid": pid,
+                    "run_ns": run_ns,
+                    "wait_ns": wait_ns,
+                    "timeslices": timeslices,
+                    "migrations": migrations,
+                }
+                for observed_ns, app, mode, pid, run_ns, wait_ns, timeslices, migrations in (
+                    (100, "api", "latency", 1, 10, 20, 1, 2),
+                    (200, "api", "latency", 1, 40, 60, 4, 5),
+                    (100, "batch", "throughput", 2, 5, 5, 1, 1),
+                    (200, "batch", "throughput", 2, 25, 15, 3, 2),
+                )
+            ]
+            (observations / "task-schedstat.jsonl").write_text(
+                "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+            )
+
+            metrics = _schedstat_metrics(bench_dir, 100, 200)
+
+            self.assertEqual(metrics["workers"], 2)
+            self.assertEqual(metrics["migrations"], 4)
+            self.assertEqual(metrics["by_application"]["api"]["timeslices"], 3)
+            self.assertEqual(metrics["by_application"]["api"]["migrations"], 3)
+            self.assertAlmostEqual(
+                metrics["by_class"]["latency"]["wait_ratio"], 40 / 70
+            )
+
     def test_real_application_metrics_use_geometric_means(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             run_dir = Path(directory)

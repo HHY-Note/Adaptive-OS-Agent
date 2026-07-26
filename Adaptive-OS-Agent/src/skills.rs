@@ -26,6 +26,8 @@ pub struct BehaviorClassificationProposal {
     pub process: ProcessKey,
     /// Class suggested by measurable scheduling facts.
     pub class: TaskClass,
+    /// Deterministic evidence strength in per-mille units.
+    pub confidence_per_mille: u16,
 }
 
 /// Produces one-time process semantic proposals from bounded `/proc` metadata.
@@ -67,11 +69,12 @@ pub struct BehaviorClassificationSkill;
 impl BehaviorClassificationSkill {
     /// Returns only strong, identity-bound evidence suitable for Registry voting.
     pub fn propose(&self, window: BehaviorWindow) -> Option<BehaviorClassificationProposal> {
-        let class = classify_window(window)?;
+        let assessment = classify_window(window)?;
         Some(BehaviorClassificationProposal {
             task: window.task,
             process: window.process,
-            class,
+            class: assessment.class,
+            confidence_per_mille: assessment.confidence_per_mille,
         })
     }
 }
@@ -122,6 +125,7 @@ mod tests {
         assert_eq!(proposal.task, window.task);
         assert_eq!(proposal.process, window.process);
         assert_eq!(proposal.class, TaskClass::Throughput);
+        assert_eq!(proposal.confidence_per_mille, 900);
     }
 
     /// Invalid windows cannot produce proposals.

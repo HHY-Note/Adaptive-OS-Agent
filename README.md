@@ -2,7 +2,7 @@
 
 本项目由三个协同但可独立构建的部分组成：
 
-- `Adaptive-OS-Agent` 从真实 `/proc` 发现进程和线程，通过 LLM 形成分类 Proposal，并维护权威分类状态。
+- `Adaptive-OS-Agent` 从真实 `/proc` 发现进程和线程，融合当前启动目标、LLM 语义和运行时行为，并维护权威分类状态。
 - `scheduler/rust/scx_adaptive` 根据 `Latency`、`Balanced`、`Throughput` 三类状态选择任务、CPU 和时间片，eBPF 数据面负责校验并执行调度命令。
 - `test` 在 6 vCPU 虚拟机中，用固化到 qcow2 镜像的真实应用对 Linux 原生调度器和 Agent 做配对实验。
 
@@ -74,7 +74,7 @@ sudo Adaptive-OS-Agent/target/release/adaptive-os-agent \
   --scheduler-bin scheduler/rust/target/release/scx_adaptive
 ```
 
-新任务在分类完成前保持 `Balanced`。LLM 超时、失败或返回 `Unknown` 不会阻塞调度。`SIGINT` 或 `SIGTERM` 会触发 Agent 停止 scheduler，scheduler 随后 detach sched_ext。确定性离线诊断可以添加 `--offline`。
+新任务先使用中性的 `Balanced`。当前启动命令中的显式 SLO/批处理目标、LLM 语义和 scheduler 行为窗口并行提供证据；`Balanced` 不会压制一致的 `Latency`/`Throughput` 证据，专用类型冲突则保守回到 `Balanced`。Agent 不读写持久化应用分类档案；进程内精确元数据缓存只在本次 Agent 生命期内有效。LLM 超时、失败或返回 `Unknown` 不会阻塞调度。`SIGINT` 或 `SIGTERM` 会触发 Agent 停止 scheduler，scheduler 随后 detach sched_ext。确定性离线诊断可以添加 `--offline`。
 
 ## 真实负载镜像
 
@@ -124,6 +124,8 @@ python3 test/scripts/benchmark.py all
 ```bash
 python3 test/scripts/benchmark.py mix --single-round
 ```
+
+2026-07-26 的分类里程碑单轮验收中，Mix 和 Throughput 的进程/线程、根任务与运行时加权准确率均为 100%；Latency 的根任务、已解析任务、活跃任务与运行时加权准确率也均为 100%。对应报告目录为 `20260726-123509-125295`、`20260726-123923-141354` 和 `20260726-124803-054361`。这些是分类验收与调度迭代信号，不替代三轮配对统计。
 
 正式配置为 20 秒预热、60 秒测量和 3 秒冷却。Guest 固定为 `1 socket x 3 cores x 2 threads`；vCPU 固定到 Host CPU `6-11`，QEMU emulator 和 Host IRQ 使用 `0-5`。有效 run 才进入同 repeat 的 Native/Agent 配对统计，并报告中位数和 bootstrap 95% 区间。
 

@@ -79,7 +79,7 @@ impl Default for SchedulerConfig {
             preemption_min_runtime_ns: 250_000,
             latency_target_ns: 2 * NSEC_PER_MSEC,
             latency_guarantee_percent: 10,
-            preemption_budget_percent: 5,
+            preemption_budget_percent: 10,
             heartbeat_timeout: Duration::from_millis(250),
             poll_interval: Duration::from_millis(1),
             latency_max_wait_ns: 10 * NSEC_PER_MSEC,
@@ -209,6 +209,13 @@ impl SchedulerConfig {
             .saturating_mul(100)
             .div_ceil(u64::from(self.preemption_budget_percent))
     }
+
+    /// Root request used only while more than one latency task is queued.
+    pub fn latency_backlog_request_ns(&self) -> u64 {
+        self.latency_slice_ns
+            .saturating_mul(100)
+            .div_ceil(100 + u64::from(self.latency_guarantee_percent))
+    }
 }
 
 /// Actionable configuration validation failures.
@@ -297,6 +304,7 @@ mod tests {
             config.request_for_estimate(crate::identity::TaskClass::Throughput, 20_000_000),
             8_000_000
         );
-        assert_eq!(config.fast_preemption_interval_ns(), 5_000_000);
+        assert_eq!(config.fast_preemption_interval_ns(), 2_500_000);
+        assert_eq!(config.latency_backlog_request_ns(), 227_273);
     }
 }

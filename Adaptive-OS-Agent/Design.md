@@ -67,7 +67,7 @@ Adaptive-OS-Agent/
     |-- discovery.rs            全量 /proc 扫描
     |-- metadata.rs             /proc 读取、限长、身份稳定化、脱敏
     |-- deepseek.rs             HTTPS 客户端、prompt、严格 JSON 校验、重试
-    |-- process_classifier.rs   进程批次的特征投影和短 ID 映射
+    |-- process_classifier.rs   通用启动目标判定、进程批次特征和短 ID 映射
     |-- thread_classifier.rs    同 TGID 线程批次与共享进程上下文
     |-- behavior.rs             行为窗口结构和强证据公式
     |-- skills.rs               三种 proposal-only 能力的公开边界
@@ -148,6 +148,7 @@ Registry 不加内部锁。一切异步输入先进有界队列，再由主线�
 | `api_key_env` | String | `DEEPSEEK_API_KEY` | trim 后非空 |
 | `api_key_file` | `Option<String>` | None | Some 时 trim 后非空 |
 | `timeout_secs` | u64 | 45 | `> 0` |
+| `connect_timeout_secs` | u64 | 5 | `> 0` 且不大于 `timeout_secs` |
 | `batch_size` | usize | 24 | `1..=128` |
 | `max_retries` | usize | 2 | 表示初始请求之后的重试数 |
 | `worker_count` | usize | 2 | `1..=8` |
@@ -159,6 +160,7 @@ API key 读取顺序：先读 `api_key_env` 指定的环境变量；非空即返
 
 | `ClassificationConfig` 字段 | 类型 | 默认值 | 校验 |
 | --- | --- | --- | --- |
+| `process_semantic_min_age_secs` | u64 | 0 | - |
 | `process_long_lived_secs` | u64 | 5 | `> 0` |
 | `task_long_lived_secs` | u64 | 2 | `> 0` |
 | `high_confidence_threshold` | f32 | 0.80 | `0.0..=1.0` |
@@ -516,7 +518,11 @@ confidence 用 `round(clamp(confidence * 1000, 0, 1000))` 存储；低于配置�
 | `class_generation` | u64 | Agent desired generation |
 | `applied_generation` | u64 | scheduler 已 ACK/snapshot 的 generation |
 | `semantic` | `SemanticState` | 进程语义状态 |
+| `local_class`, `local_confidence_per_mille` | `Option<TaskClass>`, `Option<u16>` | 当前启动目标的保守本地判定 |
+| `inherited_from` | `Option<ProcessKey>` | 自身目标未定时跟随的精确父进程 |
+| `behavior_override`, `behavior_confidence_per_mille` | bool, `Option<u16>` | 是否由独立 task 行为证据修正默认值 |
 | `created_ns` | u64 | Agent 单调时间起点 |
+| `timing` | `ClassificationTiming` | 请求、语义、行为、决策、lock 和 ACK 首次时间 |
 | `tasks` | `HashSet<TaskKey>` | 当前所属 task |
 | `pending_request_id` | `Option<u64>` | 当前 desired action 的幂等 ID |
 
@@ -531,7 +537,9 @@ confidence 用 `round(clamp(confidence * 1000, 0, 1000))` 存储；低于配置�
 | `semantic` | `SemanticState` | 线程语义状态 |
 | `created_ns` | u64 | task 发现时间 |
 | `start_time_ticks` | `Option<u64>` | replay 时拒绝 TID 复用 |
-| `behavior` | `{class: Option<TaskClass>, windows: u32}` | 连续强证据 |
+| `behavior` | `{class: Option<TaskClass>, windows: u32, confidence_per_mille: u16}` | 连续强证据 |
+| `behavior_confidence_per_mille` | `Option<u16>` | locked 本地行为置信度 |
+| `timing` | `ClassificationTiming` | task 级分类里程碑 |
 | `last_behavior_window_sequence` | u64 | 去重与缺口检测 |
 | `pending_request_id` | `Option<u64>` | 当前 desired action ID |
 
@@ -544,8 +552,10 @@ confidence 用 `round(clamp(confidence * 1000, 0, 1000))` 存储；低于配置�
 | `replay_tasks` | `HashMap<(ProcessInstanceKey,u32,u64), TaskReplay>` |
 | `metadata_by_instance` | `HashMap<ProcessInstanceKey, ProcessMetadata>` |
 | `process_semantics` | `HashMap<ProcessInstanceKey, SemanticState>` |
-| `process_proposals` | `HashMap<ProcessInstanceKey, ProcessClassificationProposal>` |
+| `semantic_cache` | `HashMap<ProcessSemanticFingerprint, SemanticState>`，仅当前 Agent 生命期 |
+| `semantic_cache_order` | `VecDeque<ProcessSemanticFingerprint>`，有界淘汰顺序 |
 | `process_request_ids` | `HashMap<ProcessInstanceKey,u64>` |
+| `process_timings` | `HashMap<ProcessInstanceKey,ClassificationTiming>` |
 | `next_process_request_id` | 1，wrap 时跳过 0 |
 | `next_control_request_id` | `1 << 63`，wrap 后回到高半区起点 |
 | `next_snapshot_id` | 1，wrap 时跳过 0 |
@@ -601,8 +611,9 @@ take_process_batches(batch_size, max_batches)
 - 同一 request ID 中未被模型结果覆盖的 instance 标记为 `Failed`，并同步已绑定进程记录。
 - process action 同时把该进程下所有 `Inherited` task 的 effective class 和 desired generation 镜像更新。
 
-`on_process_discovered` 创建初始 `balanced/generation=0/applied=0`。如果预先完成的匹配 proposal 有效，
-直接创建 `generation=1` action。已存在的完整 ProcessKey 事件幂等忽略。
+`on_process_discovered` 创建初始 `balanced/generation=0/applied=0`，并先对当前有界 argv 做与程序名无关的保守目标判定：显式 deadline/SLO 或“限速+尾延迟报告”为 `Latency`，显式 throughput 目标或“无远端 endpoint 的本地 benchmark+工作预算”为 `Throughput`，无 SLO 的远端 benchmark 为 `Balanced`。其余返回 None，保持中性默认并继续提交 LLM。
+
+本地目标、LLM 和后续行为证据由 Registry 融合：`Balanced` 是中性意见，不覆盖高置信专用目标；`Latency` 与 `Throughput` 冲突则取 `Balanced`。完全相同的有界元数据指纹可在当前 Agent 进程内复用已完成语义；缓存容量有界，不写入磁盘，Agent 重启后为空。已存在的完整 ProcessKey 事件幂等忽略。
 
 ### 10.2 线程批次
 
@@ -633,7 +644,7 @@ record.pending_request_id is None
 record.applied_generation == record.class_generation
 ```
 
-接受的 known class 使 stage 变为 `Semantic`，`class_generation += 1`，产生 task action。
+接受的 known class 使 stage 变为 `Semantic`，`class_generation += 1`，产生 task action。进程默认是 `Balanced` 时，线程的专用类型可立即精炼该线程；两个专用类型冲突时仍需运行时证据确认。
 Unknown/low confidence 只改 semantic 状态，不改当前 inherited class。
 
 ## 11. 行为窗口与一次修正
@@ -668,7 +679,7 @@ Unknown/low confidence 只改 semantic 状态，不改当前 inherited class。
 quality == good
 window_sequence != 0
 window_end_ns > window_start_ns
-task_age_ns >= 5,000,000,000
+task_age_ns >= 2,000,000,000
 
 AND at least one sample floor:
 max(enqueue_count, run_count) >= 32
@@ -696,17 +707,18 @@ util_per_mille <= 500
 runnable_wait_ns > 0
 ```
 
-`Throughput` 必须五项同时成立：
+`Throughput` 必须四项同时成立：
 
 ```text
 run_count > 0
 long * 10 >= run_count * 7
 slice_exhaustion_count * 2 >= run_count
 voluntary_block_count * 10 <= run_count
-util_per_mille >= 700
 ```
 
-其余情况 proposal 为 None。所有乘法/加法用 saturating 语义。
+Throughput 不要求墙钟利用率，因为 CPU 争用下的持续计算任务也可能获得较低的墙钟 CPU 份额。
+
+`Balanced` 要求 `run_count >= 64`，且以下五项至少三项成立：利用率 20%..80%、自愿阻塞比 15%..85%、长短 burst 均至少 20%、wakeup/enqueue 10%..80%、slice exhaustion 10%..60%。信心随命中项数从 0.70 增长到 0.80。其余情况 proposal 为 None。所有比例运算都是有界 saturating 语义。
 
 ### 11.3 Registry 投票和 lock
 
@@ -725,8 +737,8 @@ Locked -- no outgoing transition
 1. task/process 完整身份必须匹配，stage 不得是 Locked。
 2. sequence 必须大于已见值；重复/逆序丢弃。sequence 不连续先清 evidence。
 3. `quality=bad`、有 pending action 或 desired != applied 都清 evidence 并停止。
-4. task semantic 为 Pending/Requested 且 stage 为 Inherited 时，先使用 process semantic 判断是否 ready。
-5. semantic 未 ready 不阻塞本地强证据：候选必须连续达到高置信修正窗口数才可 lock；没有候选时仍等待超时。
+4. 运行时 `Latency` 形态不能独立创建延迟目标；只有进程默认或进程/线程语义已经支持 `Latency` 时才可投票。持续 slice-exhausting 行为可独立证明 `Throughput`。
+5. `Balanced` 语义对专用运行时候选为中性；只有另一个专用类型才是矛盾。候选必须连续达到配置窗口数才可 lock。
 6. task age 到 `behavior_lock_timeout_secs` 时视为超时；lock 时未完成的 task semantic 改为 Failed。
 7. proposal 的 task/process 必须与 window 相同，否则当 None。
 8. 同一候选 class 的连续窗口计数；class 改变则从 1 开始，None 清零。
@@ -735,18 +747,23 @@ Locked -- no outgoing transition
 
 ```text
 if candidate exists:
-    if candidate != effective_class
-       and semantic_confidence_per_mille >= floor(high_confidence_threshold * 1000):
-        threshold = high_confidence_correction_windows   # default 5
-    else:
-        threshold = low_confidence_correction_windows    # default 3
-    lock candidate when streak >= threshold
+    specialized_contradiction = strongest semantic class that is neither
+                                candidate nor Balanced
+    supported = any process/thread semantic class equals candidate
+    unsupported_contradiction = specialized_contradiction exists and not supported
+    threshold = high_confidence_correction_windows       # default 5
+        if unsupported_contradiction is high-confidence
+        or candidate is low-confidence Balanced
+    otherwise threshold = low_confidence_correction_windows  # default 3
+    lock Balanced when an unsupported specialized contradiction reaches threshold
+    otherwise lock candidate when streak reaches threshold
 else if timed_out:
     lock current effective_class
 ```
 
 lock 时 stage=`Locked`、`class_generation += 1`、`expected_generation=applied_generation`，清空 evidence，
-生成一个 `SetTaskClass`。
+生成一个 `SetTaskClass`。同一进程至少两个独立 locked task 给出一致专用类型后，Registry 可将它提升为临时进程默认；不一致时保持 `Balanced`。
+Locked 是终止 stage，不再收集新行为窗口。只有晚到的高置信进程专用类型与已 locked 的另一专用类型直接冲突时，Registry 才可在保持 `Locked` stage 的同时通过新 generation 保守调整为 `Balanced`；晚到的语义 `Balanced` 不会撤销强本地 lock。
 
 ## 12. 生命周期、exec 和 scheduler replay
 
@@ -949,7 +966,7 @@ kind, identity, class, stage="process_default", source,
 confidence|null, generation, applied_generation
 ```
 
-process source：Classified=`llm`；Unknown/Failed=`fallback`；Pending/Requested=`default`。
+process source 可为 `local_metadata`、`llm`、`semantic_cache`、`parent_default`、`behavior` 或多种证据的 `hybrid`；Unknown/Failed=`fallback`，Pending/Requested=`default`。
 
 `classification.get(task)` 额外返回 process；source 由 stage 决定：
 Inherited=`process_default`，Semantic=`llm`，Locked=`behavior`。confidence 仅 Classified 状态非 null。

@@ -68,6 +68,8 @@ pub struct DataPlaneStats {
     pub fast_path_empty_steal_skips: u64,
     /// Urgent fast-path requests held back by victim-runtime or rate limits.
     pub fast_path_preemption_throttles: u64,
+    /// Latency dispatches given temporary root weight because peers were queued.
+    pub fast_path_latency_backlog_boosts: u64,
 }
 
 impl From<bpf_intf::adaptive_global_stats> for DataPlaneStats {
@@ -99,6 +101,7 @@ impl From<bpf_intf::adaptive_global_stats> for DataPlaneStats {
             cpu_state_events_suppressed: raw.cpu_state_events_suppressed,
             fast_path_empty_steal_skips: raw.fast_path_empty_steal_skips,
             fast_path_preemption_throttles: raw.fast_path_preemption_throttles,
+            fast_path_latency_backlog_boosts: raw.fast_path_latency_backlog_boosts,
         }
     }
 }
@@ -179,6 +182,9 @@ impl DataPlaneStats {
         self.fast_path_preemption_throttles = self
             .fast_path_preemption_throttles
             .saturating_add(sample.fast_path_preemption_throttles);
+        self.fast_path_latency_backlog_boosts = self
+            .fast_path_latency_backlog_boosts
+            .saturating_add(sample.fast_path_latency_backlog_boosts);
     }
 }
 
@@ -224,6 +230,7 @@ impl<'obj> BpfRuntime<'obj> {
         rodata.heartbeat_timeout_ns = config.heartbeat_timeout.as_nanos() as u64;
         rodata.preemption_min_runtime_ns = config.preemption_min_runtime_ns;
         rodata.fast_preemption_interval_ns = config.fast_preemption_interval_ns();
+        rodata.latency_backlog_request_ns = config.latency_backlog_request_ns();
 
         let mut skel = scx_utils::scx_ops_load!(skel, scx_adaptive, uei)?;
         for cpu in topology.cpus() {
@@ -367,7 +374,6 @@ fn initial_cpu_state(online: bool) -> bpf_intf::adaptive_cpu_state {
         last_idle_event_ns: 0,
         running_started_ns: 0,
         last_preemption_ns: 0,
-        last_remote_latency_ns: 0,
         accepted_commands: 0,
         rejected_commands: 0,
         root_virtual_time_ns: 0,

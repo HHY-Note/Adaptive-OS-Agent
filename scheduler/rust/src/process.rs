@@ -29,7 +29,7 @@ pub struct TaskClassCache {
     pub process: ProcessKey,
     /// Class currently used to choose a Rust pool and time slice.
     pub effective_class: TaskClass,
-    /// Whether the class is inherited, semantic, or permanently locked.
+    /// Whether the class is inherited, semantic, or locally locked.
     pub stage: ClassStage,
     /// Agent-owned generation mirrored into the BPF `task_control` map.
     pub class_generation: u64,
@@ -49,7 +49,8 @@ impl TaskClassCache {
     /// Validates and applies one Agent task-class transition.
     ///
     /// The control plane writes the same generation to BPF before committing
-    /// this update. A locked task rejects all later changes.
+    /// this update. A locked extreme may converge once to conservative
+    /// Balanced when later independent evidence conflicts.
     pub fn apply(
         &mut self,
         task: TaskKey,
@@ -58,7 +59,11 @@ impl TaskClassCache {
         if self.process != update.process {
             return Err(ClassUpdateError::ProcessIdentity { task });
         }
-        if self.stage == ClassStage::Locked {
+        let resolves_locked_conflict = self.stage == ClassStage::Locked
+            && self.effective_class != TaskClass::Balanced
+            && update.stage == ClassStage::Locked
+            && update.class == TaskClass::Balanced;
+        if self.stage == ClassStage::Locked && !resolves_locked_conflict {
             return Err(ClassUpdateError::AlreadyLocked { task });
         }
         if update.class_generation <= self.class_generation {
@@ -68,7 +73,7 @@ impl TaskClassCache {
                 received: update.class_generation,
             });
         }
-        if !valid_stage_transition(self.stage, update.stage) {
+        if !resolves_locked_conflict && !valid_stage_transition(self.stage, update.stage) {
             return Err(ClassUpdateError::InvalidStage {
                 task,
                 from: self.stage,
@@ -128,7 +133,7 @@ pub enum ClassUpdateError {
         /// Task whose process identity did not match.
         task: TaskKey,
     },
-    /// Locked tasks have consumed their one allowed correction.
+    /// Locked tasks reject changes except one conservative conflict resolution.
     #[error("task {task:?} classification is already locked")]
     AlreadyLocked {
         /// Permanently classified task.
@@ -161,7 +166,7 @@ mod tests {
     use super::{ClassUpdateError, ProcessDefaultCache, TaskClassCache, TaskClassUpdate};
     use crate::identity::{ClassStage, ProcessKey, TaskClass, TaskKey};
 
-    /// Semantic classification may be corrected exactly once by locking it.
+    /// A locked extreme can resolve one late conflict only toward Balanced.
     #[test]
     fn enforces_one_correction_transition() {
         let process = ProcessKey::new(10, 20, 1).unwrap();
@@ -194,8 +199,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(cache.effective_class, TaskClass::Throughput);
-        assert!(matches!(
-            cache.apply(
+        cache
+            .apply(
                 task,
                 TaskClassUpdate {
                     task,
@@ -203,6 +208,19 @@ mod tests {
                     class: TaskClass::Balanced,
                     stage: ClassStage::Locked,
                     class_generation: 3,
+                },
+            )
+            .unwrap();
+        assert_eq!(cache.effective_class, TaskClass::Balanced);
+        assert!(matches!(
+            cache.apply(
+                task,
+                TaskClassUpdate {
+                    task,
+                    process,
+                    class: TaskClass::Latency,
+                    stage: ClassStage::Locked,
+                    class_generation: 4,
                 }
             ),
             Err(ClassUpdateError::AlreadyLocked { .. })

@@ -2,6 +2,7 @@
 
 //! Read-only standardized Agent Tool interface over a bounded local socket.
 
+use std::collections::HashSet;
 use std::fs;
 use std::io::{self, Write};
 use std::os::unix::fs::FileTypeExt;
@@ -19,7 +20,7 @@ use serde_json::{json, Value};
 
 use crate::identity::{ClassStage, ProcessKey, TaskKey};
 use crate::local_frame::{encode as encode_frame, FrameReader};
-use crate::registry::{ClassificationRegistry, SemanticState};
+use crate::registry::{ClassificationRegistry, ClassificationTiming, SemanticState};
 
 const TOOL_REPLY_TIMEOUT: Duration = Duration::from_secs(4);
 
@@ -150,6 +151,8 @@ struct ListArguments {
     limit: usize,
     #[serde(default)]
     offset: usize,
+    #[serde(default)]
+    tgids: Vec<u32>,
 }
 
 fn workload_list(registry: &ClassificationRegistry, arguments: &Value) -> Result<Value, String> {
@@ -161,30 +164,56 @@ fn workload_list(registry: &ClassificationRegistry, arguments: &Value) -> Result
     if !matches!(scope, "all" | "process" | "task") {
         return Err("scope must be all, process, or task".into());
     }
+    if args.tgids.len() > 256 || args.tgids.contains(&0) {
+        return Err("tgids must contain at most 256 non-zero process IDs".into());
+    }
+    let tgids: HashSet<_> = args.tgids.into_iter().collect();
+    let includes = |tgid: u32| tgids.is_empty() || tgids.contains(&tgid);
 
     let mut rows = Vec::new();
     if scope != "task" {
-        let mut records: Vec<_> = registry.processes().collect();
+        let mut retired: Vec<_> = registry
+            .retired_processes()
+            .filter(|record| includes(record.identity.tgid))
+            .collect();
+        retired.sort_unstable_by_key(|record| record.identity);
+        rows.extend(
+            retired
+                .into_iter()
+                .map(|record| process_list_item(record, "exited")),
+        );
+        let mut records: Vec<_> = registry
+            .processes()
+            .filter(|record| includes(record.identity.tgid))
+            .collect();
         records.sort_unstable_by_key(|record| record.identity);
-        rows.extend(records.into_iter().map(|record| {
-            json!({
-                "kind": "process",
-                "identity": record.identity,
-                "comm": record.metadata.as_ref().map(|metadata| metadata.comm.as_str()),
-                "tasks": record.tasks.len(),
-            })
-        }));
+        rows.extend(
+            records
+                .into_iter()
+                .map(|record| process_list_item(record, "active")),
+        );
     }
     if scope != "process" {
-        let mut records: Vec<_> = registry.tasks().collect();
+        let mut retired: Vec<_> = registry
+            .retired_tasks()
+            .filter(|record| includes(record.process.tgid))
+            .collect();
+        retired.sort_unstable_by_key(|record| record.identity);
+        rows.extend(
+            retired
+                .into_iter()
+                .map(|record| task_list_item(record, "exited")),
+        );
+        let mut records: Vec<_> = registry
+            .tasks()
+            .filter(|record| includes(record.process.tgid))
+            .collect();
         records.sort_unstable_by_key(|record| record.identity);
-        rows.extend(records.into_iter().map(|record| {
-            json!({
-                "kind": "task",
-                "identity": record.identity,
-                "process": record.process,
-            })
-        }));
+        rows.extend(
+            records
+                .into_iter()
+                .map(|record| task_list_item(record, "active")),
+        );
     }
     let total = rows.len();
     let items: Vec<_> = rows
@@ -193,6 +222,27 @@ fn workload_list(registry: &ClassificationRegistry, arguments: &Value) -> Result
         .take(args.limit)
         .collect();
     Ok(json!({"items": items, "total": total, "registry": registry.stats()}))
+}
+
+fn process_list_item(record: &crate::registry::ProcessRecord, lifecycle: &str) -> Value {
+    json!({
+        "kind": "process",
+        "identity": record.identity,
+        "lifecycle": lifecycle,
+        "comm": record.metadata.as_ref().map(|metadata| metadata.comm.as_str()),
+        "tasks": record.tasks.len(),
+        "classification": process_classification(record),
+    })
+}
+
+fn task_list_item(record: &crate::registry::TaskRecord, lifecycle: &str) -> Value {
+    json!({
+        "kind": "task",
+        "identity": record.identity,
+        "process": record.process,
+        "lifecycle": lifecycle,
+        "classification": task_classification(record),
+    })
 }
 
 #[derive(Deserialize)]
@@ -242,39 +292,80 @@ fn classification_get(
             let record = registry
                 .process(process)
                 .ok_or_else(|| "process identity not found".to_string())?;
-            Ok(json!({
-                "kind": "process",
-                "identity": record.identity,
-                "class": record.default_class,
-                "stage": "process_default",
-                "source": semantic_source(record.semantic, record.inherited_from.is_some()),
-                "confidence": semantic_confidence(record.semantic),
-                "generation": record.class_generation,
-                "applied_generation": record.applied_generation,
-            }))
+            Ok(process_classification(record))
         }
         Target::Task(task) => {
             let record = registry
                 .task(task)
                 .ok_or_else(|| "task identity not found".to_string())?;
-            let source = match record.stage {
-                ClassStage::Inherited => "process_default",
-                ClassStage::Semantic => "llm",
-                ClassStage::Locked => "behavior",
-            };
-            Ok(json!({
-                "kind": "task",
-                "identity": record.identity,
-                "process": record.process,
-                "class": record.effective_class,
-                "stage": record.stage,
-                "source": source,
-                "confidence": semantic_confidence(record.semantic),
-                "generation": record.class_generation,
-                "applied_generation": record.applied_generation,
-            }))
+            Ok(task_classification(record))
         }
     }
+}
+
+fn process_classification(record: &crate::registry::ProcessRecord) -> Value {
+    json!({
+        "kind": "process",
+        "identity": record.identity,
+        "class": record.default_class,
+        "stage": "process_default",
+        "source": process_source(record),
+        "confidence": process_confidence(record),
+        "generation": record.class_generation,
+        "applied_generation": record.applied_generation,
+        "timing": classification_timing(record.created_ns, &record.timing),
+    })
+}
+
+fn task_classification(record: &crate::registry::TaskRecord) -> Value {
+    let source = match record.stage {
+        ClassStage::Inherited => "process_default",
+        ClassStage::Semantic => "llm",
+        ClassStage::Locked => "behavior",
+    };
+    json!({
+        "kind": "task",
+        "identity": record.identity,
+        "process": record.process,
+        "class": record.effective_class,
+        "stage": record.stage,
+        "source": source,
+        "confidence": task_confidence(record),
+        "generation": record.class_generation,
+        "applied_generation": record.applied_generation,
+        "timing": classification_timing(record.created_ns, &record.timing),
+    })
+}
+
+fn classification_timing(created_ns: u64, timing: &ClassificationTiming) -> Value {
+    json!({
+        "discovered_ns": created_ns,
+        "semantic_requested_ns": timing.semantic_requested_ns,
+        "semantic_resolved_ns": timing.semantic_resolved_ns,
+        "behavior_evidence_ns": timing.behavior_evidence_ns,
+        "decided_ns": timing.decided_ns,
+        "locked_ns": timing.locked_ns,
+        "applied_ns": timing.applied_ns,
+        "request_delay_ns": elapsed_from(created_ns, timing.semantic_requested_ns),
+        "semantic_latency_ns": elapsed_between(
+            timing.semantic_requested_ns,
+            timing.semantic_resolved_ns,
+        ),
+        "behavior_delay_ns": elapsed_from(created_ns, timing.behavior_evidence_ns),
+        "decision_delay_ns": elapsed_from(created_ns, timing.decided_ns),
+        "lock_delay_ns": elapsed_from(created_ns, timing.locked_ns),
+        "apply_delay_ns": elapsed_from(created_ns, timing.applied_ns),
+    })
+}
+
+fn elapsed_from(start_ns: u64, end_ns: Option<u64>) -> Option<u64> {
+    end_ns.map(|end_ns| end_ns.saturating_sub(start_ns))
+}
+
+fn elapsed_between(start_ns: Option<u64>, end_ns: Option<u64>) -> Option<u64> {
+    start_ns
+        .zip(end_ns)
+        .map(|(start_ns, end_ns)| end_ns.saturating_sub(start_ns))
 }
 
 fn scheduler_health(snapshot: Option<&Value>) -> Result<Value, String> {
@@ -326,14 +417,45 @@ fn parse_arguments<T: for<'de> Deserialize<'de>>(arguments: &Value) -> Result<T,
     serde_json::from_value(arguments.clone()).map_err(|error| error.to_string())
 }
 
-fn semantic_source(state: SemanticState, inherited: bool) -> &'static str {
-    if inherited {
+fn process_source(record: &crate::registry::ProcessRecord) -> &'static str {
+    if record.behavior_override {
+        return if matches!(record.semantic, SemanticState::Classified { .. })
+            || record.local_class.is_some()
+        {
+            "hybrid"
+        } else {
+            "behavior"
+        };
+    }
+    if record.inherited_from.is_some() {
         return "parent_default";
     }
-    match state {
+    match record.semantic {
+        SemanticState::Classified { .. } if record.timing.semantic_requested_ns.is_none() => {
+            "semantic_cache"
+        }
+        SemanticState::Classified { .. } if record.local_class.is_some() => "hybrid",
         SemanticState::Classified { .. } => "llm",
+        _ if record.local_class.is_some() => "local_metadata",
         SemanticState::Unknown | SemanticState::Failed => "fallback",
         SemanticState::Pending | SemanticState::Requested => "default",
+    }
+}
+
+fn process_confidence(record: &crate::registry::ProcessRecord) -> Option<f32> {
+    if record.behavior_override {
+        return record
+            .behavior_confidence_per_mille
+            .map(|confidence| f32::from(confidence) / 1000.0);
+    }
+    let semantic = semantic_confidence(record.semantic);
+    let local = record
+        .local_confidence_per_mille
+        .map(|confidence| f32::from(confidence) / 1000.0);
+    match (semantic, local) {
+        (Some(semantic), Some(local)) => Some(semantic.min(local)),
+        (Some(confidence), None) | (None, Some(confidence)) => Some(confidence),
+        (None, None) => None,
     }
 }
 
@@ -344,6 +466,16 @@ fn semantic_confidence(state: SemanticState) -> Option<f32> {
             ..
         } => Some(f32::from(confidence_per_mille) / 1000.0),
         _ => None,
+    }
+}
+
+fn task_confidence(record: &crate::registry::TaskRecord) -> Option<f32> {
+    match record.stage {
+        ClassStage::Locked => record
+            .behavior_confidence_per_mille
+            .map(|confidence| f32::from(confidence) / 1000.0),
+        ClassStage::Inherited => None,
+        ClassStage::Semantic => semantic_confidence(record.semantic),
     }
 }
 
@@ -515,8 +647,51 @@ mod tests {
         };
         let response = execute(&request, &registry, None);
         assert!(response.ok);
-        assert_eq!(response.result.unwrap()["total"], 2);
+        let result = response.result.unwrap();
+        assert_eq!(result["total"], 2);
+        assert!(result["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item["classification"].is_object()));
         assert_eq!(registry.stats().tasks, 1);
+    }
+
+    #[test]
+    fn workload_list_includes_recently_exited_classification() {
+        let mut registry = ClassificationRegistry::default();
+        let process = ProcessKey {
+            tgid: 11,
+            process_cookie: 12,
+            exec_generation: 1,
+        };
+        let task = TaskKey {
+            tid: 13,
+            task_cookie: 14,
+        };
+        registry.on_task_discovered(task, process, 1);
+        registry.on_task_exited(task, process);
+        let request = ToolRequest {
+            request_id: 3,
+            tool: "workload.list".into(),
+            arguments: json!({"scope": "task"}),
+        };
+
+        let result = execute(&request, &registry, None).result.unwrap();
+        assert_eq!(result["total"], 1);
+        assert_eq!(result["items"][0]["lifecycle"], "exited");
+        assert_eq!(result["items"][0]["identity"], json!(task));
+        assert!(result["items"][0]["classification"].is_object());
+
+        let filtered = ToolRequest {
+            request_id: 4,
+            tool: "workload.list".into(),
+            arguments: json!({"scope": "task", "tgids": [99]}),
+        };
+        assert_eq!(
+            execute(&filtered, &registry, None).result.unwrap()["total"],
+            0
+        );
     }
 
     #[test]

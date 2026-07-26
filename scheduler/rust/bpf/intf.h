@@ -149,7 +149,6 @@ struct adaptive_cpu_state {
 	u64 last_idle_event_ns;
 	u64 running_started_ns;
 	u64 last_preemption_ns;
-	u64 last_remote_latency_ns;
 	u64 accepted_commands;
 	u64 rejected_commands;
 	u64 root_virtual_time_ns;
@@ -183,6 +182,7 @@ struct adaptive_global_stats {
 	u64 cpu_state_events_suppressed;
 	u64 fast_path_empty_steal_skips;
 	u64 fast_path_preemption_throttles;
+	u64 fast_path_latency_backlog_boosts;
 };
 
 _Static_assert(sizeof(struct task_event) == 96, "task_event ABI size changed");
@@ -190,9 +190,9 @@ _Static_assert(sizeof(struct dispatch_command) == 72,
 	       "dispatch_command ABI size changed");
 _Static_assert(sizeof(struct task_control_value) == 40,
 	       "task_control_value ABI size changed");
-_Static_assert(sizeof(struct adaptive_cpu_state) == 120,
+_Static_assert(sizeof(struct adaptive_cpu_state) == 112,
 	       "adaptive_cpu_state ABI size changed");
-_Static_assert(sizeof(struct adaptive_global_stats) == 216,
+_Static_assert(sizeof(struct adaptive_global_stats) == 224,
 	       "adaptive_global_stats ABI size changed");
 
 #endif /* __SCX_ADAPTIVE_INTF_H */

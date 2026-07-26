@@ -86,6 +86,8 @@ pub struct DeepSeekConfig {
     pub api_key_file: Option<String>,
     /// Per-request blocking HTTP timeout.
     pub timeout_secs: u64,
+    /// TCP/TLS connection timeout, kept shorter than the full response timeout.
+    pub connect_timeout_secs: u64,
     /// Maximum process/thread items in one logical LLM request.
     pub batch_size: usize,
     /// Number of retries after the initial request.
@@ -105,6 +107,7 @@ impl Default for DeepSeekConfig {
             api_key_env: "DEEPSEEK_API_KEY".into(),
             api_key_file: None,
             timeout_secs: 45,
+            connect_timeout_secs: 5,
             batch_size: 24,
             max_retries: 2,
             worker_count: 2,
@@ -161,8 +164,17 @@ impl DeepSeekConfig {
         {
             anyhow::bail!("DeepSeek API-key file path must not be empty when configured");
         }
-        if self.timeout_secs == 0 || self.batch_size == 0 || self.worker_count == 0 {
-            anyhow::bail!("DeepSeek timeout, batch_size, and worker_count must be non-zero");
+        if self.timeout_secs == 0
+            || self.connect_timeout_secs == 0
+            || self.batch_size == 0
+            || self.worker_count == 0
+        {
+            anyhow::bail!(
+                "DeepSeek response/connect timeouts, batch_size, and worker_count must be non-zero"
+            );
+        }
+        if self.connect_timeout_secs > self.timeout_secs {
+            anyhow::bail!("DeepSeek connect timeout must not exceed the response timeout");
         }
         if self.batch_size > 128 || self.worker_count > 8 {
             anyhow::bail!("DeepSeek batch_size must be <=128 and worker_count <=8");
@@ -178,6 +190,9 @@ impl DeepSeekConfig {
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct ClassificationConfig {
+    /// Minimum scheduler-observed process age before process semantic batching.
+    /// Zero submits new processes on the next bounded semantic tick.
+    pub process_semantic_min_age_secs: u64,
     /// Minimum process age before thread semantic batching.
     pub process_long_lived_secs: u64,
     /// Minimum task age before thread semantic batching.
@@ -200,6 +215,7 @@ impl Default for ClassificationConfig {
     /// Uses 5 s process, 2 s task, and 5/3 contrary-window rules.
     fn default() -> Self {
         Self {
+            process_semantic_min_age_secs: 0,
             process_long_lived_secs: 5,
             task_long_lived_secs: 2,
             high_confidence_threshold: 0.80,
@@ -219,7 +235,9 @@ impl ClassificationConfig {
             || self.task_long_lived_secs == 0
             || self.behavior_lock_timeout_secs < 5
         {
-            anyhow::bail!("semantic lifetimes must be non-zero and behavior timeout at least 5 s");
+            anyhow::bail!(
+                "long-lived semantic thresholds must be non-zero and behavior timeout at least 5 s"
+            );
         }
         if !(0.0..=1.0).contains(&self.high_confidence_threshold) {
             anyhow::bail!("high_confidence_threshold must be in 0..=1");
@@ -250,6 +268,7 @@ mod tests {
         assert_eq!(config.deepseek.api_key_env, "DEEPSEEK_API_KEY");
         assert_eq!(config.deepseek.api_key_file, None);
         assert_eq!(config.deepseek.batch_size, 24);
+        assert_eq!(config.deepseek.connect_timeout_secs, 5);
         assert_eq!(config.deepseek.min_confidence, 0.60);
         assert!(config.classification.thread_semantic_enabled);
         assert_eq!(config.classification.thread_semantic_min_tasks, 2);
@@ -264,6 +283,7 @@ mod tests {
         assert_eq!(config.deepseek.worker_count, 3);
         assert_eq!(config.deepseek.batch_size, 24);
         assert_eq!(config.classification.behavior_lock_timeout_secs, 20);
+        assert_eq!(config.classification.process_semantic_min_age_secs, 0);
         assert_eq!(config.classification.process_long_lived_secs, 5);
         assert!(config.validate().is_ok());
     }

@@ -46,7 +46,7 @@ def analyze_run(run_dir: str | Path) -> dict[str, Any]:
         else None
     )
     classification = _classification_metrics(
-        bench_dir, start_ns, enabled=variant == "agent"
+        bench_dir, start_ns, end_ns, enabled=variant == "agent"
     )
     perf = _perf_metrics(bench_dir / "perf-stat.csv")
     scheduler = _scheduler_metrics(bench_dir, start_ns, end_ns)
@@ -244,24 +244,83 @@ def _schedstat_metrics(bench_dir: Path, start_ns: int, end_ns: int) -> dict[str,
     grouped: dict[tuple[int, int], list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
         grouped[(int(row.get("pid", 0)), int(row.get("tid", 0)))].append(row)
-    run_ns = wait_ns = timeslices = 0
+    run_ns = wait_ns = timeslices = migrations = 0
     covered = 0
+    by_application: dict[str, dict[str, int]] = defaultdict(
+        lambda: {
+            "workers": 0,
+            "run_ns": 0,
+            "wait_ns": 0,
+            "timeslices": 0,
+            "migrations": 0,
+        }
+    )
+    by_class: dict[str, dict[str, int]] = defaultdict(
+        lambda: {
+            "workers": 0,
+            "run_ns": 0,
+            "wait_ns": 0,
+            "timeslices": 0,
+            "migrations": 0,
+        }
+    )
     for values in grouped.values():
         delta = _window_delta(values, start_ns, end_ns)
         if delta is None:
             continue
         before, after = delta
-        run_ns += max(0, int(after["run_ns"]) - int(before["run_ns"]))
-        wait_ns += max(0, int(after["wait_ns"]) - int(before["wait_ns"]))
-        timeslices += max(0, int(after["timeslices"]) - int(before["timeslices"]))
+        worker_run_ns = max(0, int(after["run_ns"]) - int(before["run_ns"]))
+        worker_wait_ns = max(0, int(after["wait_ns"]) - int(before["wait_ns"]))
+        worker_timeslices = max(
+            0, int(after["timeslices"]) - int(before["timeslices"])
+        )
+        worker_migrations = max(
+            0, int(after.get("migrations", 0)) - int(before.get("migrations", 0))
+        )
+        run_ns += worker_run_ns
+        wait_ns += worker_wait_ns
+        timeslices += worker_timeslices
+        migrations += worker_migrations
         covered += 1
+
+        for key, bucket in (
+            (str(after.get("app", "unknown")), by_application),
+            (str(after.get("mode", "unknown")), by_class),
+        ):
+            entry = bucket[key]
+            entry["workers"] += 1
+            entry["run_ns"] += worker_run_ns
+            entry["wait_ns"] += worker_wait_ns
+            entry["timeslices"] += worker_timeslices
+            entry["migrations"] += worker_migrations
     return {
         "workers": covered,
         "run_seconds": run_ns / 1_000_000_000,
         "wait_seconds": wait_ns / 1_000_000_000,
         "wait_ratio": wait_ns / (run_ns + wait_ns) if run_ns + wait_ns else None,
         "timeslices": timeslices,
+        "migrations": migrations,
+        "by_application": _schedstat_breakdown(by_application),
+        "by_class": _schedstat_breakdown(by_class),
     }
+
+
+def _schedstat_breakdown(
+    values: dict[str, dict[str, int]],
+) -> dict[str, dict[str, int | float | None]]:
+    result: dict[str, dict[str, int | float | None]] = {}
+    for name, counters in sorted(values.items()):
+        run_ns = counters["run_ns"]
+        wait_ns = counters["wait_ns"]
+        result[name] = {
+            "workers": counters["workers"],
+            "run_seconds": run_ns / 1_000_000_000,
+            "wait_seconds": wait_ns / 1_000_000_000,
+            "wait_ratio": wait_ns / (run_ns + wait_ns) if run_ns + wait_ns else None,
+            "timeslices": counters["timeslices"],
+            "migrations": counters["migrations"],
+        }
+    return result
 
 
 def _overhead_metrics(bench_dir: Path, start_ns: int, end_ns: int) -> dict[str, Any]:
@@ -384,6 +443,10 @@ def _scheduler_metrics(bench_dir: Path, start_ns: int, end_ns: int) -> dict[str,
             "data_plane",
             "fast_path_preemption_throttles",
         ),
+        "fast_path_latency_backlog_boosts": (
+            "data_plane",
+            "fast_path_latency_backlog_boosts",
+        ),
         "fast_path_local_dispatches": (
             "data_plane",
             "fast_path_local_dispatches",
@@ -435,7 +498,7 @@ def _scheduler_metrics(bench_dir: Path, start_ns: int, end_ns: int) -> dict[str,
 
 
 def _classification_metrics(
-    bench_dir: Path, start_ns: int, *, enabled: bool
+    bench_dir: Path, start_ns: int, end_ns: int, *, enabled: bool
 ) -> dict[str, Any]:
     snapshot = (
         _read_json(bench_dir / "observations" / "classification-snapshot.json")
@@ -452,6 +515,29 @@ def _classification_metrics(
         process_rows = []
     if not isinstance(thread_rows, list):
         thread_rows = []
+    process_runtime, thread_runtime = _classification_runtime(
+        bench_dir, start_ns, end_ns
+    )
+    process_rows = [
+        {
+            **row,
+            "observed_runtime_ns": process_runtime.get(int(row.get("pid", 0)), 0),
+        }
+        if isinstance(row, dict)
+        else row
+        for row in process_rows
+    ]
+    thread_rows = [
+        {
+            **row,
+            "observed_runtime_ns": thread_runtime.get(
+                (int(row.get("pid", 0)), int(row.get("tid", 0))), 0
+            ),
+        }
+        if isinstance(row, dict)
+        else row
+        for row in thread_rows
+    ]
     target_processes = len(process_rows)
     target_threads = len(thread_rows)
     return {
@@ -491,7 +577,12 @@ def _classification_scope_metrics(
     observed = [row for row in rows if isinstance(row, dict) and row.get("observed")]
     correct = [row for row in observed if row.get("class") == row.get("expected_class")]
     if scope == "process":
-        resolved = [row for row in observed if row.get("source") == "llm"]
+        resolved = [
+            row
+            for row in observed
+            if row.get("source")
+            in {"llm", "local_metadata", "semantic_cache", "behavior", "hybrid"}
+        ]
     else:
         resolved = [
             row for row in observed if row.get("stage") in {"semantic", "locked"}
@@ -523,6 +614,14 @@ def _classification_scope_metrics(
         "classes": _count_field(observed, "class"),
         "stages": _count_field(observed, "stage"),
         "sources": _count_field(observed, "source"),
+        "confusion_matrix": _confusion_matrix(observed),
+        "accuracy_by_source": _group_accuracy(observed, "source"),
+        "accuracy_by_process_role": _group_accuracy(observed, "process_role"),
+        "accuracy_by_application": _group_accuracy(observed, "app"),
+        "coverage_by_liveness": _group_coverage(rows, "active_at_snapshot"),
+        "coverage_by_process_role": _group_coverage(rows, "process_role"),
+        "timing": _classification_timing_metrics(observed),
+        "runtime_weighted": _runtime_weighted_accuracy(rows),
     }
 
 
@@ -547,6 +646,161 @@ def _classification_ratios(counts: dict[str, int]) -> dict[str, Any]:
 def _count_field(rows: list[dict[str, Any]], field: str) -> dict[str, int]:
     values = Counter(str(row.get(field, "unknown")) for row in rows)
     return dict(sorted(values.items()))
+
+
+def _confusion_matrix(rows: list[dict[str, Any]]) -> dict[str, dict[str, int]]:
+    matrix: dict[str, Counter[str]] = {}
+    for row in rows:
+        expected = str(row.get("expected_class", "unknown"))
+        actual = str(row.get("class", "unknown"))
+        matrix.setdefault(expected, Counter())[actual] += 1
+    return {
+        expected: dict(sorted(actual.items()))
+        for expected, actual in sorted(matrix.items())
+    }
+
+
+def _group_accuracy(
+    rows: list[dict[str, Any]], field: str
+) -> dict[str, dict[str, Any]]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        grouped.setdefault(str(row.get(field, "unknown")), []).append(row)
+    return {
+        name: {
+            "observed": len(group),
+            "correct": sum(
+                row.get("class") == row.get("expected_class") for row in group
+            ),
+            "accuracy": (
+                sum(row.get("class") == row.get("expected_class") for row in group)
+                / len(group)
+                if group
+                else None
+            ),
+        }
+        for name, group in sorted(grouped.items())
+    }
+
+
+def _group_coverage(rows: list[Any], field: str) -> dict[str, dict[str, Any]]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        if isinstance(row, dict):
+            grouped.setdefault(str(row.get(field, "unknown")), []).append(row)
+    result: dict[str, dict[str, Any]] = {}
+    for name, group in sorted(grouped.items()):
+        observed = [row for row in group if row.get("observed")]
+        correct = [
+            row for row in observed if row.get("class") == row.get("expected_class")
+        ]
+        result[name] = {
+            "target": len(group),
+            "observed": len(observed),
+            "correct": len(correct),
+            "coverage": len(observed) / len(group) if group else None,
+            "observed_accuracy": len(correct) / len(observed) if observed else None,
+        }
+    return result
+
+
+def _classification_timing_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    fields = (
+        "request_delay_ns",
+        "semantic_latency_ns",
+        "behavior_delay_ns",
+        "decision_delay_ns",
+        "lock_delay_ns",
+        "apply_delay_ns",
+    )
+    result: dict[str, Any] = {}
+    for field in fields:
+        values = sorted(
+            int(timing[field])
+            for row in rows
+            if isinstance((timing := row.get("timing")), dict)
+            and isinstance(timing.get(field), int)
+            and timing[field] >= 0
+        )
+        result[field.removesuffix("_ns")] = {
+            "samples": len(values),
+            "median_seconds": (
+                statistics.median(values) / 1_000_000_000 if values else None
+            ),
+            "p95_seconds": (_percentile(values, 95) / 1_000_000_000 if values else None),
+        }
+    return result
+
+
+def _classification_runtime(
+    bench_dir: Path, start_ns: int, end_ns: int
+) -> tuple[dict[int, int], dict[tuple[int, int], int]]:
+    grouped: dict[tuple[int, int], list[dict[str, Any]]] = defaultdict(list)
+    for row in _read_jsonl(bench_dir / "observations" / "task-schedstat.jsonl"):
+        grouped[(int(row.get("pid", 0)), int(row.get("tid", 0)))].append(row)
+    thread_runtime: dict[tuple[int, int], int] = {}
+    process_runtime: dict[int, int] = defaultdict(int)
+    for key, values in grouped.items():
+        delta = _window_delta(values, start_ns, end_ns)
+        if delta is None:
+            continue
+        before, after = delta
+        runtime_ns = max(0, int(after.get("run_ns", 0)) - int(before.get("run_ns", 0)))
+        thread_runtime[key] = runtime_ns
+        process_runtime[key[0]] += runtime_ns
+    return dict(process_runtime), thread_runtime
+
+
+def _runtime_weighted_accuracy(rows: list[Any]) -> dict[str, Any]:
+    valid = [row for row in rows if isinstance(row, dict)]
+    target_runtime = sum(max(0, int(row.get("observed_runtime_ns", 0))) for row in valid)
+    observed = [row for row in valid if row.get("observed")]
+    observed_runtime = sum(
+        max(0, int(row.get("observed_runtime_ns", 0))) for row in observed
+    )
+    correct_runtime = sum(
+        max(0, int(row.get("observed_runtime_ns", 0)))
+        for row in observed
+        if row.get("class") == row.get("expected_class")
+    )
+    active = [row for row in valid if int(row.get("observed_runtime_ns", 0)) >= 1_000_000]
+    active_observed = [row for row in active if row.get("observed")]
+    active_correct = [
+        row
+        for row in active_observed
+        if row.get("class") == row.get("expected_class")
+    ]
+    return {
+        "target_runtime_seconds": target_runtime / 1_000_000_000,
+        "observed_runtime_seconds": observed_runtime / 1_000_000_000,
+        "correct_runtime_seconds": correct_runtime / 1_000_000_000,
+        "runtime_coverage": observed_runtime / target_runtime if target_runtime else None,
+        "observed_runtime_accuracy": (
+            correct_runtime / observed_runtime if observed_runtime else None
+        ),
+        "effective_runtime_accuracy": (
+            correct_runtime / target_runtime if target_runtime else None
+        ),
+        "active_target": len(active),
+        "active_observed": len(active_observed),
+        "active_correct": len(active_correct),
+        "active_coverage": len(active_observed) / len(active) if active else None,
+        "active_observed_accuracy": (
+            len(active_correct) / len(active_observed) if active_observed else None
+        ),
+    }
+
+
+def _percentile(values: list[int], percentile: float) -> float:
+    if not values:
+        raise ValueError("percentile requires at least one value")
+    position = (len(values) - 1) * percentile / 100.0
+    lower = math.floor(position)
+    upper = math.ceil(position)
+    if lower == upper:
+        return float(values[lower])
+    fraction = position - lower
+    return values[lower] + (values[upper] - values[lower]) * fraction
 
 
 def _comparisons(
@@ -655,6 +909,7 @@ def _campaign_classification(summaries: list[dict[str, Any]]) -> dict[str, Any]:
 def _aggregate_classification_scope(
     rows: Iterable[dict[str, Any]],
 ) -> dict[str, Any]:
+    rows = list(rows)
     fields = (
         "target",
         "observed",
@@ -668,7 +923,82 @@ def _aggregate_classification_scope(
     for row in rows:
         for field in fields:
             totals[field] += int(row.get(field, 0))
-    return _classification_ratios(totals)
+    result = _classification_ratios(totals)
+    result["runtime_weighted"] = _aggregate_runtime_weighted(rows)
+    result["timing"] = _aggregate_classification_timing(rows)
+    return result
+
+
+def _aggregate_runtime_weighted(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    runtime_rows = [
+        row.get("runtime_weighted", {})
+        for row in rows
+        if isinstance(row.get("runtime_weighted"), dict)
+    ]
+    target_runtime = sum(float(row.get("target_runtime_seconds", 0)) for row in runtime_rows)
+    observed_runtime = sum(
+        float(row.get("observed_runtime_seconds", 0)) for row in runtime_rows
+    )
+    correct_runtime = sum(
+        float(row.get("correct_runtime_seconds", 0)) for row in runtime_rows
+    )
+    active_target = sum(int(row.get("active_target", 0)) for row in runtime_rows)
+    active_observed = sum(int(row.get("active_observed", 0)) for row in runtime_rows)
+    active_correct = sum(int(row.get("active_correct", 0)) for row in runtime_rows)
+    return {
+        "target_runtime_seconds": target_runtime,
+        "observed_runtime_seconds": observed_runtime,
+        "correct_runtime_seconds": correct_runtime,
+        "runtime_coverage": observed_runtime / target_runtime if target_runtime else None,
+        "observed_runtime_accuracy": (
+            correct_runtime / observed_runtime if observed_runtime else None
+        ),
+        "effective_runtime_accuracy": (
+            correct_runtime / target_runtime if target_runtime else None
+        ),
+        "active_target": active_target,
+        "active_observed": active_observed,
+        "active_correct": active_correct,
+        "active_coverage": active_observed / active_target if active_target else None,
+        "active_observed_accuracy": (
+            active_correct / active_observed if active_observed else None
+        ),
+    }
+
+
+def _aggregate_classification_timing(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    fields = (
+        "request_delay",
+        "semantic_latency",
+        "behavior_delay",
+        "decision_delay",
+        "lock_delay",
+        "apply_delay",
+    )
+    result: dict[str, Any] = {}
+    for field in fields:
+        values = [
+            timing
+            for row in rows
+            if isinstance((timings := row.get("timing")), dict)
+            and isinstance((timing := timings.get(field)), dict)
+        ]
+        medians = [
+            float(value["median_seconds"])
+            for value in values
+            if isinstance(value.get("median_seconds"), (int, float))
+        ]
+        p95s = [
+            float(value["p95_seconds"])
+            for value in values
+            if isinstance(value.get("p95_seconds"), (int, float))
+        ]
+        result[field] = {
+            "samples": sum(int(value.get("samples", 0)) for value in values),
+            "median_seconds": statistics.median(medians) if medians else None,
+            "median_run_p95_seconds": statistics.median(p95s) if p95s else None,
+        }
+    return result
 
 
 def _report(output: dict[str, Any]) -> str:
@@ -748,6 +1078,50 @@ def _report(output: dict[str, Any]) -> str:
                 thread_resolved_coverage=_format_ratio(thread["resolved_coverage"]),
                 thread_resolved=_format_ratio(thread["resolved_accuracy"]),
                 thread_applied=_format_ratio(thread["generation_applied_ratio"]),
+            ),
+        ]
+    )
+    process_runtime = process["runtime_weighted"]
+    thread_runtime = thread["runtime_weighted"]
+    process_timing = process["timing"]
+    thread_timing = thread["timing"]
+    lines.extend(
+        [
+            "",
+            (
+                "运行时间加权准确率：进程 {process_accuracy}（覆盖 {process_coverage}）；"
+                "线程 {thread_accuracy}（覆盖 {thread_coverage}）。"
+            ).format(
+                process_accuracy=_format_ratio(
+                    process_runtime["observed_runtime_accuracy"]
+                ),
+                process_coverage=_format_ratio(process_runtime["runtime_coverage"]),
+                thread_accuracy=_format_ratio(thread_runtime["observed_runtime_accuracy"]),
+                thread_coverage=_format_ratio(thread_runtime["runtime_coverage"]),
+            ),
+            (
+                "分类中位时延：进程 LLM {process_semantic}、决策 {process_decision}、生效 "
+                "{process_apply}；线程本地首证据 {thread_behavior}、决策 {thread_decision}、"
+                "生效 {thread_apply}。"
+            ).format(
+                process_semantic=_format_seconds(
+                    process_timing["semantic_latency"]["median_seconds"]
+                ),
+                process_decision=_format_seconds(
+                    process_timing["decision_delay"]["median_seconds"]
+                ),
+                process_apply=_format_seconds(
+                    process_timing["apply_delay"]["median_seconds"]
+                ),
+                thread_behavior=_format_seconds(
+                    thread_timing["behavior_delay"]["median_seconds"]
+                ),
+                thread_decision=_format_seconds(
+                    thread_timing["decision_delay"]["median_seconds"]
+                ),
+                thread_apply=_format_seconds(
+                    thread_timing["apply_delay"]["median_seconds"]
+                ),
             ),
         ]
     )

@@ -1074,7 +1074,8 @@ impl SchedulerEngine {
                 accumulator.wakeup_count = accumulator.wakeup_count.saturating_add(1);
                 accumulator.sleep_ns = accumulator.sleep_ns.saturating_add(event.sleep_ns);
             }
-            if previous_sequence != 0
+            if !event.bpf_scheduled()
+                && previous_sequence != 0
                 && event.enqueue_sequence > previous_sequence.saturating_add(1)
             {
                 accumulator.bad = true;
@@ -2137,7 +2138,9 @@ pub enum EngineError {
 
 #[cfg(test)]
 mod tests {
-    use super::{EngineNotice, PreemptionGuard, ReservationPhase, RunState, SchedulerEngine};
+    use super::{
+        EngineNotice, PreemptionGuard, ReservationPhase, RunState, SchedulerEngine, WindowQuality,
+    };
     use crate::config::SchedulerConfig;
     use crate::identity::{ClassStage, ProcessKey, TaskClass, TaskKey};
     use crate::process::TaskClassUpdate;
@@ -2205,6 +2208,24 @@ mod tests {
         assert_eq!(engine.task(task).unwrap().run_state, RunState::Running);
         assert_eq!(engine.task(task).unwrap().assigned_slice_ns, 1_000_000);
         assert_eq!(engine.reservation_count(), 0);
+    }
+
+    #[test]
+    fn sampled_bpf_sequence_gap_keeps_behavior_window_valid() {
+        let mut engine =
+            SchedulerEngine::new(SchedulerConfig::default(), CpuTopology::flat(1)).unwrap();
+        let mut first = event(EventKind::Enqueue, 11, 1, 0);
+        first.flags = crate::bpf_intf::SCX_ADAPTIVE_EVENT_FLAG_BPF_SCHEDULED as u64;
+        engine.handle_event(first);
+
+        let mut sampled = event(EventKind::Enqueue, 11, 3, 0);
+        sampled.flags = crate::bpf_intf::SCX_ADAPTIVE_EVENT_FLAG_BPF_SCHEDULED as u64;
+        sampled.timestamp_ns = 2_000;
+        engine.handle_event(sampled);
+
+        let window = engine.take_behavior_windows(3_000).remove(0);
+        assert_eq!(window.enqueue_count, 2);
+        assert_eq!(window.quality, WindowQuality::Good);
     }
 
     /// Locked tasks leave behavior tracking until a Registry reset resumes it.

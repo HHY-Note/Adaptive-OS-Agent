@@ -47,7 +47,8 @@ use adaptive_os_agent::tools::{self, ToolServer};
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(3);
 const READY_TIMEOUT: Duration = Duration::from_secs(15);
 const MAIN_LOOP_SLEEP: Duration = Duration::from_millis(20);
-const MAX_EVENTS_PER_TICK: usize = 512;
+const MAX_EVENTS_PER_TICK: usize = 2_048;
+const MAX_CONTROL_ACTIONS_PER_TICK: usize = 256;
 const WORKER_SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 
 /// Counts one `/proc` pass without retaining process metadata outside Registry.
@@ -113,6 +114,13 @@ enum ClassificationOutcome {
     },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ClassifierWorkerRole {
+    ProcessOnly,
+    PreferProcess,
+    PreferThread,
+}
+
 /// Small fixed worker pool. All registry mutation remains on Agent main.
 struct ClassifierPool {
     process_work_tx: Option<Sender<ClassificationWork>>,
@@ -124,15 +132,20 @@ struct ClassifierPool {
 
 impl ClassifierPool {
     fn spawn(client: DeepSeekClient, workers: usize, capacity: usize) -> Result<Self> {
-        let process_capacity = capacity.saturating_sub(capacity / 2).max(1);
-        let thread_capacity = (capacity / 2).max(1);
-        let (process_work_tx, process_work_rx) = bounded(process_capacity);
-        let (thread_work_tx, thread_work_rx) = bounded(thread_capacity);
+        let queue_capacity = capacity.min(workers.max(1)).max(1);
+        let (process_work_tx, process_work_rx) = bounded(queue_capacity);
+        let (thread_work_tx, thread_work_rx) = bounded(queue_capacity);
         let (outcome_tx, outcomes) = bounded(capacity.max(workers).max(1));
         let shutdown = Arc::new(AtomicBool::new(false));
         let mut handles = Vec::with_capacity(workers);
         for index in 0..workers {
-            let process_only = workers > 1 && index == 0;
+            let role = if workers == 1 {
+                ClassifierWorkerRole::PreferProcess
+            } else if index == 0 {
+                ClassifierWorkerRole::ProcessOnly
+            } else {
+                ClassifierWorkerRole::PreferThread
+            };
             let worker_client = client.clone();
             let worker_process_rx = process_work_rx.clone();
             let worker_thread_rx = thread_work_rx.clone();
@@ -147,7 +160,7 @@ impl ClassifierPool {
                         worker_thread_rx,
                         worker_outcomes,
                         worker_shutdown,
-                        process_only,
+                        role,
                     )
                 })
                 .context("spawn Agent semantic worker")?;
@@ -180,6 +193,14 @@ impl ClassifierPool {
         self.outcomes.try_recv().ok()
     }
 
+    fn available_process_slots(&self) -> usize {
+        available_slots(self.process_work_tx.as_ref())
+    }
+
+    fn available_thread_slots(&self) -> usize {
+        available_slots(self.thread_work_tx.as_ref())
+    }
+
     fn shutdown(mut self) {
         self.shutdown.store(true, Ordering::Release);
         self.process_work_tx.take();
@@ -198,19 +219,23 @@ impl ClassifierPool {
     }
 }
 
+fn available_slots<T>(sender: Option<&Sender<T>>) -> usize {
+    sender.and_then(Sender::capacity).map_or(0, |capacity| {
+        capacity.saturating_sub(sender.map_or(0, Sender::len))
+    })
+}
+
 fn worker_loop(
     client: DeepSeekClient,
     process_work_rx: Receiver<ClassificationWork>,
     thread_work_rx: Receiver<ClassificationWork>,
     outcomes: Sender<ClassificationOutcome>,
     shutdown: Arc<AtomicBool>,
-    process_only: bool,
+    role: ClassifierWorkerRole,
 ) {
     let process_skill = ProcessSemanticClassificationSkill;
     let thread_skill = ThreadSemanticClassificationSkill;
-    while let Ok(work) =
-        receive_classification_work(&process_work_rx, &thread_work_rx, process_only)
-    {
+    while let Ok(work) = receive_classification_work(&process_work_rx, &thread_work_rx, role) {
         if shutdown.load(Ordering::Acquire) {
             break;
         }
@@ -250,23 +275,35 @@ fn worker_loop(
     }
 }
 
-/// Receives process work first when both bounded semantic queues are ready.
+/// Receives work according to one worker's fixed fairness role.
 fn receive_classification_work<T>(
     process_work_rx: &Receiver<T>,
     thread_work_rx: &Receiver<T>,
-    process_only: bool,
+    role: ClassifierWorkerRole,
 ) -> std::result::Result<T, RecvError> {
-    if process_only {
-        return process_work_rx.recv();
+    match role {
+        ClassifierWorkerRole::ProcessOnly => process_work_rx.recv(),
+        ClassifierWorkerRole::PreferProcess => {
+            receive_preferred_work(process_work_rx, thread_work_rx)
+        }
+        ClassifierWorkerRole::PreferThread => {
+            receive_preferred_work(thread_work_rx, process_work_rx)
+        }
     }
-    match process_work_rx.try_recv() {
+}
+
+fn receive_preferred_work<T>(
+    preferred_rx: &Receiver<T>,
+    fallback_rx: &Receiver<T>,
+) -> std::result::Result<T, RecvError> {
+    match preferred_rx.try_recv() {
         Ok(work) => return Ok(work),
-        Err(TryRecvError::Disconnected) => return thread_work_rx.recv(),
+        Err(TryRecvError::Disconnected) => return fallback_rx.recv(),
         Err(TryRecvError::Empty) => {}
     }
     select_biased! {
-        recv(process_work_rx) -> work => work,
-        recv(thread_work_rx) -> work => work,
+        recv(preferred_rx) -> work => work,
+        recv(fallback_rx) -> work => work,
     }
 }
 
@@ -340,6 +377,7 @@ fn run_agent(cli: Cli, config: AgentConfig) -> Result<()> {
 
     let result = (|| {
         scheduler.wait_ready(&client, READY_TIMEOUT)?;
+        let started = Instant::now();
         let mut excluded_tgids = vec![std::process::id(), scheduler_pid];
         let mut registry = ClassificationRegistry::new(limits, config.deepseek.min_confidence);
         let initial = reconcile_metadata(&mut registry, &excluded_tgids)?;
@@ -367,7 +405,6 @@ fn run_agent(cli: Cli, config: AgentConfig) -> Result<()> {
             )?)
         };
 
-        let started = Instant::now();
         let now = started;
         let reconcile_interval = Duration::from_secs(config.reconcile_interval_secs);
         let semantic_interval = Duration::from_secs(config.behavior_window_secs);
@@ -418,18 +455,24 @@ fn run_agent(cli: Cli, config: AgentConfig) -> Result<()> {
                         rebuild_required: true,
                     },
                     limits.snapshot_batch_size,
+                    monotonic_elapsed_ns(started),
                 ) {
                     warn!("Registry synchronization deferred: {error:#}");
                     next_sync_attempt = loop_now + Duration::from_millis(500);
                 }
             }
             if let Some(pool) = classifiers.as_ref() {
-                drain_classifier_outcomes(pool, &mut registry, &client)?;
+                drain_classifier_outcomes(pool, &mut registry, started)?;
             }
             drain_tool_requests(&tools, &registry, &client);
             let pending = registry.pending_actions();
             if !pending.is_empty() && client.is_synchronized() {
-                commit_actions(&client, &mut registry, pending);
+                commit_actions(
+                    &client,
+                    &mut registry,
+                    pending,
+                    monotonic_elapsed_ns(started),
+                );
             }
 
             let now = Instant::now();
@@ -446,6 +489,7 @@ fn run_agent(cli: Cli, config: AgentConfig) -> Result<()> {
                     &config,
                     limits.llm_pending_batches,
                     cli.offline,
+                    monotonic_elapsed_ns(started),
                 );
                 schedule_thread_batches(
                     &mut registry,
@@ -526,6 +570,7 @@ fn synchronize_registry(
     registry: &mut ClassificationRegistry,
     status: ConnectionStatus,
     batch_size: usize,
+    now_ns: u64,
 ) -> Result<()> {
     if client.connected_epoch() != status.scheduler_epoch {
         anyhow::bail!("scheduler connection changed before Registry synchronization");
@@ -551,7 +596,7 @@ fn synchronize_registry(
         }
     }
     client.mark_synchronized(status.scheduler_epoch)?;
-    registry.mark_snapshot_applied();
+    registry.mark_snapshot_applied_at(now_ns);
     info!(
         "Registry synchronized epoch={} batches={} rebuild_required={}",
         status.scheduler_epoch, batch_count, status.rebuild_required
@@ -572,7 +617,7 @@ fn drain_scheduler_events(
             break;
         };
         let now_ns = monotonic_elapsed_ns(started);
-        let actions = match event {
+        let _actions = match event {
             SchedulerEvent::Connected(status) => {
                 client.invalidate_synchronization();
                 registry.begin_scheduler_replay();
@@ -636,11 +681,8 @@ fn drain_scheduler_events(
             SchedulerEvent::BehaviorWindows {
                 timestamp_ns: _,
                 windows,
-            } => apply_behavior_windows(registry, windows, &config.classification),
+            } => apply_behavior_windows(registry, windows, &config.classification, now_ns),
         };
-        if client.is_synchronized() {
-            commit_actions(client, registry, actions);
-        }
     }
     Ok(())
 }
@@ -649,12 +691,13 @@ fn apply_behavior_windows(
     registry: &mut ClassificationRegistry,
     windows: Vec<BehaviorWindow>,
     config: &adaptive_os_agent::config::ClassificationConfig,
+    now_ns: u64,
 ) -> Vec<RegistryAction> {
     let skill = BehaviorClassificationSkill;
     let mut actions = Vec::new();
     for window in windows {
         let proposal = skill.propose(window);
-        actions.extend(registry.apply_behavior_window(window, proposal, config));
+        actions.extend(registry.apply_behavior_window_at(window, proposal, config, now_ns));
     }
     actions
 }
@@ -662,7 +705,7 @@ fn apply_behavior_windows(
 fn drain_classifier_outcomes(
     pool: &ClassifierPool,
     registry: &mut ClassificationRegistry,
-    client: &SchedulerClient,
+    started: Instant,
 ) -> Result<()> {
     while let Some(outcome) = pool.try_recv() {
         match outcome {
@@ -689,8 +732,9 @@ fn drain_classifier_outcomes(
                             proposal.confidence
                         );
                     }
-                    let actions = registry.apply_process_proposals(plan.request_id, proposals);
-                    commit_actions(client, registry, actions);
+                    let now_ns = monotonic_elapsed_ns(started);
+                    let _actions =
+                        registry.apply_process_proposals_at(plan.request_id, proposals, now_ns);
                 }
                 Err(error) => {
                     warn!(
@@ -698,7 +742,7 @@ fn drain_classifier_outcomes(
                         plan.request_id,
                         plan.processes.len()
                     );
-                    registry.mark_process_batch_failed(&plan);
+                    registry.mark_process_batch_failed_at(&plan, monotonic_elapsed_ns(started));
                 }
             },
             ClassificationOutcome::Thread { plan, result } => match result {
@@ -724,8 +768,8 @@ fn drain_classifier_outcomes(
                             proposal.confidence
                         );
                     }
-                    let actions = registry.apply_thread_proposals(proposals);
-                    commit_actions(client, registry, actions);
+                    let now_ns = monotonic_elapsed_ns(started);
+                    let _actions = registry.apply_thread_proposals_at(proposals, now_ns);
                 }
                 Err(error) => {
                     warn!(
@@ -733,7 +777,8 @@ fn drain_classifier_outcomes(
                         plan.process.tgid,
                         plan.tasks.len()
                     );
-                    registry.mark_thread_batch_failed(&plan.tasks);
+                    registry
+                        .mark_thread_batch_failed_at(&plan.tasks, monotonic_elapsed_ns(started));
                 }
             },
         }
@@ -747,15 +792,35 @@ fn schedule_process_batches(
     config: &AgentConfig,
     max_batches: usize,
     offline: bool,
+    now_ns: u64,
 ) {
-    for plan in registry.take_process_batches(config.deepseek.batch_size, max_batches) {
+    let available_batches = if offline {
+        max_batches
+    } else {
+        pool.map_or(0, ClassifierPool::available_process_slots)
+            .min(max_batches)
+    };
+    if available_batches == 0 {
+        return;
+    }
+    let min_age_ns = config
+        .classification
+        .process_semantic_min_age_secs
+        .saturating_mul(1_000_000_000);
+    for plan in registry.take_process_batches_at(
+        now_ns,
+        min_age_ns,
+        config.deepseek.batch_size,
+        available_batches,
+    ) {
         if offline {
-            registry.mark_process_batch_failed(&plan);
+            registry.mark_process_batch_failed_at(&plan, now_ns);
             continue;
         }
         let submitted = pool
             .is_some_and(|pool| pool.submit(ClassificationWork::Process { plan: plan.clone() }));
         if submitted {
+            registry.mark_process_batch_submitted(&plan, now_ns);
             info!(
                 "semantic batch queued scope=process request_id={} items={}",
                 plan.request_id,
@@ -785,16 +850,25 @@ fn schedule_thread_batches(
     offline: bool,
     now_ns: u64,
 ) {
+    let available_batches = if offline {
+        max_batches
+    } else {
+        pool.map_or(0, ClassifierPool::available_thread_slots)
+            .min(max_batches)
+    };
+    if available_batches == 0 {
+        return;
+    }
     let plans = registry.take_thread_batch_plans(
         now_ns,
         &config.classification,
         config.deepseek.batch_size,
-        max_batches,
+        available_batches,
     );
     let mut thread_snapshots = HashMap::new();
     for plan in plans {
         if offline {
-            registry.mark_thread_batch_failed(&plan.tasks);
+            registry.mark_thread_batch_failed_at(&plan.tasks, now_ns);
             continue;
         }
 
@@ -817,7 +891,7 @@ fn schedule_thread_batches(
             }
         };
         let Some(available) = snapshot.as_ref() else {
-            registry.mark_thread_batch_failed(&plan.tasks);
+            registry.mark_thread_batch_failed_at(&plan.tasks, now_ns);
             continue;
         };
 
@@ -833,10 +907,10 @@ fn schedule_thread_batches(
             }
         }
         if !missing.is_empty() {
-            registry.mark_thread_batch_failed(&missing);
+            registry.mark_thread_batch_failed_at(&missing, now_ns);
         }
         if threads.is_empty() {
-            registry.mark_thread_batch_failed(&plan.tasks);
+            registry.mark_thread_batch_failed_at(&plan.tasks, now_ns);
             continue;
         }
         let item_count = threads.len();
@@ -847,6 +921,7 @@ fn schedule_thread_batches(
             })
         });
         if submitted {
+            registry.mark_thread_batch_submitted(&plan.tasks, now_ns);
             info!(
                 "semantic batch queued scope=thread tgid={} items={}",
                 plan.process.tgid, item_count
@@ -862,22 +937,23 @@ fn commit_actions(
     client: &SchedulerClient,
     registry: &mut ClassificationRegistry,
     actions: Vec<RegistryAction>,
+    now_ns: u64,
 ) {
-    for action in actions {
-        let response = match action {
+    let mut submitted = Vec::new();
+    for action in actions.into_iter().take(MAX_CONTROL_ACTIONS_PER_TICK) {
+        let pending = match action {
             RegistryAction::SetProcessDefault {
                 request_id,
                 process,
                 class,
                 expected_generation,
                 new_generation,
-            } => client.set_process_default(
+            } => client.submit_process_default(
                 request_id,
                 process,
                 class,
                 expected_generation,
                 new_generation,
-                CONTROL_TIMEOUT,
             ),
             RegistryAction::SetTaskClass {
                 request_id,
@@ -898,10 +974,10 @@ fn commit_actions(
                 };
                 match stage {
                     adaptive_os_agent::identity::ClassStage::Semantic => {
-                        client.set_task_provisional(update, CONTROL_TIMEOUT)
+                        client.submit_task_provisional(update)
                     }
                     adaptive_os_agent::identity::ClassStage::Locked => {
-                        client.lock_task_class(update, CONTROL_TIMEOUT)
+                        client.submit_lock_task_class(update)
                     }
                     adaptive_os_agent::identity::ClassStage::Inherited => Err(anyhow::anyhow!(
                         "Registry emitted an inherited task override"
@@ -909,11 +985,22 @@ fn commit_actions(
                 }
             }
         };
+        match pending {
+            Ok(pending) => submitted.push((action, pending)),
+            Err(error) => {
+                warn!("scheduler control update was not submitted: {error:#}");
+                client.invalidate_synchronization();
+                return;
+            }
+        }
+    }
 
+    for (action, pending) in submitted {
+        let response = pending.wait(CONTROL_TIMEOUT);
         match response {
             Ok(response) if response.ok => {
                 let applied = response.applied_generation.unwrap_or(0);
-                if registry.acknowledge(action, applied) {
+                if registry.acknowledge_at(action, applied, now_ns) {
                     log_committed_action(action);
                 } else {
                     warn!("scheduler ACK did not match the current pending Registry action");
@@ -929,7 +1016,7 @@ fn commit_actions(
             }
             Ok(response) => {
                 warn!(
-                    "scheduler rejected classification [{}]: {}",
+                    "scheduler rejected classification [{}]: {} action={action:?}",
                     response.error_code.as_deref().unwrap_or("unknown"),
                     response.error.as_deref().unwrap_or("no detail")
                 );
@@ -996,23 +1083,54 @@ fn write_snapshot(path: &Path, snapshot: &serde_json::Value) -> Result<()> {
 mod tests {
     use crossbeam_channel::bounded;
 
-    use super::{receive_classification_work, refresh_live_processes, write_snapshot};
+    use super::{
+        available_slots, receive_classification_work, refresh_live_processes, write_snapshot,
+        ClassifierWorkerRole,
+    };
     use adaptive_os_agent::metadata::read_process;
 
     #[test]
-    fn process_semantics_precede_queued_thread_work() {
+    fn mixed_thread_worker_prefers_queued_thread_work() {
         let (process_tx, process_rx) = bounded(1);
         let (thread_tx, thread_rx) = bounded(1);
         thread_tx.send("thread").unwrap();
         process_tx.send("process").unwrap();
 
         assert_eq!(
-            receive_classification_work(&process_rx, &thread_rx, false).unwrap(),
-            "process"
+            receive_classification_work(
+                &process_rx,
+                &thread_rx,
+                ClassifierWorkerRole::PreferThread,
+            )
+            .unwrap(),
+            "thread"
         );
         assert_eq!(
-            receive_classification_work(&process_rx, &thread_rx, false).unwrap(),
-            "thread"
+            receive_classification_work(
+                &process_rx,
+                &thread_rx,
+                ClassifierWorkerRole::PreferThread,
+            )
+            .unwrap(),
+            "process"
+        );
+    }
+
+    #[test]
+    fn single_worker_prefers_queued_process_work() {
+        let (process_tx, process_rx) = bounded(1);
+        let (thread_tx, thread_rx) = bounded(1);
+        thread_tx.send("thread").unwrap();
+        process_tx.send("process").unwrap();
+
+        assert_eq!(
+            receive_classification_work(
+                &process_rx,
+                &thread_rx,
+                ClassifierWorkerRole::PreferProcess,
+            )
+            .unwrap(),
+            "process"
         );
     }
 
@@ -1024,10 +1142,26 @@ mod tests {
         process_tx.send("process").unwrap();
 
         assert_eq!(
-            receive_classification_work(&process_rx, &thread_rx, true).unwrap(),
+            receive_classification_work(
+                &process_rx,
+                &thread_rx,
+                ClassifierWorkerRole::ProcessOnly,
+            )
+            .unwrap(),
             "process"
         );
         assert_eq!(thread_rx.try_recv().unwrap(), "thread");
+    }
+
+    #[test]
+    fn semantic_batch_planning_uses_only_free_queue_slots() {
+        let (tx, _rx) = bounded(2);
+        assert_eq!(available_slots(Some(&tx)), 2);
+        tx.send("first").unwrap();
+        assert_eq!(available_slots(Some(&tx)), 1);
+        tx.send("second").unwrap();
+        assert_eq!(available_slots(Some(&tx)), 0);
+        assert_eq!(available_slots::<&str>(None), 0);
     }
 
     #[test]

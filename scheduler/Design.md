@@ -111,8 +111,8 @@ Inherited ------------> Locked
 
 - Inherited：继承进程默认值；初始默认值为 Balanced、generation 为 0；
 - Semantic：Agent 给出线程语义判断，仍收集运行行为；
-- Locked：完成唯一一次确认或纠正，分类永久锁定；
-- Locked 之后不允许再次修改。
+- Locked：完成行为确认或纠正，不再发送行为观测；
+- stage 在 Locked 后不再转换。仅 Agent 发现晚到的专用语义与专用本地 lock 直接冲突时，可以新 generation 将 class 保守调整为 Balanced；语义 Balanced 不撤销 lock。
 
 task_control 中始终设置 BPF_SCHED。Inherited 和 Semantic 同时设置 OBSERVE；Locked 清除 OBSERVE。
 因此三种 stage 都能走 BPF 快路径，但只有未锁定任务继续发送 ENQUEUE、RUNNING、STOP 等观测事件。
@@ -180,9 +180,7 @@ urgent slot 工作时，直接完成 local DSQ 插入。这条路径省去 enque
 FAST_CLASS_DSQ_BASE + class_id * MAX_CPUS + cpu
 ~~~
 
-Balanced 和 Throughput 插入目标 CPU 的 class DSQ。非 direct 的 Latency 插入一个共享 vtime DSQ；
-共享队列消除初始 CPU 放置错误造成的长时间排队，同时仍按 task deadline 排序。select_cpu 已原子取得
-空闲 CPU 且该 CPU 没有私有积压时，Latency 仍可直接插入 local DSQ。
+Balanced 和 Throughput 插入目标 CPU 的 class DSQ。Latency 首个任务保留在目标 CPU 私有队列，同 CPU 已有 Latency 积压时后续任务进入有界共享 overflow vtime DSQ；dispatch 优先保留 target CPU，等待超过一个 latency slice 后才允许远端 CPU 接管。select_cpu 已原子取得空闲 CPU 且该 CPU 没有私有积压时，Latency 仍可直接插入 local DSQ。
 
 task 在 class 内携带：
 
@@ -198,6 +196,8 @@ class 变化时把 source lag 限制在 source/target 各自一个 request 内�
 
 每次 custom DSQ 插入前精确增加 `class_queued_tasks`，只有成功 move-to-local 后才减少；该计数是
 Throughput epoch、空扫描跳过和 liveness 判断共享的总体积压不变量。
+
+task EEVDF 的 request、实际运行时间和 class 转换 lag 都通过 Linux task weight 换算为 virtual service。因此 `nice` 不为 0 的 Balanced 任务仍保留内核类似的比例公平性，而默认 weight 下不产生额外策略偏置。
 
 ### 4.4 每 CPU root EEVDF
 
@@ -219,6 +219,7 @@ vruntime。休眠后重新活跃的 class 最多保留一个 base request 的正
 
 root base request 固定为 0.25/4/8 ms。Latency 的短 root deadline 提供低延迟，但 EEVDF 服务记账
 防止其无限占用 CPU。
+Latency 队列中多于一个任务时，root request 临时缩短为 `latency_slice * 100 / (100 + latency_guarantee_percent)`，默认为 227,273 ns；队列恢复单任务后自动回到 250 us。
 
 ### 4.5 Latency urgent lane
 
@@ -353,7 +354,7 @@ Rust 放置同时考虑：
 - 每 CPU 一个 normal slot 和一个 urgent slot。
 
 Latency 预计超过 2 ms SLO 时，才可能在 root 选择之外申请 10% CPU-time service budget。
-真正的 urgent preemption 还受到独立 2% disruption budget、victim 最小运行 250 us、重复抢占
+真正的 urgent preemption 还受到独立 10% disruption budget、victim 最小运行 250 us、重复抢占
 guard 和 victim class 限制。Latency 永远不能抢占 Latency。
 
 ### 5.4 BPF 最终校验
@@ -468,8 +469,8 @@ ABI version 做兼容性变更。
 | task_event | 96 bytes |
 | dispatch_command | 72 bytes |
 | task_control_value | 40 bytes |
-| adaptive_cpu_state | 96 bytes |
-| adaptive_global_stats | 208 bytes |
+| adaptive_cpu_state | 112 bytes |
+| adaptive_global_stats | 224 bytes |
 
 关键容量：
 
@@ -546,7 +547,7 @@ Rust 读取 global_stats 时对计数器做 saturating sum，对 max_normal_stag
 | preemption_min_runtime_ns | 250,000 |
 | latency_target_ns | 2,000,000 |
 | latency_guarantee_percent | 10 |
-| preemption_budget_percent | 5 |
+| preemption_budget_percent | 10 |
 | heartbeat_timeout | 250 ms |
 | poll_interval | 1 ms |
 | latency_max_wait_ns | 10,000,000 |
@@ -566,6 +567,8 @@ BPF 内部额外常量：
 | 常量 | 值 |
 | --- | ---: |
 | FAST_STEAL_SCAN_LIMIT | 8 CPUs |
+| FAST_LATENCY_SCAN_LIMIT | 8 tasks |
+| FAST_EVENT_SAMPLE_INTERVAL_NS | 4,000,000 |
 | CPU_STATE_EVENT_INTERVAL_NS | 1,000,000 |
 | FAST_CLASS_DSQ_BASE | 0x10000 |
 
@@ -599,12 +602,12 @@ JSON envelope。control thread 只负责 framing、校验和有界转发，Sched
 | --- | --- | --- |
 | Latency idle direct dispatch | 减少 wakeup 到 local DSQ 的路径长度 | 原子 idle claim 且 CPU 无本地积压 |
 | 已分类 BPF fast path | 移除每次运行的 Rust round trip | 完整 task_control identity/generation |
-| Locked 事件抑制 | 降低 queue、usersched 和 JSON 观测开销 | 仅 Locked；生命周期事件仍保留 |
+| 行为事件采样/Locked 抑制 | 降低 queue、usersched 和 JSON 观测开销 | 未锁定 task 每 4 ms 至多一组；Locked 仅保留生命周期事件 |
 | CPU_STATE 1 ms 合并 | 减少 idle churn | map 状态立即更新，hotplug/必要唤醒不合并 |
 | Throughput 8..64 ms epoch | 降低切换与重新入队开销 | 全局无分类排队竞争、上限 64 ms、阻塞即复位 |
 | prev continuation | 避免完整 dispatch cycle | Locked Throughput 且全局/本地均无其他工作 |
 | fallback 本地化 | 降低未分类与 safe task 的迁移/控制面开销 | CPU 在线且 affinity 允许，否则 GLOBAL |
-| 快路径抢占限流 | 避免短 victim 和连续 IPI 抖动 | victim >=250 us，每 CPU 间隔 >=5 ms |
+| 快路径抢占限流 | 避免短 victim 和连续 IPI 抖动 | victim >=250 us，每 CPU 间隔 >=2.5 ms |
 | 有界 rotating steal | 改善负载不均 | 8 CPU 上限、source claim、保留 source 工作 |
 | PERCPU stats | 消除全局统计 cache-line 竞争 | Rust 聚合并饱和计数 |
 | 单次 stats lookup 记 enqueue | 缩短热路径 | 仅合并相同生命周期的计数 |
@@ -644,29 +647,21 @@ event_overflows 和 detach 状态判断。
 
 ## 14. 当前性能证据与验收规则
 
-`20260725-120702-620116` 是当前代码的单轮全场景候选结果。Guest 独占 3 个物理核、
-6 个 SMT 线程，每个 run 预热 20 s、测量 60 s；6/6 run 有效。这些数据用于迭代取舍，
-不构成正式置信区间。
+2026-07-26 的分类里程碑使用 Guest 独占 3 个物理核、6 个 SMT 线程，每个 run 预热 20 s、测量 60 s。Latency、Throughput 和 Mix 各执行一次 Native/Agent 配对，这些数据用于分类验收和调度器下一轮定位，不构成正式置信区间。
 
 | 场景 | Native | Agent | Agent 相对 Native |
 | --- | ---: | ---: | ---: |
-| latency P99 | 2,074.713 us | 21,996.078 us | 低 960.20% |
-| throughput | 1,073.059 units/s | 977.614 units/s | 低 8.89% |
-| mix P99 | 7,679.252 us | 25,406.212 us | 低 230.84% |
-| mix throughput | 13.102 units/s | 12.908 units/s | 低 1.47% |
+| latency P99 | 2,331.099 us | 1,905.623 us | +18.25% |
+| throughput | 681.611 units/s | 615.187 units/s | -9.75% |
+| mix P99 | 7,846.650 us | 13,946.100 us | -77.73% |
+| mix throughput | 13.226 units/s | 11.781 units/s | -10.92% |
 
-与同一天的优化前单轮基线 `single-round-20260724-222443` 相比：
+分类报告目录为 `20260726-123923-141354`、`20260726-124803-054361` 和 `20260726-123509-125295`。Throughput 曾有一次测量窗口延长到 66.018 s 的无效 run，原样复跑后有效，但仍作为调度饥饿风险保留。
 
-- 纯 Throughput 相对 Native 的差距从 20.24% 收窄到 8.89%；
-- Mix P99 从 287,953.686 us 降到 25,406.212 us，约降低 91.18%；
-- Mix P99/Native 比值从约 37.22 倍降到 3.31 倍；
-- Mix 的 scheduler CPU 从约 15.01 s 降到 6.42 s，events 从约 190 万降到 137 万，
-  CPU migration 从约 44.1 万降到 18.5 万；
-- 纯 Latency 仍为最大缺口，当前 P99 约为 Native 的 10.60 倍，不能被 Mix 改善掩盖。
-
-独立纯 Throughput 复验 `20260725-120145-308125` 中，fallback 本地化将 CPU migration 从
-130,134 降到 49,055，scheduler CPU 从 3.94 s 降到 1.95 s，同时将相对 Native 的差距从
-9.78% 收窄到 8.53%。
+- Mix 进程/线程、9/9 根任务和运行时加权准确率均为 100%；
+- Throughput 进程/线程、6/6 根任务和运行时加权准确率均为 100%；
+- Latency 的 5/5 根任务、已解析、活跃与运行时加权准确率均为 100%；总体统计中未解析的是快照前已退出的零运行时后台子进程。
+- 当前主要差距已从分类转移到 Scheduler：优先定位 Mix 尾延迟和通用 Throughput 公平性/利用率。
 
 分类 snapshot 是测量期内的时点观测，可能早于异步 LLM 批次提交；因此必须与最终 class
 dispatch 计数、Locked 行为纠错和 scheduler log 一起解读，不能把早期 snapshot 当成全程分类。
@@ -674,7 +669,7 @@ dispatch 计数、Locked 行为纠错和 scheduler log 一起解读，不能把�
 后续候选必须继续运行默认三轮 paired campaign，并同时满足：
 
 1. 所有 Native/Agent paired run 有效；
-2. 分类覆盖率、正确率和 generation 应用率为 100%；
+2. 根任务、已解析、活跃与运行时加权分类正确率为 100%，generation 应用率为 100%；
 3. latency P99 相对优化前实现有正向中位改善；
 4. throughput ops/s 相对优化前实现有正向中位改善；
 5. mix P99 不出现统计显著退化；

@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::behavior::{BehaviorWindow, WindowQuality};
 use crate::config::ClassificationConfig;
 use crate::identity::{ClassStage, ProcessKey, TaskClass, TaskKey};
 use crate::limits::RuntimeLimits;
-use crate::metadata::{ProcessInstanceKey, ProcessMetadata};
+use crate::metadata::{redact_command, ProcessInstanceKey, ProcessMetadata};
+use crate::process_classifier::classify_process_metadata;
 use crate::scheduler_client::{
     ProcessSnapshot, RegistrySnapshotBatch, SchedulerClient, TaskSnapshot,
 };
@@ -34,6 +35,28 @@ pub enum SemanticState {
     Failed,
 }
 
+/// Exact bounded metadata reused only within one Agent lifetime.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct ProcessSemanticFingerprint {
+    comm: String,
+    command: Vec<String>,
+    executable: Option<String>,
+    cgroups: Vec<String>,
+    uid: Option<u32>,
+}
+
+impl From<&ProcessMetadata> for ProcessSemanticFingerprint {
+    fn from(metadata: &ProcessMetadata) -> Self {
+        Self {
+            comm: metadata.comm.clone(),
+            command: redact_command(&metadata.command),
+            executable: metadata.executable.clone(),
+            cgroups: metadata.cgroups.clone(),
+            uid: metadata.uid,
+        }
+    }
+}
+
 /// Consecutive strong behavior evidence retained for one possible correction.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct EvidenceStreak {
@@ -41,6 +64,8 @@ struct EvidenceStreak {
     class: Option<TaskClass>,
     /// Consecutive count for that candidate.
     windows: u32,
+    /// Lowest confidence across the current consecutive evidence streak.
+    confidence_per_mille: u16,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -49,23 +74,43 @@ struct TaskReplay {
     stage: ClassStage,
     class_generation: u64,
     semantic: SemanticState,
+    behavior_confidence_per_mille: Option<u16>,
     created_ns: u64,
+    timing: ClassificationTiming,
+}
+
+/// Monotonic milestones for one process or task classification lifecycle.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ClassificationTiming {
+    /// First successful semantic queue submission.
+    pub semantic_requested_ns: Option<u64>,
+    /// First terminal semantic response, including unknown or failed results.
+    pub semantic_resolved_ns: Option<u64>,
+    /// First behavior window containing usable local classification evidence.
+    pub behavior_evidence_ns: Option<u64>,
+    /// First explicit semantic or behavior decision.
+    pub decided_ns: Option<u64>,
+    /// Time at which a task entered its final local lock stage.
+    pub locked_ns: Option<u64>,
+    /// First matching scheduler acknowledgement for the current decision.
+    pub applied_ns: Option<u64>,
 }
 
 impl EvidenceStreak {
     /// Records one strong evidence class or resets on contradictory/weak evidence.
-    fn record(&mut self, class: Option<TaskClass>) {
-        match class {
-            Some(class) if self.class == Some(class) => {
+    fn record(&mut self, proposal: Option<(TaskClass, u16)>) {
+        match proposal {
+            Some((class, confidence)) if self.class == Some(class) => {
                 self.windows = self.windows.saturating_add(1);
+                self.confidence_per_mille = self.confidence_per_mille.min(confidence);
             }
-            Some(class) => {
+            Some((class, confidence)) => {
                 self.class = Some(class);
                 self.windows = 1;
+                self.confidence_per_mille = confidence.min(1000);
             }
             None => {
-                self.class = None;
-                self.windows = 0;
+                self.clear();
             }
         }
     }
@@ -73,6 +118,47 @@ impl EvidenceStreak {
     /// Clears all accumulated evidence after a class match or lock transition.
     fn clear(&mut self) {
         *self = Self::default();
+    }
+}
+
+/// Independent locked task decisions aggregated within one process image.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ProcessBehaviorEvidence {
+    latency: u32,
+    balanced: u32,
+    throughput: u32,
+}
+
+impl ProcessBehaviorEvidence {
+    fn record(&mut self, class: TaskClass) {
+        let count = match class {
+            TaskClass::Latency => &mut self.latency,
+            TaskClass::Balanced => &mut self.balanced,
+            TaskClass::Throughput => &mut self.throughput,
+        };
+        *count = count.saturating_add(1);
+    }
+
+    /// Requires two task decisions before changing a process-wide default.
+    fn candidate(self) -> Option<(TaskClass, u16)> {
+        let total = self
+            .latency
+            .saturating_add(self.balanced)
+            .saturating_add(self.throughput);
+        if total < 2 {
+            return None;
+        }
+        let class = if self.balanced > 0 || (self.latency > 0 && self.throughput > 0) {
+            TaskClass::Balanced
+        } else if self.latency >= 2 {
+            TaskClass::Latency
+        } else if self.throughput >= 2 {
+            TaskClass::Throughput
+        } else {
+            return None;
+        };
+        let confidence = 750_u16.saturating_add(total.min(5) as u16 * 50);
+        Some((class, confidence))
     }
 }
 
@@ -95,10 +181,22 @@ pub struct ProcessRecord {
     pub applied_generation: u64,
     /// One-time process semantic request status.
     pub semantic: SemanticState,
+    /// Immediate high-confidence class derived from explicit process metadata.
+    pub local_class: Option<TaskClass>,
+    /// Confidence attached to the immediate metadata decision.
+    pub local_confidence_per_mille: Option<u16>,
+    /// Whether local task evidence contributes to the current process default.
+    pub behavior_override: bool,
+    /// Confidence of the aggregated local process decision.
+    pub behavior_confidence_per_mille: Option<u16>,
     /// Monotonic creation time used for long-lived thread eligibility.
     pub created_ns: u64,
+    /// Classification lifecycle milestones relative to Agent startup.
+    pub timing: ClassificationTiming,
     /// Stable task lifetimes currently known to belong to this process image.
     pub tasks: HashSet<TaskKey>,
+    /// Locked task decisions used for conservative process-level fallback.
+    behavior: ProcessBehaviorEvidence,
     /// Stable control request reused until this desired generation is acknowledged.
     pending_request_id: Option<u64>,
 }
@@ -120,8 +218,12 @@ pub struct TaskRecord {
     pub applied_generation: u64,
     /// One-time thread semantic request status.
     pub semantic: SemanticState,
+    /// Confidence of a locked local behavior decision, when present.
+    pub behavior_confidence_per_mille: Option<u16>,
     /// Monotonic task discovery time.
     pub created_ns: u64,
+    /// Classification lifecycle milestones relative to Agent startup.
+    pub timing: ClassificationTiming,
     /// `/proc` start time used to reject TID reuse during scheduler replay.
     pub start_time_ticks: Option<u64>,
     /// Consecutive strong contrary evidence for the one lock transition.
@@ -215,16 +317,23 @@ pub struct ClassificationRegistry {
     process_by_instance: HashMap<ProcessInstanceKey, ProcessKey>,
     /// Stable task lifetime records.
     tasks: HashMap<TaskKey, TaskRecord>,
+    /// Recently exited process projections retained for bounded observability.
+    retired_processes: VecDeque<ProcessRecord>,
+    /// Recently exited task projections retained for bounded observability.
+    retired_tasks: VecDeque<TaskRecord>,
     /// Task classifications awaiting new BPF cookies during lifecycle replay.
     replay_tasks: HashMap<(ProcessInstanceKey, u32, u64), TaskReplay>,
     /// Startup/reconciliation metadata indexed before cookie binding.
     metadata_by_instance: HashMap<ProcessInstanceKey, ProcessMetadata>,
     /// Process LLM states indexed before scheduler identity is observed.
     process_semantics: HashMap<ProcessInstanceKey, SemanticState>,
-    /// Completed proposal retained until the matching BPF identity is observed.
-    process_proposals: HashMap<ProcessInstanceKey, ProcessClassificationProposal>,
+    /// Known exact metadata signatures, bounded to process registry capacity.
+    semantic_cache: HashMap<ProcessSemanticFingerprint, SemanticState>,
+    semantic_cache_order: VecDeque<ProcessSemanticFingerprint>,
     /// Active semantic request generation for each pre-cookie process instance.
     process_request_ids: HashMap<ProcessInstanceKey, u64>,
+    /// Semantic timing retained before a process receives its scheduler cookie.
+    process_timings: HashMap<ProcessInstanceKey, ClassificationTiming>,
     /// Monotonic source for non-zero process request generations.
     next_process_request_id: u64,
     /// Monotonic high-range source for idempotent scheduler requests.
@@ -265,11 +374,15 @@ impl ClassificationRegistry {
             processes: HashMap::new(),
             process_by_instance: HashMap::new(),
             tasks: HashMap::new(),
+            retired_processes: VecDeque::new(),
+            retired_tasks: VecDeque::new(),
             replay_tasks: HashMap::new(),
             metadata_by_instance: HashMap::new(),
             process_semantics: HashMap::new(),
-            process_proposals: HashMap::new(),
+            semantic_cache: HashMap::new(),
+            semantic_cache_order: VecDeque::new(),
             process_request_ids: HashMap::new(),
+            process_timings: HashMap::new(),
             next_process_request_id: 1,
             next_control_request_id: SchedulerClient::first_action_request_id(),
             next_snapshot_id: 1,
@@ -289,24 +402,60 @@ impl ClassificationRegistry {
             self.dropped_process_records = self.dropped_process_records.saturating_add(1);
             return;
         }
+        let cached = self
+            .semantic_cache
+            .get(&ProcessSemanticFingerprint::from(&metadata))
+            .copied();
         self.metadata_by_instance.insert(instance, metadata);
-        self.process_semantics
+        let state = self
+            .process_semantics
             .entry(instance)
-            .or_insert(SemanticState::Pending);
+            .or_insert(cached.unwrap_or(SemanticState::Pending));
+        if *state == SemanticState::Pending {
+            if let Some(cached) = cached {
+                *state = cached;
+            }
+        }
     }
 
-    /// Returns unrequested process metadata in deterministic bounded batches.
+    /// Returns newest unrequested process metadata in deterministic bounded batches.
     pub fn take_process_batches(
         &mut self,
+        batch_size: usize,
+        max_batches: usize,
+    ) -> Vec<ProcessBatchPlan> {
+        self.take_process_batches_at(0, 0, batch_size, max_batches)
+    }
+
+    /// Returns newest scheduler-observed processes old enough for remote semantics.
+    pub fn take_process_batches_at(
+        &mut self,
+        now_ns: u64,
+        min_age_ns: u64,
         batch_size: usize,
         max_batches: usize,
     ) -> Vec<ProcessBatchPlan> {
         let mut instances: Vec<_> = self
             .process_semantics
             .iter()
-            .filter_map(|(instance, state)| (*state == SemanticState::Pending).then_some(*instance))
+            .filter_map(|(instance, state)| {
+                if *state != SemanticState::Pending {
+                    return None;
+                }
+                if min_age_ns == 0 {
+                    return Some(*instance);
+                }
+                let process = self.process_by_instance.get(instance)?;
+                let record = self.processes.get(process)?;
+                (now_ns.saturating_sub(record.created_ns) >= min_age_ns).then_some(*instance)
+            })
             .collect();
-        instances.sort_unstable();
+        instances.sort_unstable_by(|left, right| {
+            right
+                .start_time_ticks
+                .cmp(&left.start_time_ticks)
+                .then_with(|| left.tgid.cmp(&right.tgid))
+        });
         let mut batches = Vec::new();
         for chunk in instances.chunks(batch_size.max(1)).take(max_batches.max(1)) {
             let batch: Vec<_> = chunk
@@ -342,27 +491,58 @@ impl ClassificationRegistry {
         }
     }
 
+    /// Records the first successful queue submission for one process batch.
+    pub fn mark_process_batch_submitted(&mut self, plan: &ProcessBatchPlan, now_ns: u64) {
+        for process in &plan.processes {
+            if self.process_request_ids.get(&process.instance) != Some(&plan.request_id) {
+                continue;
+            }
+            let timing = self.process_timings.entry(process.instance).or_default();
+            set_once(&mut timing.semantic_requested_ns, now_ns);
+            for record in self
+                .processes
+                .values_mut()
+                .filter(|record| record.instance == Some(process.instance))
+            {
+                set_once(&mut record.timing.semantic_requested_ns, now_ns);
+            }
+        }
+    }
+
     /// Marks one failed process batch as fallback exactly once; it is never requeued.
     pub fn mark_process_batch_failed(&mut self, plan: &ProcessBatchPlan) {
+        self.mark_process_batch_failed_at(plan, 0);
+    }
+
+    /// Marks one failed process batch and records its terminal response time.
+    pub fn mark_process_batch_failed_at(&mut self, plan: &ProcessBatchPlan, now_ns: u64) {
         for process in &plan.processes {
-            self.mark_process_request_failed(process.instance, plan.request_id);
+            self.mark_process_request_failed(process.instance, plan.request_id, now_ns);
         }
     }
 
     /// Finalizes one exact request item that failed or disappeared before inference.
-    fn mark_process_request_failed(&mut self, instance: ProcessInstanceKey, request_id: u64) {
+    fn mark_process_request_failed(
+        &mut self,
+        instance: ProcessInstanceKey,
+        request_id: u64,
+        now_ns: u64,
+    ) {
         if self.process_request_ids.get(&instance) != Some(&request_id) {
             return;
         }
         self.process_request_ids.remove(&instance);
         self.process_semantics
             .insert(instance, SemanticState::Failed);
+        let timing = self.process_timings.entry(instance).or_default();
+        set_once(&mut timing.semantic_resolved_ns, now_ns);
         for record in self
             .processes
             .values_mut()
             .filter(|record| record.instance == Some(instance))
         {
             record.semantic = SemanticState::Failed;
+            set_once(&mut record.timing.semantic_resolved_ns, now_ns);
         }
     }
 
@@ -398,7 +578,10 @@ impl ClassificationRegistry {
         let semantic = instance
             .and_then(|instance| self.process_semantics.get(&instance).copied())
             .unwrap_or(SemanticState::Pending);
-        let proposal = instance.and_then(|instance| self.process_proposals.get(&instance).cloned());
+        let local = metadata.as_ref().and_then(classify_process_metadata);
+        let timing = instance
+            .and_then(|instance| self.process_timings.get(&instance).copied())
+            .unwrap_or_default();
         let mut record = ProcessRecord {
             identity,
             instance,
@@ -408,17 +591,26 @@ impl ClassificationRegistry {
             class_generation: 0,
             applied_generation: 0,
             semantic,
+            local_class: local.map(|decision| decision.class),
+            local_confidence_per_mille: local.map(|decision| decision.confidence_per_mille),
+            behavior_override: false,
+            behavior_confidence_per_mille: None,
             created_ns: now_ns,
+            timing,
             tasks: HashSet::new(),
+            behavior: ProcessBehaviorEvidence::default(),
             pending_request_id: None,
         };
         let mut actions = Vec::new();
-        if let Some(proposal) = proposal {
-            record.semantic = semantic_from_proposal(&proposal, self.min_confidence_per_mille);
-            if let SemanticState::Classified { class, .. } = record.semantic {
-                record.default_class = class;
-                record.inherited_from = None;
-            }
+        if let SemanticState::Classified { class, .. } = record.semantic {
+            record.default_class = class;
+            record.inherited_from = None;
+            set_once(&mut record.timing.semantic_resolved_ns, now_ns);
+            set_once(&mut record.timing.decided_ns, now_ns);
+        } else if let Some(local) = local {
+            record.default_class = local.class;
+            record.inherited_from = None;
+            set_once(&mut record.timing.decided_ns, now_ns);
         }
         if record.default_class != TaskClass::Balanced {
             record.class_generation = 1;
@@ -473,6 +665,7 @@ impl ClassificationRegistry {
             if let Some(process_record) = self.processes.get_mut(&previous.process) {
                 process_record.tasks.remove(&task);
             }
+            self.retire_task(previous);
         }
         if !self.processes.contains_key(&process)
             && self.processes.len() >= self.limits.registry_processes
@@ -499,8 +692,14 @@ impl ClassificationRegistry {
                 class_generation: 0,
                 applied_generation: 0,
                 semantic: SemanticState::Pending,
+                local_class: None,
+                local_confidence_per_mille: None,
+                behavior_override: false,
+                behavior_confidence_per_mille: None,
                 created_ns: now_ns,
+                timing: ClassificationTiming::default(),
                 tasks: HashSet::new(),
+                behavior: ProcessBehaviorEvidence::default(),
                 pending_request_id: None,
             });
         let mut record = TaskRecord {
@@ -511,7 +710,9 @@ impl ClassificationRegistry {
             class_generation: process_record.class_generation,
             applied_generation: process_record.applied_generation,
             semantic: SemanticState::Pending,
+            behavior_confidence_per_mille: None,
             created_ns: now_ns,
+            timing: ClassificationTiming::default(),
             start_time_ticks,
             behavior: EvidenceStreak::default(),
             last_behavior_window_sequence: 0,
@@ -523,6 +724,8 @@ impl ClassificationRegistry {
                 state => state,
             };
             record.created_ns = replay.created_ns;
+            record.timing = replay.timing;
+            record.behavior_confidence_per_mille = replay.behavior_confidence_per_mille;
             if replay.stage != ClassStage::Inherited {
                 record.effective_class = replay.effective_class;
                 record.stage = replay.stage;
@@ -556,7 +759,9 @@ impl ClassificationRegistry {
                     stage: record.stage,
                     class_generation: record.class_generation,
                     semantic: record.semantic,
+                    behavior_confidence_per_mille: record.behavior_confidence_per_mille,
                     created_ns: record.created_ns,
+                    timing: record.timing,
                 },
             );
         }
@@ -601,19 +806,29 @@ impl ClassificationRegistry {
         {
             return;
         }
-        self.tasks.remove(&task);
+        let retired = self.tasks.remove(&task);
         if let Some(process_record) = self.processes.get_mut(&process) {
             process_record.tasks.remove(&task);
+        }
+        if let Some(record) = retired {
+            self.retire_task(record);
         }
     }
 
     /// Deletes a process and only tasks still bound to the exact process identity.
     pub fn on_process_exited(&mut self, process: ProcessKey) {
-        let instance = self
-            .processes
-            .remove(&process)
-            .and_then(|record| record.instance);
-        self.tasks.retain(|_, record| record.process != process);
+        let retired_process = self.processes.remove(&process);
+        let instance = retired_process.as_ref().and_then(|record| record.instance);
+        let retired_tasks: Vec<_> = self
+            .tasks
+            .iter()
+            .filter_map(|(task, record)| (record.process == process).then_some(*task))
+            .collect();
+        for task in retired_tasks {
+            if let Some(record) = self.tasks.remove(&task) {
+                self.retire_task(record);
+            }
+        }
         for record in self.processes.values_mut() {
             if record.inherited_from == Some(process) {
                 record.inherited_from = None;
@@ -631,6 +846,9 @@ impl ClassificationRegistry {
                 self.forget_instance(instance);
             }
         }
+        if let Some(record) = retired_process {
+            self.retire_process(record);
+        }
     }
 
     /// Applies one completed process proposal batch after request validation.
@@ -639,6 +857,16 @@ impl ClassificationRegistry {
         request_id: u64,
         proposals: Vec<ProcessClassificationProposal>,
     ) -> Vec<RegistryAction> {
+        self.apply_process_proposals_at(request_id, proposals, 0)
+    }
+
+    /// Applies one completed process proposal batch with a monotonic response time.
+    pub fn apply_process_proposals_at(
+        &mut self,
+        request_id: u64,
+        proposals: Vec<ProcessClassificationProposal>,
+        now_ns: u64,
+    ) -> Vec<RegistryAction> {
         let mut classified = Vec::new();
         for proposal in proposals {
             if self.process_request_ids.get(&proposal.instance) != Some(&request_id) {
@@ -646,9 +874,16 @@ impl ClassificationRegistry {
             }
             self.process_request_ids.remove(&proposal.instance);
             let state = semantic_from_proposal(&proposal, self.min_confidence_per_mille);
+            if let Some(metadata) = self.metadata_by_instance.get(&proposal.instance).cloned() {
+                self.cache_process_semantic(&metadata, state);
+            }
             self.process_semantics.insert(proposal.instance, state);
-            self.process_proposals
-                .insert(proposal.instance, proposal.clone());
+            let timing = self.process_timings.entry(proposal.instance).or_default();
+            set_once(&mut timing.semantic_resolved_ns, now_ns);
+            if matches!(state, SemanticState::Classified { .. }) {
+                set_once(&mut timing.decided_ns, now_ns);
+            }
+            let timing = *timing;
             let mut identities: Vec<_> = self
                 .processes
                 .values()
@@ -661,9 +896,30 @@ impl ClassificationRegistry {
                     continue;
                 };
                 record.semantic = state;
-                if let SemanticState::Classified { class, .. } = state {
+                record.timing = timing;
+                if let SemanticState::Classified {
+                    class,
+                    confidence_per_mille,
+                } = state
+                {
+                    let (class, confidence_per_mille) = fuse_local_process_class(
+                        class,
+                        confidence_per_mille,
+                        record.local_class.zip(record.local_confidence_per_mille),
+                    );
+                    let (class, behavior_override, behavior_confidence) = fuse_process_class(
+                        class,
+                        confidence_per_mille,
+                        record.behavior.candidate(),
+                    );
                     record.inherited_from = None;
-                    classified.push((identity, class));
+                    record.behavior_override = behavior_override;
+                    record.behavior_confidence_per_mille = behavior_confidence;
+                    classified.push((
+                        identity,
+                        class,
+                        behavior_confidence.unwrap_or(confidence_per_mille),
+                    ));
                 }
             }
         }
@@ -675,16 +931,17 @@ impl ClassificationRegistry {
             })
             .collect();
         for instance in missing {
-            self.mark_process_request_failed(instance, request_id);
+            self.mark_process_request_failed(instance, request_id, now_ns);
         }
         let mut actions = Vec::new();
-        for (identity, class) in &classified {
+        for (identity, class, _) in &classified {
             if let Some(action) = self.update_process_default(*identity, *class) {
                 actions.push(action);
             }
         }
-        for (identity, class) in classified {
+        for (identity, class, confidence) in classified {
             actions.extend(self.propagate_inherited_process_default(identity, class));
+            actions.extend(self.reconcile_locked_tasks(identity, class, confidence));
         }
         for action in &actions {
             self.sync_inherited_tasks(*action);
@@ -701,6 +958,7 @@ impl ClassificationRegistry {
                 record.identity != parent
                     && record.inherited_from.is_none()
                     && !matches!(record.semantic, SemanticState::Classified { .. })
+                    && record.local_class.is_none()
                     && record
                         .metadata
                         .as_ref()
@@ -751,6 +1009,122 @@ impl ClassificationRegistry {
         actions
     }
 
+    /// Promotes independent locked task decisions into a provisional process default.
+    fn record_process_behavior(
+        &mut self,
+        process: ProcessKey,
+        class: TaskClass,
+        now_ns: u64,
+    ) -> Vec<RegistryAction> {
+        let (candidate, can_update) = {
+            let Some(record) = self.processes.get_mut(&process) else {
+                return Vec::new();
+            };
+            set_once(&mut record.timing.behavior_evidence_ns, now_ns);
+            record.behavior.record(class);
+            let Some((behavior_class, behavior_confidence)) = record.behavior.candidate() else {
+                return Vec::new();
+            };
+            let (class, behavior_override, confidence) = match record.semantic {
+                SemanticState::Classified {
+                    class,
+                    confidence_per_mille,
+                } => {
+                    let (class, confidence_per_mille) = fuse_local_process_class(
+                        class,
+                        confidence_per_mille,
+                        record.local_class.zip(record.local_confidence_per_mille),
+                    );
+                    fuse_process_class(
+                        class,
+                        confidence_per_mille,
+                        Some((behavior_class, behavior_confidence)),
+                    )
+                }
+                _ if record.inherited_from.is_some()
+                    && record.default_class != TaskClass::Balanced
+                    && record.default_class != behavior_class =>
+                {
+                    (TaskClass::Balanced, true, Some(behavior_confidence))
+                }
+                _ => (behavior_class, true, Some(behavior_confidence)),
+            };
+            record.behavior_override = behavior_override;
+            record.behavior_confidence_per_mille = confidence;
+            record.inherited_from = None;
+            set_once(&mut record.timing.decided_ns, now_ns);
+            (
+                class,
+                record.pending_request_id.is_none()
+                    && record.applied_generation == record.class_generation,
+            )
+        };
+        if !can_update {
+            return Vec::new();
+        }
+        let mut actions = Vec::new();
+        if let Some(action) = self.update_process_default(process, candidate) {
+            actions.push(action);
+        }
+        actions.extend(self.propagate_inherited_process_default(process, candidate));
+        for action in &actions {
+            self.sync_inherited_tasks(*action);
+        }
+        actions
+    }
+
+    /// Reconciles local early locks once the owning process decision arrives.
+    fn reconcile_locked_tasks(
+        &mut self,
+        process: ProcessKey,
+        process_class: TaskClass,
+        process_confidence_per_mille: u16,
+    ) -> Vec<RegistryAction> {
+        if process_class == TaskClass::Balanced {
+            return Vec::new();
+        }
+        let mut tasks: Vec<_> = self
+            .tasks
+            .values()
+            .filter(|task| {
+                task.process == process
+                    && task.stage == ClassStage::Locked
+                    && task.behavior_confidence_per_mille.is_some()
+                    && task.effective_class != TaskClass::Balanced
+                    && task.effective_class != process_class
+                    && task.pending_request_id.is_none()
+                    && task.applied_generation == task.class_generation
+            })
+            .map(|task| task.identity)
+            .collect();
+        tasks.sort_unstable();
+
+        let mut actions = Vec::new();
+        for task_key in tasks {
+            let request_id = self.allocate_control_request_id();
+            let Some(task) = self.tasks.get_mut(&task_key) else {
+                continue;
+            };
+            let expected_generation = task.applied_generation;
+            task.effective_class = TaskClass::Balanced;
+            task.behavior_confidence_per_mille = task
+                .behavior_confidence_per_mille
+                .map(|confidence| confidence.min(process_confidence_per_mille));
+            task.class_generation = task.class_generation.saturating_add(1);
+            task.pending_request_id = Some(request_id);
+            actions.push(RegistryAction::SetTaskClass {
+                request_id,
+                task: task.identity,
+                process,
+                class: TaskClass::Balanced,
+                stage: ClassStage::Locked,
+                expected_generation,
+                new_generation: task.class_generation,
+            });
+        }
+        actions
+    }
+
     /// Creates one generation-checked process action only when its class changes.
     fn update_process_default(
         &mut self,
@@ -791,9 +1165,9 @@ impl ClassificationRegistry {
         self.metadata_by_instance
             .retain(|instance, _| keep(instance));
         self.process_semantics.retain(|instance, _| keep(instance));
-        self.process_proposals.retain(|instance, _| keep(instance));
         self.process_request_ids
             .retain(|instance, _| keep(instance));
+        self.process_timings.retain(|instance, _| keep(instance));
     }
 
     /// Allocates a non-zero process request generation with wrap protection.
@@ -840,8 +1214,41 @@ impl ClassificationRegistry {
         self.process_by_instance.remove(&instance);
         self.metadata_by_instance.remove(&instance);
         self.process_semantics.remove(&instance);
-        self.process_proposals.remove(&instance);
         self.process_request_ids.remove(&instance);
+        self.process_timings.remove(&instance);
+    }
+
+    fn cache_process_semantic(&mut self, metadata: &ProcessMetadata, state: SemanticState) {
+        if !matches!(state, SemanticState::Classified { .. }) {
+            return;
+        }
+        let fingerprint = ProcessSemanticFingerprint::from(metadata);
+        if let Some(cached) = self.semantic_cache.get_mut(&fingerprint) {
+            *cached = state;
+            return;
+        }
+        while self.semantic_cache.len() >= self.limits.registry_processes {
+            let Some(oldest) = self.semantic_cache_order.pop_front() else {
+                break;
+            };
+            self.semantic_cache.remove(&oldest);
+        }
+        self.semantic_cache.insert(fingerprint.clone(), state);
+        self.semantic_cache_order.push_back(fingerprint);
+    }
+
+    fn retire_process(&mut self, record: ProcessRecord) {
+        while self.retired_processes.len() >= self.limits.registry_processes {
+            self.retired_processes.pop_front();
+        }
+        self.retired_processes.push_back(record);
+    }
+
+    fn retire_task(&mut self, record: TaskRecord) {
+        while self.retired_tasks.len() >= self.limits.registry_tasks {
+            self.retired_tasks.pop_front();
+        }
+        self.retired_tasks.push_back(record);
     }
 
     /// Returns deterministic bounded thread batches and marks them Requested.
@@ -931,12 +1338,29 @@ impl ClassificationRegistry {
         }
     }
 
+    /// Records the first successful queue submission for one thread batch.
+    pub fn mark_thread_batch_submitted(&mut self, tasks: &[TaskKey], now_ns: u64) {
+        for task in tasks {
+            if let Some(record) = self.tasks.get_mut(task) {
+                if record.semantic == SemanticState::Requested {
+                    set_once(&mut record.timing.semantic_requested_ns, now_ns);
+                }
+            }
+        }
+    }
+
     /// Marks a failed thread batch as Failed exactly once, enabling behavior fallback.
     pub fn mark_thread_batch_failed(&mut self, tasks: &[TaskKey]) {
+        self.mark_thread_batch_failed_at(tasks, 0);
+    }
+
+    /// Marks a failed thread batch and records its terminal response time.
+    pub fn mark_thread_batch_failed_at(&mut self, tasks: &[TaskKey], now_ns: u64) {
         for task in tasks {
             if let Some(record) = self.tasks.get_mut(task) {
                 if record.semantic == SemanticState::Requested {
                     record.semantic = SemanticState::Failed;
+                    set_once(&mut record.timing.semantic_resolved_ns, now_ns);
                 }
             }
         }
@@ -946,6 +1370,15 @@ impl ClassificationRegistry {
     pub fn apply_thread_proposals(
         &mut self,
         proposals: Vec<ThreadClassificationProposal>,
+    ) -> Vec<RegistryAction> {
+        self.apply_thread_proposals_at(proposals, 0)
+    }
+
+    /// Applies thread proposals with their monotonic response time.
+    pub fn apply_thread_proposals_at(
+        &mut self,
+        proposals: Vec<ThreadClassificationProposal>,
+        now_ns: u64,
     ) -> Vec<RegistryAction> {
         let mut actions = Vec::new();
         for proposal in proposals {
@@ -967,10 +1400,22 @@ impl ClassificationRegistry {
                 self.min_confidence_per_mille,
             );
             record.semantic = state;
+            set_once(&mut record.timing.semantic_resolved_ns, now_ns);
             if let SemanticState::Classified { class, .. } = state {
+                // Balanced is the neutral default. A specialized thread result
+                // can refine it immediately; conflicting specialized classes
+                // still require local behavior corroboration.
+                if record.stage == ClassStage::Inherited
+                    && class != record.effective_class
+                    && record.effective_class != TaskClass::Balanced
+                {
+                    continue;
+                }
                 let expected_generation = record.applied_generation;
                 record.effective_class = class;
                 record.stage = ClassStage::Semantic;
+                record.behavior_confidence_per_mille = None;
+                set_once(&mut record.timing.decided_ns, now_ns);
                 record.class_generation = record.class_generation.saturating_add(1);
                 record.pending_request_id = Some(request_id);
                 actions.push(RegistryAction::SetTaskClass {
@@ -994,10 +1439,28 @@ impl ClassificationRegistry {
         proposal: Option<BehaviorClassificationProposal>,
         config: &ClassificationConfig,
     ) -> Vec<RegistryAction> {
-        let process_semantic = self
+        let now_ns = window.task_age_ns.saturating_add(
+            self.tasks
+                .get(&window.task)
+                .map_or(0, |task| task.created_ns),
+        );
+        self.apply_behavior_window_at(window, proposal, config, now_ns)
+    }
+
+    /// Applies one behavior window with an Agent-monotonic observation time.
+    pub fn apply_behavior_window_at(
+        &mut self,
+        window: BehaviorWindow,
+        proposal: Option<BehaviorClassificationProposal>,
+        config: &ClassificationConfig,
+        now_ns: u64,
+    ) -> Vec<RegistryAction> {
+        let (process_semantic, process_default_class) = self
             .processes
             .get(&window.process)
-            .map_or(SemanticState::Pending, |process| process.semantic);
+            .map_or((SemanticState::Pending, TaskClass::Balanced), |process| {
+                (process.semantic, process.default_class)
+            });
         let Some(task) = self.tasks.get_mut(&window.task) else {
             return Vec::new();
         };
@@ -1030,44 +1493,65 @@ impl ClassificationRegistry {
         let timed_out = window.task_age_ns >= timeout_ns;
         let candidate = proposal.and_then(|proposal| {
             (proposal.task == window.task && proposal.process == window.process)
-                .then_some(proposal.class)
+                .then_some((proposal.class, proposal.confidence_per_mille.min(1000)))
         });
+        if candidate.is_some() {
+            set_once(&mut task.timing.behavior_evidence_ns, now_ns);
+        }
         task.behavior.record(candidate);
-        let correction_semantic = match task.semantic {
-            SemanticState::Pending | SemanticState::Requested
-                if task.stage == ClassStage::Inherited =>
-            {
-                process_semantic
+        let semantic_evidence = [
+            semantic_evidence(task.semantic),
+            semantic_evidence(process_semantic),
+        ];
+        let final_decision = if let Some((candidate, _)) = candidate {
+            let latency_objective_known = candidate != TaskClass::Latency
+                || process_default_class == TaskClass::Latency
+                || semantic_evidence
+                    .iter()
+                    .flatten()
+                    .any(|(class, _)| *class == TaskClass::Latency);
+            if !latency_objective_known {
+                return Vec::new();
             }
-            semantic => semantic,
-        };
-        let semantic_ready = matches!(
-            correction_semantic,
-            SemanticState::Classified { .. } | SemanticState::Unknown | SemanticState::Failed
-        );
-
-        let semantic_confidence = match correction_semantic {
-            SemanticState::Classified {
-                confidence_per_mille,
-                ..
-            } => confidence_per_mille,
-            _ => 0,
-        };
-        let final_class = if let Some(candidate) = candidate {
-            let contradicts_semantics = candidate != task.effective_class;
-            let threshold = if !semantic_ready
-                || (contradicts_semantics
-                    && semantic_confidence >= (config.high_confidence_threshold * 1000.0) as u16)
+            let supports_candidate = semantic_evidence
+                .iter()
+                .flatten()
+                .any(|(class, _)| *class == candidate);
+            let contradiction_confidence = semantic_evidence
+                .iter()
+                .flatten()
+                .filter_map(|(class, confidence)| {
+                    (*class != candidate && *class != TaskClass::Balanced).then_some(*confidence)
+                })
+                .max()
+                .unwrap_or(0);
+            let unsupported_contradiction = contradiction_confidence > 0 && !supports_candidate;
+            let threshold = if (unsupported_contradiction
+                && contradiction_confidence >= (config.high_confidence_threshold * 1000.0) as u16)
+                || (candidate == TaskClass::Balanced && task.behavior.confidence_per_mille < 800)
             {
                 config.high_confidence_correction_windows
             } else {
                 config.low_confidence_correction_windows
             };
-            (task.behavior.windows >= threshold).then_some(candidate)
+            (task.behavior.windows >= threshold).then_some((
+                if unsupported_contradiction {
+                    TaskClass::Balanced
+                } else {
+                    candidate
+                },
+                Some(if unsupported_contradiction {
+                    task.behavior
+                        .confidence_per_mille
+                        .min(contradiction_confidence)
+                } else {
+                    task.behavior.confidence_per_mille
+                }),
+            ))
         } else {
-            timed_out.then_some(task.effective_class)
+            timed_out.then_some((task.effective_class, None))
         };
-        let Some(final_class) = final_class else {
+        let Some((final_class, behavior_confidence_per_mille)) = final_decision else {
             return Vec::new();
         };
 
@@ -1079,6 +1563,9 @@ impl ClassificationRegistry {
         }
         task.effective_class = final_class;
         task.stage = ClassStage::Locked;
+        task.behavior_confidence_per_mille = behavior_confidence_per_mille;
+        set_once(&mut task.timing.decided_ns, now_ns);
+        set_once(&mut task.timing.locked_ns, now_ns);
         let expected_generation = task.applied_generation;
         task.class_generation = task.class_generation.saturating_add(1);
         task.behavior.clear();
@@ -1090,7 +1577,7 @@ impl ClassificationRegistry {
             return Vec::new();
         };
         task.pending_request_id = Some(request_id);
-        vec![RegistryAction::SetTaskClass {
+        let mut actions = vec![RegistryAction::SetTaskClass {
             request_id,
             task: task_key,
             process,
@@ -1098,7 +1585,11 @@ impl ClassificationRegistry {
             stage: ClassStage::Locked,
             expected_generation,
             new_generation,
-        }]
+        }];
+        if behavior_confidence_per_mille.is_some() {
+            actions.extend(self.record_process_behavior(process, final_class, now_ns));
+        }
+        actions
     }
 
     /// Mirrors one process default into every task that still inherits it.
@@ -1181,13 +1672,24 @@ impl ClassificationRegistry {
 
     /// Marks every current desired classification confirmed by a completed snapshot.
     pub fn mark_snapshot_applied(&mut self) {
+        self.mark_snapshot_applied_at(0);
+    }
+
+    /// Marks current desired state confirmed at one monotonic snapshot time.
+    pub fn mark_snapshot_applied_at(&mut self, now_ns: u64) {
         for record in self.processes.values_mut() {
             record.applied_generation = record.class_generation;
             record.pending_request_id = None;
+            if record.class_generation > 0 {
+                set_once(&mut record.timing.applied_ns, now_ns);
+            }
         }
         for record in self.tasks.values_mut() {
             record.applied_generation = record.class_generation;
             record.pending_request_id = None;
+            if record.class_generation > 0 && record.stage != ClassStage::Inherited {
+                set_once(&mut record.timing.applied_ns, now_ns);
+            }
         }
     }
 
@@ -1224,6 +1726,16 @@ impl ClassificationRegistry {
 
     /// Advances applied state only when an ACK exactly matches the pending action.
     pub fn acknowledge(&mut self, action: RegistryAction, applied_generation: u64) -> bool {
+        self.acknowledge_at(action, applied_generation, 0)
+    }
+
+    /// Advances applied state and records a matching scheduler acknowledgement.
+    pub fn acknowledge_at(
+        &mut self,
+        action: RegistryAction,
+        applied_generation: u64,
+        now_ns: u64,
+    ) -> bool {
         if applied_generation != action.new_generation() {
             return false;
         }
@@ -1246,6 +1758,7 @@ impl ClassificationRegistry {
                 }
                 record.applied_generation = new_generation;
                 record.pending_request_id = None;
+                set_once(&mut record.timing.applied_ns, now_ns);
                 for task in self.tasks.values_mut() {
                     if task.process == process
                         && task.stage == ClassStage::Inherited
@@ -1278,6 +1791,7 @@ impl ClassificationRegistry {
                 }
                 record.applied_generation = new_generation;
                 record.pending_request_id = None;
+                set_once(&mut record.timing.applied_ns, now_ns);
                 true
             }
         }
@@ -1318,9 +1832,19 @@ impl ClassificationRegistry {
         self.processes.values()
     }
 
+    /// Iterates bounded recently exited process projections.
+    pub fn retired_processes(&self) -> impl Iterator<Item = &ProcessRecord> {
+        self.retired_processes.iter()
+    }
+
     /// Iterates task records without exposing mutable Registry ownership.
     pub fn tasks(&self) -> impl Iterator<Item = &TaskRecord> {
         self.tasks.values()
+    }
+
+    /// Iterates bounded recently exited task projections.
+    pub fn retired_tasks(&self) -> impl Iterator<Item = &TaskRecord> {
+        self.retired_tasks.iter()
     }
 
     /// Returns a process record for main-loop metadata reconciliation.
@@ -1331,6 +1855,62 @@ impl ClassificationRegistry {
     /// Returns a task record for tests and thread metadata reconciliation.
     pub fn task(&self, task: TaskKey) -> Option<&TaskRecord> {
         self.tasks.get(&task)
+    }
+}
+
+/// Keeps positive local evidence when remote semantics only reports no preference.
+fn fuse_local_process_class(
+    semantic_class: TaskClass,
+    semantic_confidence_per_mille: u16,
+    local: Option<(TaskClass, u16)>,
+) -> (TaskClass, u16) {
+    let Some((local_class, local_confidence_per_mille)) = local else {
+        return (semantic_class, semantic_confidence_per_mille);
+    };
+    let confidence = semantic_confidence_per_mille.min(local_confidence_per_mille);
+    if local_class == semantic_class {
+        (semantic_class, confidence)
+    } else if semantic_class == TaskClass::Balanced && local_class != TaskClass::Balanced {
+        (local_class, confidence)
+    } else {
+        (TaskClass::Balanced, confidence)
+    }
+}
+
+/// Combines process semantics with independent locked task behavior.
+fn fuse_process_class(
+    semantic_class: TaskClass,
+    semantic_confidence_per_mille: u16,
+    behavior: Option<(TaskClass, u16)>,
+) -> (TaskClass, bool, Option<u16>) {
+    let Some((behavior_class, behavior_confidence)) = behavior else {
+        return (semantic_class, false, None);
+    };
+    if behavior_class == semantic_class {
+        return (semantic_class, false, None);
+    }
+    if semantic_class == TaskClass::Balanced {
+        return (
+            behavior_class,
+            behavior_class != TaskClass::Balanced,
+            Some(behavior_confidence.min(1000)),
+        );
+    }
+    (
+        TaskClass::Balanced,
+        true,
+        Some(
+            semantic_confidence_per_mille
+                .min(behavior_confidence)
+                .min(1000),
+        ),
+    )
+}
+
+/// Records a real monotonic milestone without replacing its first occurrence.
+fn set_once(slot: &mut Option<u64>, now_ns: u64) {
+    if now_ns > 0 && slot.is_none() {
+        *slot = Some(now_ns);
     }
 }
 
@@ -1368,11 +1948,22 @@ fn semantic_from_parts(
     }
 }
 
+/// Projects a known semantic result into one fusion vote.
+const fn semantic_evidence(semantic: SemanticState) -> Option<(TaskClass, u16)> {
+    match semantic {
+        SemanticState::Classified {
+            class,
+            confidence_per_mille,
+        } => Some((class, confidence_per_mille)),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
 
-    use super::{ClassificationRegistry, RegistryAction, SemanticState};
+    use super::{fuse_local_process_class, ClassificationRegistry, RegistryAction, SemanticState};
     use crate::behavior::{BehaviorWindow, WindowQuality};
     use crate::config::ClassificationConfig;
     use crate::identity::{ClassStage, ProcessKey, TaskClass, TaskKey};
@@ -1423,6 +2014,303 @@ mod tests {
             cgroups: Vec::new(),
             uid: Some(1000),
         }
+    }
+
+    #[test]
+    fn process_batches_prioritize_newest_lifetimes() {
+        let mut registry = ClassificationRegistry::default();
+        registry.remember_metadata(process_metadata(11, 100, None));
+        registry.remember_metadata(process_metadata(12, 300, None));
+        registry.remember_metadata(process_metadata(13, 200, None));
+
+        let newest = registry.take_process_batches(2, 1).remove(0);
+        let selected: Vec<_> = newest
+            .processes
+            .iter()
+            .map(|metadata| metadata.instance)
+            .collect();
+        assert_eq!(
+            selected,
+            vec![
+                ProcessInstanceKey {
+                    tgid: 12,
+                    start_time_ticks: 300,
+                },
+                ProcessInstanceKey {
+                    tgid: 13,
+                    start_time_ticks: 200,
+                },
+            ]
+        );
+
+        let oldest = registry.take_process_batches(2, 1).remove(0);
+        assert_eq!(oldest.processes[0].instance.tgid, 11);
+    }
+
+    #[test]
+    fn process_semantics_wait_for_scheduler_observation_and_minimum_age() {
+        let mut registry = ClassificationRegistry::default();
+        let metadata = process_metadata(14, 400, None);
+        let process = ProcessKey {
+            tgid: 14,
+            process_cookie: 15,
+            exec_generation: 1,
+        };
+        registry.remember_metadata(metadata.clone());
+        assert!(registry
+            .take_process_batches_at(2_000_000_000, 1_000_000_000, 1, 1)
+            .is_empty());
+
+        registry.on_process_discovered(process, Some(metadata), 2_000_000_000);
+        assert!(registry
+            .take_process_batches_at(2_999_999_999, 1_000_000_000, 1, 1)
+            .is_empty());
+        assert_eq!(
+            registry
+                .take_process_batches_at(3_000_000_000, 1_000_000_000, 1, 1)
+                .remove(0)
+                .processes[0]
+                .instance
+                .tgid,
+            14
+        );
+    }
+
+    #[test]
+    fn local_metadata_applies_immediately_without_suppressing_remote_semantics() {
+        let mut registry = ClassificationRegistry::default();
+        let mut metadata = process_metadata(15, 500, None);
+        metadata.comm = "time".into();
+        metadata.executable = Some("/usr/bin/time".into());
+        metadata.command = vec![
+            "/usr/bin/time".into(),
+            "bash".into(),
+            "-c".into(),
+            "job-runner --throughput --input data.bin".into(),
+        ];
+        let process = ProcessKey {
+            tgid: 15,
+            process_cookie: 16,
+            exec_generation: 1,
+        };
+
+        let actions = registry.on_process_discovered(process, Some(metadata), 2_000_000_000);
+
+        assert!(matches!(
+            actions.as_slice(),
+            [RegistryAction::SetProcessDefault {
+                process: observed,
+                class: TaskClass::Throughput,
+                ..
+            }] if *observed == process
+        ));
+        let record = registry.process(process).unwrap();
+        assert_eq!(record.default_class, TaskClass::Throughput);
+        assert_eq!(record.local_class, Some(TaskClass::Throughput));
+        assert_eq!(record.semantic, SemanticState::Pending);
+        assert_eq!(record.timing.decided_ns, Some(2_000_000_000));
+        let plan = registry
+            .take_process_batches_at(2_000_000_000, 0, 8, 1)
+            .remove(0);
+        let corrections = registry.apply_process_proposals_at(
+            plan.request_id,
+            vec![ProcessClassificationProposal {
+                instance: plan.processes[0].instance,
+                class: Some(TaskClass::Balanced),
+                confidence: 0.95,
+            }],
+            3_000_000_000,
+        );
+        assert!(corrections.is_empty());
+        assert_eq!(
+            registry.process(process).unwrap().default_class,
+            TaskClass::Throughput
+        );
+    }
+
+    #[test]
+    fn conflicting_positive_process_classes_remain_balanced() {
+        assert_eq!(
+            fuse_local_process_class(TaskClass::Latency, 950, Some((TaskClass::Throughput, 900)),),
+            (TaskClass::Balanced, 900)
+        );
+    }
+
+    #[test]
+    fn startup_inventory_remains_eligible_for_remote_semantics() {
+        let mut registry = ClassificationRegistry::default();
+        let startup_metadata = process_metadata(21, 100, None);
+        let startup_process = ProcessKey {
+            tgid: 21,
+            process_cookie: 22,
+            exec_generation: 1,
+        };
+        registry.on_process_discovered(startup_process, Some(startup_metadata), 0);
+
+        let startup_batch = registry.take_process_batches(8, 8).remove(0);
+        assert_eq!(startup_batch.processes.len(), 1);
+        assert_eq!(startup_batch.processes[0].instance.tgid, 21);
+
+        let new_metadata = process_metadata(31, 200, None);
+        registry.remember_metadata(new_metadata);
+        let batch = registry.take_process_batches(8, 8).remove(0);
+        assert_eq!(batch.processes.len(), 1);
+        assert_eq!(batch.processes[0].instance.tgid, 31);
+    }
+
+    #[test]
+    fn exact_semantic_fingerprint_classifies_repeated_process_immediately() {
+        let mut registry = ClassificationRegistry::default();
+        let first_metadata = process_metadata(51, 500, None);
+        let first_process = ProcessKey {
+            tgid: 51,
+            process_cookie: 52,
+            exec_generation: 1,
+        };
+        registry.on_process_discovered(first_process, Some(first_metadata.clone()), 1_000);
+        let plan = registry.take_process_batches(1, 1).remove(0);
+        registry.apply_process_proposals_at(
+            plan.request_id,
+            vec![ProcessClassificationProposal {
+                instance: first_metadata.instance,
+                class: Some(TaskClass::Throughput),
+                confidence: 0.9,
+            }],
+            2_000,
+        );
+
+        let mut repeated = first_metadata.clone();
+        repeated.instance = ProcessInstanceKey {
+            tgid: 61,
+            start_time_ticks: 600,
+        };
+        let repeated_process = ProcessKey {
+            tgid: 61,
+            process_cookie: 62,
+            exec_generation: 1,
+        };
+        let actions = registry.on_process_discovered(repeated_process, Some(repeated), 3_000);
+
+        assert!(matches!(
+            actions.as_slice(),
+            [RegistryAction::SetProcessDefault {
+                process,
+                class: TaskClass::Throughput,
+                ..
+            }] if *process == repeated_process
+        ));
+        let record = registry.process(repeated_process).unwrap();
+        assert!(matches!(
+            record.semantic,
+            SemanticState::Classified {
+                class: TaskClass::Throughput,
+                confidence_per_mille: 900
+            }
+        ));
+        assert_eq!(record.timing.semantic_requested_ns, None);
+        assert_eq!(record.timing.semantic_resolved_ns, Some(3_000));
+        assert!(registry.take_process_batches(8, 8).is_empty());
+
+        let mut changed = first_metadata;
+        changed.instance = ProcessInstanceKey {
+            tgid: 71,
+            start_time_ticks: 700,
+        };
+        changed.command.push("--different".into());
+        registry.remember_metadata(changed);
+        assert_eq!(
+            registry.take_process_batches(8, 8).remove(0).processes[0]
+                .instance
+                .tgid,
+            71
+        );
+    }
+
+    #[test]
+    fn process_timing_tracks_submission_decision_and_acknowledgement() {
+        let mut registry = ClassificationRegistry::default();
+        let process = ProcessKey {
+            tgid: 15,
+            process_cookie: 16,
+            exec_generation: 1,
+        };
+        let metadata = process_metadata(15, 150, None);
+        registry.on_process_discovered(process, Some(metadata.clone()), 1_000);
+        let plan = registry.take_process_batches(1, 1).remove(0);
+        registry.mark_process_batch_submitted(&plan, 2_000);
+        let action = registry
+            .apply_process_proposals_at(
+                plan.request_id,
+                vec![ProcessClassificationProposal {
+                    instance: metadata.instance,
+                    class: Some(TaskClass::Latency),
+                    confidence: 0.9,
+                }],
+                4_000,
+            )
+            .remove(0);
+        assert!(registry.acknowledge_at(action, 1, 5_000));
+
+        let timing = registry.process(process).unwrap().timing;
+        assert_eq!(timing.semantic_requested_ns, Some(2_000));
+        assert_eq!(timing.semantic_resolved_ns, Some(4_000));
+        assert_eq!(timing.decided_ns, Some(4_000));
+        assert_eq!(timing.applied_ns, Some(5_000));
+        assert_eq!(timing.behavior_evidence_ns, None);
+    }
+
+    #[test]
+    fn task_timing_tracks_first_behavior_evidence_and_lock() {
+        let mut registry = ClassificationRegistry::default();
+        let process = ProcessKey {
+            tgid: 17,
+            process_cookie: 18,
+            exec_generation: 1,
+        };
+        let task = TaskKey {
+            tid: 19,
+            task_cookie: 20,
+        };
+        registry.on_task_discovered(task, process, 1_000);
+        registry.processes.get_mut(&process).unwrap().semantic = SemanticState::Failed;
+        let config = ClassificationConfig::default();
+        let proposal = BehaviorClassificationProposal {
+            task,
+            process,
+            class: TaskClass::Throughput,
+            confidence_per_mille: 900,
+        };
+        assert!(registry
+            .apply_behavior_window_at(
+                behavior_window(task, process, 1),
+                Some(proposal),
+                &config,
+                2_000,
+            )
+            .is_empty());
+        assert!(registry
+            .apply_behavior_window_at(
+                behavior_window(task, process, 2),
+                Some(proposal),
+                &config,
+                3_000,
+            )
+            .is_empty());
+        let action = registry
+            .apply_behavior_window_at(
+                behavior_window(task, process, 3),
+                Some(proposal),
+                &config,
+                4_000,
+            )
+            .remove(0);
+        assert!(registry.acknowledge_at(action, 1, 5_000));
+
+        let timing = registry.task(task).unwrap().timing;
+        assert_eq!(timing.behavior_evidence_ns, Some(2_000));
+        assert_eq!(timing.decided_ns, Some(4_000));
+        assert_eq!(timing.locked_ns, Some(4_000));
+        assert_eq!(timing.applied_ns, Some(5_000));
     }
 
     #[test]
@@ -1645,6 +2533,36 @@ mod tests {
     }
 
     #[test]
+    fn exited_classification_history_is_bounded() {
+        let limits = RuntimeLimits {
+            registry_processes: 2,
+            registry_tasks: 1,
+            ..RuntimeLimits::default()
+        };
+        let mut registry = ClassificationRegistry::new(limits, 0.6);
+        let process = ProcessKey {
+            tgid: 41,
+            process_cookie: 42,
+            exec_generation: 1,
+        };
+        for cookie in [44, 46] {
+            let task = TaskKey {
+                tid: cookie - 1,
+                task_cookie: u64::from(cookie),
+            };
+            registry.on_task_discovered(task, process, cookie as u64);
+            registry.on_task_exited(task, process);
+        }
+
+        let retired: Vec<_> = registry.retired_tasks().collect();
+        assert_eq!(retired.len(), 1);
+        assert_eq!(retired[0].identity.task_cookie, 46);
+
+        registry.on_process_exited(process);
+        assert_eq!(registry.retired_processes().count(), 1);
+    }
+
+    #[test]
     fn unknown_identity_rejection_removes_only_the_exact_lifetime() {
         let mut registry = ClassificationRegistry::default();
         let process = ProcessKey {
@@ -1665,7 +2583,7 @@ mod tests {
             request_id: 1,
             task,
             process: wrong_process,
-            class: TaskClass::Latency,
+            class: TaskClass::Throughput,
             stage: ClassStage::Locked,
             expected_generation: 0,
             new_generation: 1,
@@ -1705,6 +2623,7 @@ mod tests {
             task,
             process,
             class: TaskClass::Throughput,
+            confidence_per_mille: 900,
         };
         assert!(registry
             .apply_behavior_window(behavior_window(task, process, 1), Some(proposal), &config)
@@ -1723,7 +2642,7 @@ mod tests {
         ));
     }
 
-    /// Strong local evidence resolves a task after five windows even while its
+    /// Strong local evidence resolves a task after three windows even while its
     /// remote semantic request remains pending.
     #[test]
     fn pending_semantics_fall_back_to_strong_behavior() {
@@ -1743,9 +2662,10 @@ mod tests {
             task,
             process,
             class: TaskClass::Throughput,
+            confidence_per_mille: 900,
         };
 
-        for sequence in 1..=4 {
+        for sequence in 1..=2 {
             assert!(registry
                 .apply_behavior_window(
                     behavior_window(task, process, sequence),
@@ -1755,12 +2675,12 @@ mod tests {
                 .is_empty());
         }
         let record = registry.tasks.get_mut(&task).unwrap();
-        assert_eq!(record.behavior.windows, 4);
+        assert_eq!(record.behavior.windows, 2);
         assert_eq!(record.stage, ClassStage::Inherited);
 
         assert!(matches!(
             registry
-                .apply_behavior_window(behavior_window(task, process, 5), Some(proposal), &config,)
+                .apply_behavior_window(behavior_window(task, process, 3), Some(proposal), &config,)
                 .as_slice(),
             [RegistryAction::SetTaskClass {
                 class: TaskClass::Throughput,
@@ -1773,10 +2693,163 @@ mod tests {
         assert_eq!(record.stage, ClassStage::Locked);
     }
 
-    /// Process-level semantics provide enough confidence context for local
-    /// behavior to correct an inherited class without waiting for thread LLM.
     #[test]
-    fn behavior_corrects_inherited_process_semantics() {
+    fn two_locked_tasks_promote_a_local_process_default() {
+        let mut registry = ClassificationRegistry::default();
+        let process = ProcessKey {
+            tgid: 131,
+            process_cookie: 132,
+            exec_generation: 1,
+        };
+        let tasks = [
+            TaskKey {
+                tid: 133,
+                task_cookie: 134,
+            },
+            TaskKey {
+                tid: 135,
+                task_cookie: 136,
+            },
+        ];
+        let config = ClassificationConfig::default();
+        let mut final_actions = Vec::new();
+
+        registry.on_task_discovered(tasks[0], process, 1);
+        registry.processes.get_mut(&process).unwrap().semantic = SemanticState::Classified {
+            class: TaskClass::Balanced,
+            confidence_per_mille: 900,
+        };
+
+        for task in tasks {
+            registry.on_task_discovered(task, process, 1);
+            let proposal = BehaviorClassificationProposal {
+                task,
+                process,
+                class: TaskClass::Throughput,
+                confidence_per_mille: 900,
+            };
+            for sequence in 1..=3 {
+                final_actions = registry.apply_behavior_window(
+                    behavior_window(task, process, sequence),
+                    Some(proposal),
+                    &config,
+                );
+            }
+        }
+
+        assert!(final_actions.iter().any(|action| matches!(
+            action,
+            RegistryAction::SetProcessDefault {
+                process: action_process,
+                class: TaskClass::Throughput,
+                ..
+            } if *action_process == process
+        )));
+        let record = registry.process(process).unwrap();
+        assert_eq!(record.default_class, TaskClass::Throughput);
+        assert!(record.behavior_override);
+        assert_eq!(record.behavior_confidence_per_mille, Some(850));
+    }
+
+    #[test]
+    fn balanced_process_semantics_preserve_a_strong_local_lock() {
+        let mut registry = ClassificationRegistry::default();
+        let process = ProcessKey {
+            tgid: 141,
+            process_cookie: 142,
+            exec_generation: 1,
+        };
+        let task = TaskKey {
+            tid: 143,
+            task_cookie: 144,
+        };
+        let metadata = process_metadata(141, 145, None);
+        registry.remember_metadata(metadata.clone());
+        registry.on_process_discovered(process, Some(metadata.clone()), 1);
+        registry.on_task_discovered(task, process, 1);
+        registry.tasks.get_mut(&task).unwrap().semantic = SemanticState::Classified {
+            class: TaskClass::Latency,
+            confidence_per_mille: 900,
+        };
+        let plan = registry.take_process_batches(1, 1).remove(0);
+        let config = ClassificationConfig::default();
+        let proposal = BehaviorClassificationProposal {
+            task,
+            process,
+            class: TaskClass::Latency,
+            confidence_per_mille: 900,
+        };
+        let mut local_actions = Vec::new();
+        for sequence in 1..=3 {
+            local_actions = registry.apply_behavior_window(
+                behavior_window(task, process, sequence),
+                Some(proposal),
+                &config,
+            );
+        }
+        let local_action = local_actions
+            .into_iter()
+            .find(|action| matches!(action, RegistryAction::SetTaskClass { .. }))
+            .unwrap();
+        assert!(registry.acknowledge(local_action, 1));
+
+        let actions = registry.apply_process_proposals(
+            plan.request_id,
+            vec![ProcessClassificationProposal {
+                instance: metadata.instance,
+                class: Some(TaskClass::Balanced),
+                confidence: 0.8,
+            }],
+        );
+
+        assert!(actions.is_empty());
+        let record = registry.task(task).unwrap();
+        assert_eq!(record.effective_class, TaskClass::Latency);
+        assert_eq!(record.behavior_confidence_per_mille, Some(900));
+    }
+
+    #[test]
+    fn io_shaped_behavior_does_not_invent_a_latency_objective() {
+        let mut registry = ClassificationRegistry::default();
+        let process = ProcessKey {
+            tgid: 151,
+            process_cookie: 152,
+            exec_generation: 1,
+        };
+        let task = TaskKey {
+            tid: 153,
+            task_cookie: 154,
+        };
+        registry.on_task_discovered(task, process, 1);
+        registry.processes.get_mut(&process).unwrap().semantic = SemanticState::Classified {
+            class: TaskClass::Balanced,
+            confidence_per_mille: 900,
+        };
+        let proposal = BehaviorClassificationProposal {
+            task,
+            process,
+            class: TaskClass::Latency,
+            confidence_per_mille: 900,
+        };
+        let config = ClassificationConfig::default();
+
+        for sequence in 1..=5 {
+            assert!(registry
+                .apply_behavior_window(
+                    behavior_window(task, process, sequence),
+                    Some(proposal),
+                    &config,
+                )
+                .is_empty());
+        }
+        let record = registry.task(task).unwrap();
+        assert_eq!(record.effective_class, TaskClass::Balanced);
+        assert_eq!(record.stage, ClassStage::Inherited);
+    }
+
+    /// Conflicting process semantics and local behavior converge to Balanced.
+    #[test]
+    fn behavior_fuses_conflicting_process_semantics_as_balanced() {
         let mut registry = ClassificationRegistry::default();
         let process = ProcessKey {
             tgid: 121,
@@ -1791,7 +2864,7 @@ mod tests {
         let process_record = registry.processes.get_mut(&process).unwrap();
         process_record.semantic = SemanticState::Classified {
             class: TaskClass::Latency,
-            confidence_per_mille: 700,
+            confidence_per_mille: 900,
         };
         process_record.default_class = TaskClass::Latency;
         registry.tasks.get_mut(&task).unwrap().effective_class = TaskClass::Latency;
@@ -1800,25 +2873,31 @@ mod tests {
             task,
             process,
             class: TaskClass::Throughput,
+            confidence_per_mille: 900,
         };
 
-        assert!(registry
-            .apply_behavior_window(behavior_window(task, process, 1), Some(proposal), &config)
-            .is_empty());
-        assert!(registry
-            .apply_behavior_window(behavior_window(task, process, 2), Some(proposal), &config)
-            .is_empty());
+        for sequence in 1..=4 {
+            assert!(registry
+                .apply_behavior_window(
+                    behavior_window(task, process, sequence),
+                    Some(proposal),
+                    &config,
+                )
+                .is_empty());
+        }
         assert!(matches!(
             registry
-                .apply_behavior_window(behavior_window(task, process, 3), Some(proposal), &config)
+                .apply_behavior_window(behavior_window(task, process, 5), Some(proposal), &config)
                 .as_slice(),
             [RegistryAction::SetTaskClass {
-                class: TaskClass::Throughput,
+                class: TaskClass::Balanced,
                 stage: ClassStage::Locked,
                 ..
             }]
         ));
-        assert_eq!(registry.task(task).unwrap().semantic, SemanticState::Failed);
+        let record = registry.task(task).unwrap();
+        assert_eq!(record.semantic, SemanticState::Failed);
+        assert_eq!(record.behavior_confidence_per_mille, Some(900));
     }
 
     /// A behavior proposal from another process image cannot contribute a vote.
@@ -1849,6 +2928,7 @@ mod tests {
                     task,
                     process: wrong_process,
                     class: TaskClass::Throughput,
+                    confidence_per_mille: 900,
                 }),
                 &config,
             )
@@ -2232,6 +3312,7 @@ mod tests {
             task,
             process,
             class: TaskClass::Throughput,
+            confidence_per_mille: 900,
         };
         assert!(registry
             .apply_behavior_window(behavior_window(task, process, 1), Some(proposal), &config)
@@ -2290,6 +3371,170 @@ mod tests {
             registry.task(task).unwrap().effective_class,
             TaskClass::Balanced
         );
+    }
+
+    #[test]
+    fn specialized_thread_semantics_refine_a_balanced_process_default() {
+        let mut registry = ClassificationRegistry::default();
+        let process = ProcessKey {
+            tgid: 71,
+            process_cookie: 72,
+            exec_generation: 1,
+        };
+        let task = TaskKey {
+            tid: 73,
+            task_cookie: 74,
+        };
+        registry.on_task_discovered(task, process, 0);
+        registry.tasks.get_mut(&task).unwrap().semantic = SemanticState::Requested;
+
+        let actions = registry.apply_thread_proposals(vec![ThreadClassificationProposal {
+            process,
+            task,
+            class: Some(TaskClass::Throughput),
+            confidence: 0.9,
+        }]);
+
+        assert!(matches!(
+            actions.as_slice(),
+            [RegistryAction::SetTaskClass {
+                class: TaskClass::Throughput,
+                stage: ClassStage::Semantic,
+                ..
+            }]
+        ));
+        let record = registry.task(task).unwrap();
+        assert_eq!(record.effective_class, TaskClass::Throughput);
+        assert_eq!(record.stage, ClassStage::Semantic);
+    }
+
+    #[test]
+    fn conflicting_thread_semantics_wait_for_local_corroboration() {
+        let mut registry = ClassificationRegistry::default();
+        let process = ProcessKey {
+            tgid: 81,
+            process_cookie: 82,
+            exec_generation: 1,
+        };
+        let task = TaskKey {
+            tid: 83,
+            task_cookie: 84,
+        };
+        registry.on_task_discovered(task, process, 0);
+        let process_record = registry.processes.get_mut(&process).unwrap();
+        process_record.default_class = TaskClass::Throughput;
+        process_record.semantic = SemanticState::Classified {
+            class: TaskClass::Throughput,
+            confidence_per_mille: 900,
+        };
+        let task_record = registry.tasks.get_mut(&task).unwrap();
+        task_record.effective_class = TaskClass::Throughput;
+        task_record.semantic = SemanticState::Requested;
+
+        let actions = registry.apply_thread_proposals(vec![ThreadClassificationProposal {
+            process,
+            task,
+            class: Some(TaskClass::Balanced),
+            confidence: 0.8,
+        }]);
+
+        assert!(actions.is_empty());
+        let record = registry.task(task).unwrap();
+        assert_eq!(record.effective_class, TaskClass::Throughput);
+        assert_eq!(record.stage, ClassStage::Inherited);
+        assert_eq!(
+            record.semantic,
+            SemanticState::Classified {
+                class: TaskClass::Balanced,
+                confidence_per_mille: 800,
+            }
+        );
+
+        let config = ClassificationConfig::default();
+        let proposal = BehaviorClassificationProposal {
+            task,
+            process,
+            class: TaskClass::Throughput,
+            confidence_per_mille: 900,
+        };
+        for sequence in 1..=2 {
+            assert!(registry
+                .apply_behavior_window(
+                    behavior_window(task, process, sequence),
+                    Some(proposal),
+                    &config,
+                )
+                .is_empty());
+        }
+        assert!(matches!(
+            registry
+                .apply_behavior_window(behavior_window(task, process, 3), Some(proposal), &config)
+                .as_slice(),
+            [RegistryAction::SetTaskClass {
+                class: TaskClass::Throughput,
+                stage: ClassStage::Locked,
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn behavior_and_thread_semantics_can_override_process_semantics() {
+        let mut registry = ClassificationRegistry::default();
+        let process = ProcessKey {
+            tgid: 91,
+            process_cookie: 92,
+            exec_generation: 1,
+        };
+        let task = TaskKey {
+            tid: 93,
+            task_cookie: 94,
+        };
+        registry.on_task_discovered(task, process, 0);
+        let process_record = registry.processes.get_mut(&process).unwrap();
+        process_record.default_class = TaskClass::Throughput;
+        process_record.semantic = SemanticState::Classified {
+            class: TaskClass::Throughput,
+            confidence_per_mille: 900,
+        };
+        let task_record = registry.tasks.get_mut(&task).unwrap();
+        task_record.effective_class = TaskClass::Throughput;
+        task_record.semantic = SemanticState::Requested;
+        assert!(registry
+            .apply_thread_proposals(vec![ThreadClassificationProposal {
+                process,
+                task,
+                class: Some(TaskClass::Latency),
+                confidence: 0.9,
+            }])
+            .is_empty());
+
+        let config = ClassificationConfig::default();
+        let proposal = BehaviorClassificationProposal {
+            task,
+            process,
+            class: TaskClass::Latency,
+            confidence_per_mille: 900,
+        };
+        for sequence in 1..=2 {
+            assert!(registry
+                .apply_behavior_window(
+                    behavior_window(task, process, sequence),
+                    Some(proposal),
+                    &config,
+                )
+                .is_empty());
+        }
+        assert!(matches!(
+            registry
+                .apply_behavior_window(behavior_window(task, process, 3), Some(proposal), &config)
+                .as_slice(),
+            [RegistryAction::SetTaskClass {
+                class: TaskClass::Latency,
+                stage: ClassStage::Locked,
+                ..
+            }]
+        ));
     }
 
     /// Public proposal inputs cannot bypass confidence validation.
@@ -2464,7 +3709,9 @@ mod tests {
             task_cookie: 64,
         };
         registry.on_task_discovered(task, process, 0);
-        registry.tasks.get_mut(&task).unwrap().semantic = SemanticState::Requested;
+        let task_record = registry.tasks.get_mut(&task).unwrap();
+        task_record.effective_class = TaskClass::Latency;
+        task_record.semantic = SemanticState::Requested;
         let action = registry
             .apply_thread_proposals(vec![ThreadClassificationProposal {
                 process,
@@ -2542,6 +3789,7 @@ mod tests {
             task,
             process,
             class: TaskClass::Throughput,
+            confidence_per_mille: 900,
         };
         let config = ClassificationConfig::default();
 

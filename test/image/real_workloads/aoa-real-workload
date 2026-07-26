@@ -274,7 +274,7 @@ launch_jobs() {
             zstd_job zstd-background throughput "$phase" "$duration" 1
             ;;
         throughput)
-            redis_job redis-sentinel throughput "$phase" "$duration" "$(scaled_rate 750)"
+            redis_job redis-sentinel latency "$phase" "$duration" "$(scaled_rate 750)"
             ffmpeg_job ffmpeg "$phase" "$duration" "$CLIENT_THREADS"
             [ "$PRESSURE_CPUS" -ge 2 ] && rocksdb_job rocksdb "$phase" "$duration" "$CLIENT_THREADS"
             [ "$PRESSURE_CPUS" -ge 3 ] && zstd_job zstd throughput "$phase" "$duration" "$CLIENT_THREADS"

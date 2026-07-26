@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use crossbeam_channel::{
-    bounded, Receiver, RecvTimeoutError, SendTimeoutError, Sender, TryRecvError,
+    bounded, Receiver, RecvTimeoutError, SendTimeoutError, Sender, TryRecvError, TrySendError,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -120,6 +120,27 @@ pub struct ControlResponse {
     pub rebuild_required: Option<bool>,
     pub snapshot_complete: Option<bool>,
     pub snapshot: Option<Value>,
+}
+
+/// Correlated response handle used to pipeline independent class updates.
+pub struct PendingControlResponse {
+    request_id: u64,
+    reply: Receiver<Result<ControlResponse>>,
+}
+
+impl PendingControlResponse {
+    /// Waits only after all requests in the current control batch were submitted.
+    pub fn wait(self, timeout: Duration) -> Result<ControlResponse> {
+        match self.reply.recv_timeout(timeout) {
+            Ok(result) => result,
+            Err(RecvTimeoutError::Timeout) => {
+                anyhow::bail!("scheduler control request {} timed out", self.request_id)
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                anyhow::bail!("scheduler control I/O thread stopped")
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -262,7 +283,26 @@ impl SchedulerClient {
         new_generation: u64,
         timeout: Duration,
     ) -> Result<ControlResponse> {
-        self.request(
+        self.submit_process_default(
+            request_id,
+            process,
+            class,
+            expected_generation,
+            new_generation,
+        )?
+        .wait(timeout)
+    }
+
+    /// Submits one process update without waiting, preserving its exact CAS values.
+    pub fn submit_process_default(
+        &self,
+        request_id: u64,
+        process: ProcessKey,
+        class: TaskClass,
+        expected_generation: u64,
+        new_generation: u64,
+    ) -> Result<PendingControlResponse> {
+        self.submit_request(
             request_id,
             "set_process_default",
             json!({
@@ -272,7 +312,6 @@ impl SchedulerClient {
                 "new_generation": new_generation,
             }),
             false,
-            timeout,
         )
     }
 
@@ -282,7 +321,15 @@ impl SchedulerClient {
         update: TaskClassRequest,
         timeout: Duration,
     ) -> Result<ControlResponse> {
-        self.set_task("set_task_provisional", update, timeout)
+        self.submit_task_provisional(update)?.wait(timeout)
+    }
+
+    /// Submits one provisional task update for pipelined acknowledgement.
+    pub fn submit_task_provisional(
+        &self,
+        update: TaskClassRequest,
+    ) -> Result<PendingControlResponse> {
+        self.submit_task("set_task_provisional", update)
     }
 
     /// Commits one final behavior confirmation or correction.
@@ -291,7 +338,15 @@ impl SchedulerClient {
         update: TaskClassRequest,
         timeout: Duration,
     ) -> Result<ControlResponse> {
-        self.set_task("lock_task_class", update, timeout)
+        self.submit_lock_task_class(update)?.wait(timeout)
+    }
+
+    /// Submits one final task update for pipelined acknowledgement.
+    pub fn submit_lock_task_class(
+        &self,
+        update: TaskClassRequest,
+    ) -> Result<PendingControlResponse> {
+        self.submit_task("lock_task_class", update)
     }
 
     /// Returns current scheduler diagnostics after synchronization.
@@ -327,13 +382,12 @@ impl SchedulerClient {
         }
     }
 
-    fn set_task(
+    fn submit_task(
         &self,
         message_type: &'static str,
         update: TaskClassRequest,
-        timeout: Duration,
-    ) -> Result<ControlResponse> {
-        self.request(
+    ) -> Result<PendingControlResponse> {
+        self.submit_request(
             update.request_id,
             message_type,
             json!({
@@ -344,7 +398,6 @@ impl SchedulerClient {
                 "new_generation": update.new_generation,
             }),
             false,
-            timeout,
         )
     }
 
@@ -356,6 +409,17 @@ impl SchedulerClient {
         allowed_before_sync: bool,
         timeout: Duration,
     ) -> Result<ControlResponse> {
+        self.submit_request(id, message_type, payload, allowed_before_sync)?
+            .wait(timeout)
+    }
+
+    fn submit_request(
+        &self,
+        id: u64,
+        message_type: &'static str,
+        payload: Value,
+        allowed_before_sync: bool,
+    ) -> Result<PendingControlResponse> {
         if id == 0 {
             anyhow::bail!("scheduler control request ID must be non-zero");
         }
@@ -376,15 +440,10 @@ impl SchedulerClient {
                 reply: reply_tx,
             })
             .context("scheduler control client stopped")?;
-        match reply_rx.recv_timeout(timeout) {
-            Ok(result) => result,
-            Err(RecvTimeoutError::Timeout) => {
-                anyhow::bail!("scheduler control request {id} timed out")
-            }
-            Err(RecvTimeoutError::Disconnected) => {
-                anyhow::bail!("scheduler control I/O thread stopped")
-            }
-        }
+        Ok(PendingControlResponse {
+            request_id: id,
+            reply: reply_rx,
+        })
     }
 
     fn allocate_request_id(&self) -> Result<u64> {
@@ -576,6 +635,12 @@ fn send_event(
     mut event: SchedulerEvent,
     shutdown: &AtomicBool,
 ) -> bool {
+    if matches!(event, SchedulerEvent::BehaviorWindows { .. }) {
+        return match events.try_send(event) {
+            Ok(()) | Err(TrySendError::Full(_)) => true,
+            Err(TrySendError::Disconnected(_)) => false,
+        };
+    }
     while !shutdown.load(Ordering::Acquire) {
         match events.send_timeout(event, IO_POLL) {
             Ok(()) => return true,
@@ -924,8 +989,13 @@ fn invalid_data(message: &str) -> io::Error {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_message, encode_frame, scheduler_event, IncomingMessage, SchedulerEvent};
+    use std::sync::atomic::AtomicBool;
+
+    use super::{
+        decode_message, encode_frame, scheduler_event, send_event, IncomingMessage, SchedulerEvent,
+    };
     use crate::local_frame::FrameReader;
+    use crossbeam_channel::bounded;
     use serde_json::json;
 
     /// The Agent emits the same fixed Hello envelope accepted by scheduler tests.
@@ -1022,5 +1092,26 @@ mod tests {
         let body = buffered.take(4096).unwrap().unwrap();
         assert!(decode_message(&body).is_err());
         let _ = std::mem::size_of::<IncomingMessage>();
+    }
+
+    #[test]
+    fn full_event_queue_drops_telemetry_without_blocking_control_io() {
+        let (sender, receiver) = bounded(1);
+        sender
+            .send(SchedulerEvent::LifecycleReplayComplete)
+            .unwrap();
+
+        assert!(send_event(
+            &sender,
+            SchedulerEvent::BehaviorWindows {
+                timestamp_ns: 1,
+                windows: Vec::new(),
+            },
+            &AtomicBool::new(false),
+        ));
+        assert_eq!(
+            receiver.try_recv().unwrap(),
+            SchedulerEvent::LifecycleReplayComplete
+        );
     }
 }

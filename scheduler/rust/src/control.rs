@@ -194,6 +194,7 @@ impl Serialize for DataPlaneStats {
             cpu_state_events_suppressed: u64,
             fast_path_empty_steal_skips: u64,
             fast_path_preemption_throttles: u64,
+            fast_path_latency_backlog_boosts: u64,
         }
 
         Fields {
@@ -222,6 +223,7 @@ impl Serialize for DataPlaneStats {
             cpu_state_events_suppressed: self.cpu_state_events_suppressed,
             fast_path_empty_steal_skips: self.fast_path_empty_steal_skips,
             fast_path_preemption_throttles: self.fast_path_preemption_throttles,
+            fast_path_latency_backlog_boosts: self.fast_path_latency_backlog_boosts,
         }
         .serialize(serializer)
     }
