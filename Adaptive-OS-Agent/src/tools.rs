@@ -319,6 +319,9 @@ fn process_classification(record: &crate::registry::ProcessRecord) -> Value {
 
 fn task_classification(record: &crate::registry::TaskRecord) -> Value {
     let source = match record.stage {
+        ClassStage::Inherited if matches!(record.semantic, SemanticState::Classified { class, .. } if class != record.effective_class) => {
+            "llm_pending_behavior"
+        }
         ClassStage::Inherited => "process_default",
         ClassStage::Semantic => "llm",
         ClassStage::Locked => "behavior",
@@ -431,6 +434,15 @@ fn process_source(record: &crate::registry::ProcessRecord) -> &'static str {
         return "parent_default";
     }
     match record.semantic {
+        SemanticState::Classified { class, .. }
+            if class != record.default_class && record.local_class.is_none() =>
+        {
+            if record.timing.semantic_requested_ns.is_none() {
+                "semantic_cache_pending_behavior"
+            } else {
+                "llm_pending_behavior"
+            }
+        }
         SemanticState::Classified { .. } if record.timing.semantic_requested_ns.is_none() => {
             "semantic_cache"
         }

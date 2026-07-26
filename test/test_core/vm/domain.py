@@ -59,7 +59,11 @@ def build_domain_xml(
     escaped_cpu_mode = html.escape(cpu_mode, quote=True)
     escaped_emulator = html.escape(emulator_cpus, quote=True)
     scenario = str(spec.benchmark.get("scenario", ""))
-    profile = scenario if scenario in {"latency", "throughput", "mix"} else "idle"
+    profile = (
+        scenario
+        if scenario in {"latency", "throughput", "balanced", "mix"}
+        else "idle"
+    )
     escaped_profile_serial = html.escape(f"aoa-profile-{profile}", quote=True)
     cpu_features = "\n".join(
         f'    <feature policy="require" name="{html.escape(feature, quote=True)}"/>'

@@ -995,6 +995,8 @@ static __always_inline bool dispatch_latency_overflow(s32 dst_cpu,
 
 		if (scanned++ >= FAST_LATENCY_SCAN_LIMIT)
 			break;
+		if (!bpf_cpumask_test_cpu(dst_cpu, p->cpus_ptr))
+			continue;
 		taskc = task_ctx_for(p);
 		if (!taskc)
 			continue;

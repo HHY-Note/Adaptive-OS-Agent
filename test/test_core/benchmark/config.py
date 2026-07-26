@@ -10,7 +10,7 @@ from test_core.config.parser import ConfigError
 from test_core.models import RunSpec
 
 
-SCENARIOS = ("latency", "throughput", "mix")
+SCENARIOS = ("latency", "throughput", "balanced", "mix")
 VARIANTS = ("native", "agent")
 PROFILES = ("formal", "single-round")
 

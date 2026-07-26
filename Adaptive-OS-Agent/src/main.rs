@@ -379,7 +379,11 @@ fn run_agent(cli: Cli, config: AgentConfig) -> Result<()> {
         scheduler.wait_ready(&client, READY_TIMEOUT)?;
         let started = Instant::now();
         let mut excluded_tgids = vec![std::process::id(), scheduler_pid];
-        let mut registry = ClassificationRegistry::new(limits, config.deepseek.min_confidence);
+        let mut registry = ClassificationRegistry::new(
+            limits,
+            config.deepseek.min_confidence,
+            config.classification.high_confidence_threshold,
+        );
         let initial = reconcile_metadata(&mut registry, &excluded_tgids)?;
         let logical_batches = if initial.ordinary == 0 {
             0

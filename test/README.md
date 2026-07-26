@@ -48,14 +48,17 @@ test/
 
 PostgreSQL 的 pgbench scale 4 数据库已固化。Redis、Memcached 的 20,000 个键以及 RocksDB 的 200,000 条 256-byte 数据在每次 run 的临时 overlay 中准备，不污染只读模板。
 
-## 三种场景
+## 四种场景
 
 应用集合写死在 `image/real_workloads/aoa-real-workload`，不在 Host 配置中重复维护。
+
+表中的角色描述带显式目标的 client/job。没有进程级 SLO 或本机批处理目标的 server 组件统一按 `balanced` 观测，不从场景名称推导生产分类。
 
 | 场景 | latency 角色 | throughput 角色 | balanced 角色 |
 | --- | --- | --- | --- |
 | `latency` | Redis、Memcached、Nginx、PostgreSQL | zstd-background | 无 |
 | `throughput` | 无 | Redis、FFmpeg、RocksDB、zstd、OpenSSL、ImageMagick | 无 |
+| `balanced` | 无 | 无 | Redis、Memcached、PostgreSQL、NATS |
 | `mix` | Redis、Nginx、PostgreSQL | FFmpeg、RocksDB、zstd、ImageMagick | etcd、NATS |
 
 在 6 vCPU Guest 中，压力预算为 `vcpus - 1 = 5`，客户端线程数为 `ceil(5 / 2) = 3`。这里的“预留一个 latency CPU”只是并发需求预算，不设置 affinity，也不把任何 CPU 从内核或 scheduler 手中隔离。正式 Host 的物理核隔离由独立的 Host 准备脚本完成。
@@ -97,7 +100,7 @@ qemu-img info --output=json /tmp/aoa-real-workloads-template.qcow2
 qemu-img check /tmp/aoa-real-workloads-template.qcow2
 ```
 
-`backing-filename` 必须为空，三种 Native 烟测和至少一次 Agent 安全启停测试必须通过。替换使用同目录临时名称加原子 `mv`，替换完成后删除候选硬链接和旧构建目录；不要在运行中的 domain 上替换镜像。
+`backing-filename` 必须为空，四种 Native 烟测和至少一次 Agent 安全启停测试必须通过。替换使用同目录临时名称加原子 `mv`，替换完成后删除候选硬链接和旧构建目录；不要在运行中的 domain 上替换镜像。
 
 只更新候选镜像内的启动脚本和配置时，可以执行：
 
@@ -145,6 +148,7 @@ python3 test/scripts/check_env.py
 ```bash
 python3 test/scripts/benchmark.py latency --dry-run
 python3 test/scripts/benchmark.py throughput --dry-run
+python3 test/scripts/benchmark.py balanced --dry-run
 python3 test/scripts/benchmark.py mix --dry-run
 ```
 
@@ -153,10 +157,11 @@ python3 test/scripts/benchmark.py mix --dry-run
 ```bash
 python3 test/scripts/benchmark.py latency
 python3 test/scripts/benchmark.py throughput
+python3 test/scripts/benchmark.py balanced
 python3 test/scripts/benchmark.py mix
 ```
 
-省略参数或使用 `all` 会运行全部场景。正式模式每个场景运行 `2 variants x 3 repeats`；`all` 共 18 个独立 VM run。调度方案迭代可用一次 Native/Agent 配对：
+省略参数或使用 `all` 会运行全部场景。正式模式每个场景运行 `2 variants x 3 repeats`；`all` 共 24 个独立 VM run。调度方案迭代可用一次 Native/Agent 配对：
 
 ```bash
 python3 test/scripts/benchmark.py mix --single-round

@@ -12,6 +12,8 @@ readonly BIN_ROOT=/opt/aoa-workloads/bin
 readonly LLVM_CORPUS=/opt/openEuler/llvm-toolset-21/root/usr/lib64/libLLVM.so.21.1
 
 server_pids=()
+server_names=()
+server_roles=()
 job_pids=()
 job_names=()
 VCPUS=1
@@ -29,6 +31,7 @@ profile_from_dmi() {
     case "$serial" in
         aoa-profile-latency) printf 'latency' ;;
         aoa-profile-throughput) printf 'throughput' ;;
+        aoa-profile-balanced) printf 'balanced' ;;
         aoa-profile-mix) printf 'mix' ;;
         *) return 1 ;;
     esac
@@ -57,11 +60,13 @@ scaled_rate() {
 }
 
 start_server() {
-    local name="$1"
-    shift
+    local name="$1" role="$2"
+    shift 2
     log "starting server: $name"
     "$@" >"$RESULT_ROOT/${name}.stdout" 2>"$RESULT_ROOT/${name}.stderr" &
     server_pids+=("$!")
+    server_names+=("$name")
+    server_roles+=("$role")
 }
 
 wait_for() {
@@ -86,6 +91,14 @@ write_target() {
     printf '{"pid":%s,"start_ticks":%s,"name":"%s","role":"%s"}\n' \
         "$pid" "$start_ticks" "$name" "$role" \
         >>"$RESULT_ROOT/targets.jsonl"
+}
+
+write_server_targets() {
+    local index
+    for index in "${!server_pids[@]}"; do
+        write_target "${server_pids[$index]}" \
+            "${server_names[$index]}" "${server_roles[$index]}"
+    done
 }
 
 run_job() {
@@ -126,28 +139,41 @@ wait_jobs() {
     return "$failed"
 }
 
-redis_job() {
-    local name="$1" role="$2" phase="$3" duration="$4" rate="$5"
+memtier_job() {
+    local name="$1" role="$2" phase="$3" duration="$4" port="$5" protocol="$6"
+    shift 6
     run_job "$name" "$role" "$phase" "$BIN_ROOT/memtier_benchmark" \
-        --server=127.0.0.1 --port=16379 --protocol=redis \
+        --server=127.0.0.1 --port="$port" --protocol="$protocol" \
         --threads="$CLIENT_THREADS" --clients="$CLIENTS" --ratio=1:9 --data-size=256 \
         --key-minimum=1 --key-maximum=20000 --key-pattern=R:R \
-        --rate-limiting="$rate" --test-time="$duration" \
+        --test-time="$duration" \
+        --json-out-file="$RESULT_ROOT/apps/$name/result.json" "$@"
+}
+
+redis_job() {
+    local name="$1" role="$2" phase="$3" duration="$4" rate="$5"
+    memtier_job "$name" "$role" "$phase" "$duration" 16379 redis \
+        --rate-limiting="$rate" \
         --print-percentiles=50,90,99,99.9,99.99 \
-        --json-out-file="$RESULT_ROOT/apps/$name/result.json" \
         --hdr-file-prefix="$RESULT_ROOT/apps/$name/latency"
 }
 
 memcached_job() {
     local name="$1" phase="$2" duration="$3" rate="$4"
-    run_job "$name" latency "$phase" "$BIN_ROOT/memtier_benchmark" \
-        --server=127.0.0.1 --port=11212 --protocol=memcache_binary \
-        --threads="$CLIENT_THREADS" --clients="$CLIENTS" --ratio=1:9 --data-size=256 \
-        --key-minimum=1 --key-maximum=20000 --key-pattern=R:R \
-        --rate-limiting="$rate" --test-time="$duration" \
+    memtier_job "$name" latency "$phase" "$duration" 11212 memcache_binary \
+        --rate-limiting="$rate" \
         --print-percentiles=50,90,99,99.9,99.99 \
-        --json-out-file="$RESULT_ROOT/apps/$name/result.json" \
         --hdr-file-prefix="$RESULT_ROOT/apps/$name/latency"
+}
+
+redis_balanced_job() {
+    local name="$1" phase="$2" duration="$3"
+    memtier_job "$name" balanced "$phase" "$duration" 16379 redis
+}
+
+memcached_balanced_job() {
+    local name="$1" phase="$2" duration="$3"
+    memtier_job "$name" balanced "$phase" "$duration" 11212 memcache_binary
 }
 
 nginx_job() {
@@ -167,12 +193,20 @@ postgres_job() {
         --latency-limit=20 --log --log-prefix="$RESULT_ROOT/apps/$name/pgbench_log"
 }
 
+postgres_balanced_job() {
+    local name="$1" phase="$2" duration="$3"
+    local clients=$((CLIENTS * 2))
+    run_job "$name" balanced "$phase" /usr/bin/pgbench \
+        -h 127.0.0.1 -p 15432 -U postgres -d aoa_bench \
+        -c"$clients" -j"$CLIENT_THREADS" -T"$duration"
+}
+
 nats_job() {
     local name="$1" phase="$2" duration="$3"
     run_job "$name" balanced "$phase" bash -c '
 deadline=$((SECONDS + $1)); iterations=0; batch_size=100000
 while [ "$SECONDS" -lt "$deadline" ]; do
-    "$2" bench pub aoa.mix --server=nats://127.0.0.1:14222 \
+    "$2" bench pub aoa.balanced --server=nats://127.0.0.1:14222 \
         --msgs="$batch_size" --size=128 >/dev/null || exit $?
     iterations=$((iterations + 1))
 done
@@ -262,6 +296,9 @@ launch_jobs() {
     rm -rf "$RESULT_ROOT/apps"
     install -d -m 0755 "$RESULT_ROOT/apps"
     : >"$RESULT_ROOT/targets.jsonl"
+    if [ "$phase" = measurement ]; then
+        write_server_targets
+    fi
     if [ "$profile" = mix ]; then
         clear_etcd_perf_state
     fi
@@ -280,6 +317,12 @@ launch_jobs() {
             [ "$PRESSURE_CPUS" -ge 3 ] && zstd_job zstd throughput "$phase" "$duration" "$CLIENT_THREADS"
             [ "$PRESSURE_CPUS" -ge 4 ] && openssl_job openssl "$phase" "$duration" "$CLIENT_THREADS"
             [ "$PRESSURE_CPUS" -ge 5 ] && imagemagick_job imagemagick "$phase" "$duration"
+            ;;
+        balanced)
+            redis_balanced_job redis "$phase" "$duration"
+            memcached_balanced_job memcached "$phase" "$duration"
+            postgres_balanced_job postgresql "$phase" "$duration"
+            nats_job nats "$phase" "$duration"
             ;;
         mix)
             redis_job redis latency "$phase" "$duration" "$(scaled_rate 2000)"
@@ -301,12 +344,14 @@ launch_jobs() {
 
 start_profile_servers() {
     local profile="$1"
-    start_server redis runuser -u aoa-workload -- /usr/bin/redis-server /etc/aoa-workloads/redis.conf
-    if [ "$profile" = latency ]; then
-        start_server memcached runuser -u aoa-workload -- /usr/bin/memcached -p 11212 -m 128 -c 1024 -U 0
+    start_server redis balanced runuser -u aoa-workload -- \
+        /usr/bin/redis-server /etc/aoa-workloads/redis.conf
+    if [ "$profile" = latency ] || [ "$profile" = balanced ]; then
+        start_server memcached balanced runuser -u aoa-workload -- \
+            /usr/bin/memcached -p 11212 -m 128 -c 1024 -U 0
     fi
     if [ "$profile" = mix ]; then
-        start_server etcd runuser -u aoa-workload -- /usr/bin/etcd \
+        start_server etcd balanced runuser -u aoa-workload -- /usr/bin/etcd \
             --name=aoa --data-dir="$RUNTIME_ROOT/etcd" \
             --listen-client-urls=http://127.0.0.1:12379 \
             --advertise-client-urls=http://127.0.0.1:12379 \
@@ -314,31 +359,35 @@ start_profile_servers() {
             --initial-advertise-peer-urls=http://127.0.0.1:12380 \
             --initial-cluster=aoa=http://127.0.0.1:12380
     fi
-    if [ "$profile" != throughput ]; then
-        start_server nginx runuser -u aoa-workload -- /usr/sbin/nginx -e stderr \
+    if [ "$profile" = latency ] || [ "$profile" = mix ]; then
+        start_server nginx balanced runuser -u aoa-workload -- /usr/sbin/nginx -e stderr \
             -c /etc/aoa-workloads/nginx.conf -g 'daemon off;'
-        start_server postgresql runuser -u postgres -- /usr/bin/postgres \
+    fi
+    if [ "$profile" != throughput ]; then
+        start_server postgresql balanced runuser -u postgres -- /usr/bin/postgres \
             -D /var/lib/aoa-workloads/postgres -k "$RUN_ROOT/pg" -p 15432 \
             -c listen_addresses=127.0.0.1 -c shared_buffers=128MB \
             -c fsync=off -c synchronous_commit=off -c full_page_writes=off
     fi
-    if [ "$profile" = mix ]; then
-        start_server nats runuser -u aoa-workload -- "$BIN_ROOT/nats-server" \
+    if [ "$profile" = mix ] || [ "$profile" = balanced ]; then
+        start_server nats balanced runuser -u aoa-workload -- "$BIN_ROOT/nats-server" \
             --addr 127.0.0.1 --port 14222
     fi
 
     wait_for redis /usr/bin/redis-cli -h 127.0.0.1 -p 16379 ping
-    if [ "$profile" = latency ]; then
+    if [ "$profile" = latency ] || [ "$profile" = balanced ]; then
         wait_for memcached bash -c 'exec 3<>/dev/tcp/127.0.0.1/11212'
     fi
     if [ "$profile" = mix ]; then
         wait_for etcd env ETCDCTL_API=3 /usr/bin/etcdctl --endpoints=http://127.0.0.1:12379 endpoint health
     fi
-    if [ "$profile" != throughput ]; then
+    if [ "$profile" = latency ] || [ "$profile" = mix ]; then
         wait_for nginx /usr/bin/curl --fail --silent http://127.0.0.1:18080/index.html
+    fi
+    if [ "$profile" != throughput ]; then
         wait_for postgresql /usr/bin/pg_isready -h 127.0.0.1 -p 15432
     fi
-    if [ "$profile" = mix ]; then
+    if [ "$profile" = mix ] || [ "$profile" = balanced ]; then
         wait_for nats bash -c 'exec 3<>/dev/tcp/127.0.0.1/14222'
     fi
 }
@@ -349,13 +398,13 @@ prepare_data() {
         --protocol=redis --ratio=1:0 --requests=20000 --clients="$CLIENTS" \
         --data-size=256 --key-minimum=1 --key-maximum=20000 \
         --key-pattern=S:S >/dev/null
-    if [ "$profile" = latency ]; then
+    if [ "$profile" = latency ] || [ "$profile" = balanced ]; then
         "$BIN_ROOT/memtier_benchmark" --server=127.0.0.1 --port=11212 \
             --protocol=memcache_binary --ratio=1:0 --requests=20000 --clients="$CLIENTS" \
             --data-size=256 --key-minimum=1 --key-maximum=20000 \
             --key-pattern=S:S >/dev/null
     fi
-    if [ "$profile" != latency ] && [ "$PRESSURE_CPUS" -ge 2 ]; then
+    if { [ "$profile" = throughput ] || [ "$profile" = mix ]; } && [ "$PRESSURE_CPUS" -ge 2 ]; then
         "$BIN_ROOT/db_bench" --db="$RUNTIME_ROOT/rocksdb" --benchmarks=fillseq \
             --num=200000 --value_size=256 --threads=1 --statistics=0 >/dev/null
     fi
@@ -388,8 +437,8 @@ main() {
         fi
     fi
     case "$profile" in
-        latency|throughput|mix) ;;
-        *) printf 'usage: %s {latency|throughput|mix|--from-dmi}\n' "$0" >&2; return 2 ;;
+        latency|throughput|balanced|mix) ;;
+        *) printf 'usage: %s {latency|throughput|balanced|mix|--from-dmi}\n' "$0" >&2; return 2 ;;
     esac
 
     exec 9>/run/aoa-real-workload.lock

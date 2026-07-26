@@ -45,6 +45,11 @@ def analyze_run(run_dir: str | Path) -> dict[str, Any]:
         if scenario in {"throughput", "mix"}
         else None
     )
+    balanced = (
+        _balanced_metrics(applications, reasons)
+        if scenario in {"balanced", "mix"}
+        else None
+    )
     classification = _classification_metrics(
         bench_dir, start_ns, end_ns, enabled=variant == "agent"
     )
@@ -85,6 +90,7 @@ def analyze_run(run_dir: str | Path) -> dict[str, Any]:
         "applications": applications,
         "latency": latency,
         "throughput": throughput,
+        "balanced": balanced,
         "perf": perf,
         "task_scheduling": _schedstat_metrics(bench_dir, start_ns, end_ns),
         "overhead": _overhead_metrics(bench_dir, start_ns, end_ns),
@@ -189,15 +195,27 @@ def _latency_metrics(
 def _throughput_metrics(
     applications: dict[str, dict[str, Any]], reasons: list[str]
 ) -> dict[str, Any]:
+    return _rate_metrics(applications, reasons, role="throughput")
+
+
+def _balanced_metrics(
+    applications: dict[str, dict[str, Any]], reasons: list[str]
+) -> dict[str, Any]:
+    return _rate_metrics(applications, reasons, role="balanced")
+
+
+def _rate_metrics(
+    applications: dict[str, dict[str, Any]], reasons: list[str], *, role: str
+) -> dict[str, Any]:
     values = {
         name: float(metric["throughput_per_second"])
         for name, metric in applications.items()
-        if metric.get("role") == "throughput"
+        if metric.get("role") == role
         and isinstance(metric.get("throughput_per_second"), (int, float))
         and float(metric["throughput_per_second"]) > 0
     }
     if not values:
-        reasons.append("no throughput application produced a rate metric")
+        reasons.append(f"no {role} application produced a rate metric")
     rates = list(values.values())
     aggregate = _geometric_mean(rates)
     return {
@@ -825,6 +843,15 @@ def _comparisons(
                 True,
             )
         ],
+        "balanced": [
+            (
+                "balanced_geomean_per_second",
+                lambda row: row["balanced"]["operations_per_second"],
+                True,
+                "units/s",
+                True,
+            )
+        ],
         "mix": [
             (
                 "p99_latency_geomean_us",
@@ -836,6 +863,13 @@ def _comparisons(
             (
                 "throughput_geomean_per_second",
                 lambda row: row["throughput"]["operations_per_second"],
+                True,
+                "units/s",
+                True,
+            ),
+            (
+                "balanced_geomean_per_second",
+                lambda row: row["balanced"]["operations_per_second"],
                 True,
                 "units/s",
                 True,

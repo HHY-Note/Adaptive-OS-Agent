@@ -119,6 +119,7 @@ libvirt 把 scenario 写入 SMBIOS system serial：
 ```text
 latency    -> aoa-profile-latency
 throughput -> aoa-profile-throughput
+balanced   -> aoa-profile-balanced
 mix        -> aoa-profile-mix
 ```
 
@@ -131,6 +132,8 @@ mix        -> aoa-profile-mix
 未知 serial 时 dispatcher 保持空闲并正常退出。这样普通启动该模板不会误触发压力测试。
 
 service 为 `Type=oneshot`、`TimeoutStartSec=infinity`、`KillMode=control-group`。它先启动所需 server、准备数据、发布 `SERVERS_READY`，然后等待测试脚本提供 ready file 和时间窗。开机阶段不会把 client 的启动时间混入正式测量。
+
+server 进程本身没有显式 SLO 或本机批处理目标，因此分类真值统一为 `balanced`；场景中的 latency/throughput 角色只属于携带该目标的 client/job。这样同一服务二进制不会因测试场景名称获得生产系统不可见的标签。
 
 ## 7. 应用集合
 
@@ -155,11 +158,15 @@ service 为 `Type=oneshot`、`TimeoutStartSec=infinity`、`KillMode=control-grou
 | openssl | AES-256-GCM EVP speed（16 KiB block） | throughput | bytes/s |
 | imagemagick | fractal/blur/resize pipeline | throughput | iterations/s |
 
-### 7.3 mix
+### 7.3 balanced
+
+Redis/Memcached memtier 与 PostgreSQL pgbench 不设置请求率、延迟百分位、deadline 或 SLO；NATS 连续发布固定消息批次。四项工作都只有普通远程服务目标，不携带 latency 或本机批处理目标，并分别输出 ops/s、tps 和 messages/s。
+
+### 7.4 mix
 
 `redis`、`nginx`、`postgresql` 为 latency；`ffmpeg`、`rocksdb`、`zstd`、`imagemagick` 为 throughput；`etcd check perf` 和 NATS publish 为 balanced。
 
-NATS 连续执行固定 100,000-message 批次，直到阶段窗口结束，再输出总消息 work units；因此既保持持续压力，也能计算 messages/s。etcd 在每个阶段开始前只删除它自己的 `/etcdctl-check-perf/` 前缀，保证预热与测量互不污染。
+NATS 连续执行固定 100,000-message 批次，直到阶段窗口结束，再输出总消息 work units。etcd 在每个阶段开始前只删除自己的 `/etcdctl-check-perf/` 前缀；其固定时长检查用于施压，NATS rate 作为 mix 中的 Balanced 性能门禁。
 
 ## 8. 压力缩放
 
@@ -272,9 +279,10 @@ Guest validation 使用 schema 2。最低应用角色数量：
 | --- | ---: | ---: | ---: |
 | latency | 4 | 1 | 0 |
 | throughput | 0 | 5 | 0 |
+| balanced | 0 | 0 | 4 |
 | mix | 3 | 4 | 2 |
 
-latency/mix 至少两个 latency 应用必须有 P99；throughput/mix 至少两个 throughput 应用必须有正确定义的 rate。targets 应用集合必须与 metrics 应用集合完全相等，collector 必须覆盖全部应用。
+latency/mix 至少两个 latency 应用必须有 P99；throughput/mix 至少两个 throughput 应用必须有正确定义的 rate；balanced 的四个应用及 mix 中的 NATS 必须有 rate。每个 metrics 应用必须至少有一个 target 根；清单可额外包含为这些应用提供服务的组件，collector 必须覆盖完整清单。
 
 Agent run 还必须满足：
 
@@ -302,7 +310,7 @@ throughput 汇总：
 throughput_geomean_per_second = geometric_mean(each positive throughput rate)
 ```
 
-不同应用单位不能相加，几何平均用于表达相对整体变化；报告同时保留每个应用原始指标、median 和 worst。`mix` 必须同时报告两项，不允许用吞吐收益掩盖 P99 回退。
+Balanced 汇总同样对各普通应用的正 rate 计算 `balanced_geomean_per_second`。不同应用单位不能相加，几何平均用于表达相对整体变化；报告同时保留每个应用原始指标、median 和 worst。`mix` 必须同时报告 P99、throughput 和 Balanced 三项，不允许用某一类收益掩盖另一类回退。
 
 campaign 只配对相同 scenario、相同 repeat 的 Native/Agent 有效 run。延迟改善方向为下降，吞吐改善方向为上升。正式三轮报告中位数、配对改善和 bootstrap 95% 区间；`single-round` 只作为实现迭代证据。
 

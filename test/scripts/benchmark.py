@@ -143,7 +143,7 @@ def main(argv: list[str] | None = None) -> int:
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="运行 latency、throughput、mix 的 Native/Agent 配对性能实验"
+        description="运行 latency、throughput、balanced、mix 的 Native/Agent 配对性能实验"
     )
     parser.add_argument(
         "scenario",
@@ -158,7 +158,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--single-round",
         action="store_true",
-        help="run one six-VM latency/throughput/mix Native/Agent iteration round",
+        help="run one latency/throughput/balanced/mix Native/Agent iteration round",
     )
     return parser
 

@@ -256,6 +256,7 @@ def _classification_snapshot(
         entry = process_entries.get(pid)
         if entry is not None:
             try:
+                row["comm"] = entry.get("comm")
                 classification = entry.get("classification")
                 if isinstance(classification, dict):
                     row.update(classification)

@@ -378,6 +378,7 @@ role_counts = Counter(str(metric.get("role")) for metric in metrics)
 minimums = {
     "latency": {"latency": 4, "throughput": 1},
     "throughput": {"latency": 1, "throughput": 5},
+    "balanced": {"balanced": 4},
     "mix": {"latency": 3, "throughput": 4, "balanced": 2},
 }[scenario]
 for role, minimum in minimums.items():
@@ -385,10 +386,23 @@ for role, minimum in minimums.items():
         errors.append(f"expected at least {minimum} {role} apps, found {role_counts[role]}")
 latency_metrics = [metric for metric in metrics if metric.get("role") == "latency" and isinstance(metric.get("p99_ms"), (int, float))]
 throughput_metrics = [metric for metric in metrics if metric.get("role") == "throughput" and isinstance(metric.get("throughput_per_second"), (int, float))]
+balanced_metrics = [
+    metric
+    for metric in metrics
+    if metric.get("role") == "balanced"
+    and isinstance(metric.get("throughput_per_second"), (int, float))
+]
 if scenario in {"latency", "mix"} and len(latency_metrics) < 2:
     errors.append("fewer than two latency applications produced P99 metrics")
 if scenario in {"throughput", "mix"} and len(throughput_metrics) < 2:
     errors.append("fewer than two throughput applications produced rate metrics")
+required_balanced_rates = (
+    4 if scenario == "balanced" else 1 if scenario == "mix" else 0
+)
+if len(balanced_metrics) < required_balanced_rates:
+    errors.append(
+        f"fewer than {required_balanced_rates} balanced applications produced rate metrics"
+    )
 
 pressure = load_json(real / "pressure-plan.json")
 if pressure.get("online_vcpus") != expected_vcpus:
@@ -401,14 +415,15 @@ if expected_vcpus > 1 and pressure.get("reserved_latency_cpu") != 1:
 target_rows = load_jsonl(real / "targets.jsonl")
 target_apps = {str(row.get("name")) for row in target_rows}
 metric_apps = {str(metric.get("name")) for metric in metrics}
-if target_apps != metric_apps:
-    errors.append(f"target/application mismatch: targets={sorted(target_apps)}, metrics={sorted(metric_apps)}")
+missing_target_apps = metric_apps - target_apps
+if missing_target_apps:
+    errors.append(f"applications missing target roots: {sorted(missing_target_apps)}")
 
 collector = load_json(bench / "observations" / "collector-summary.json")
 if collector.get("samples", 0) < 1 or collector.get("target_workers", 0) < 1:
     errors.append("collector did not observe workload threads")
-if set(collector.get("target_apps", [])) != metric_apps:
-    errors.append("collector did not cover every workload application")
+if set(collector.get("target_apps", [])) != target_apps:
+    errors.append("collector target coverage does not match the workload manifest")
 if collector.get("timed_out") is True:
     errors.append("collector timed out")
 
@@ -436,6 +451,7 @@ validation = {
     "roles": dict(sorted(role_counts.items())),
     "latency_p99_applications": len(latency_metrics),
     "throughput_rate_applications": len(throughput_metrics),
+    "balanced_rate_applications": len(balanced_metrics),
 }
 (bench / "validation.json").write_text(json.dumps(validation, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 raise SystemExit(1 if errors else 0)

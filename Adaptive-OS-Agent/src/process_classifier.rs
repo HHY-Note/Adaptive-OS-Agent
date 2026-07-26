@@ -114,10 +114,11 @@ pub(crate) fn classify_process_metadata(
     let has_benchmark_operation = command_has_option(
         &process.command,
         &["--bench", "--benchmark", "--benchmarks"],
-    ) || contains_any(&tokens, &["bench", "benchmark"]);
+    ) || contains_any(&tokens, &["bench", "benchmark", "speed"]);
     let has_work_budget = command_has_option(
         &process.command,
         &[
+            "-seconds",
             "--count",
             "--duration",
             "--iterations",
@@ -127,6 +128,19 @@ pub(crate) fn classify_process_metadata(
             "--threads",
         ],
     );
+    let has_bounded_repeat_objective = process
+        .command
+        .iter()
+        .any(|argument| matches!(argument.as_str(), "-c" | "--command"))
+        && contains_any(&tokens, &["while", "for"])
+        && contains_any(&tokens, &["iterations", "work-units", "work_units"])
+        && contains_any(&tokens, &["deadline", "duration", "seconds"]);
+    if !has_remote_endpoint && has_bounded_repeat_objective {
+        return Some(LocalProcessClassification {
+            class: TaskClass::Throughput,
+            confidence_per_mille: 900,
+        });
+    }
     if !has_remote_endpoint && has_benchmark_operation && has_work_budget {
         return Some(LocalProcessClassification {
             class: TaskClass::Throughput,
@@ -325,6 +339,58 @@ mod tests {
             "--benchmarks=readwrite".into(),
             "--duration=60".into(),
             "--threads=4".into(),
+        ];
+
+        assert_eq!(
+            classify_process_metadata(&metadata),
+            Some(LocalProcessClassification {
+                class: TaskClass::Throughput,
+                confidence_per_mille: 900,
+            })
+        );
+    }
+
+    #[test]
+    fn bounded_local_repeat_loop_is_a_throughput_objective() {
+        let mut metadata = process(108, 1_008);
+        metadata.command = vec![
+            "/usr/bin/time".into(),
+            "sh".into(),
+            "-c".into(),
+            "deadline=$((SECONDS + $1)); iterations=0; while [ $SECONDS -lt $deadline ]; do local-worker; iterations=$((iterations + 1)); done".into(),
+            "local-batch".into(),
+            "60".into(),
+        ];
+
+        assert_eq!(
+            classify_process_metadata(&metadata),
+            Some(LocalProcessClassification {
+                class: TaskClass::Throughput,
+                confidence_per_mille: 900,
+            })
+        );
+    }
+
+    #[test]
+    fn remote_repeat_loop_does_not_become_local_throughput() {
+        let mut metadata = process(109, 1_009);
+        metadata.command = vec![
+            "sh".into(),
+            "-c".into(),
+            "deadline=$((SECONDS + 60)); iterations=0; while [ $SECONDS -lt $deadline ]; do request-tool --server=http://127.0.0.1; iterations=$((iterations + 1)); done".into(),
+        ];
+
+        assert_eq!(classify_process_metadata(&metadata), None);
+    }
+
+    #[test]
+    fn time_bounded_speed_mode_is_a_throughput_objective() {
+        let mut metadata = process(110, 1_010);
+        metadata.command = vec![
+            "/usr/bin/compute-tool".into(),
+            "speed".into(),
+            "-seconds".into(),
+            "60".into(),
         ];
 
         assert_eq!(

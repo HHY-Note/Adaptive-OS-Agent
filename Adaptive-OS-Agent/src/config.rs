@@ -197,7 +197,7 @@ pub struct ClassificationConfig {
     pub process_long_lived_secs: u64,
     /// Minimum task age before thread semantic batching.
     pub task_long_lived_secs: u64,
-    /// Confidence at which behavior needs more contrary windows.
+    /// Confidence that can establish a process objective and resists correction.
     pub high_confidence_threshold: f32,
     /// Contrary good windows required after high-confidence semantics.
     pub high_confidence_correction_windows: u32,
@@ -212,13 +212,13 @@ pub struct ClassificationConfig {
 }
 
 impl Default for ClassificationConfig {
-    /// Uses 5 s process, 2 s task, and 5/3 contrary-window rules.
+    /// Uses a short-process filter plus conservative semantic corroboration.
     fn default() -> Self {
         Self {
-            process_semantic_min_age_secs: 0,
+            process_semantic_min_age_secs: 1,
             process_long_lived_secs: 5,
             task_long_lived_secs: 2,
-            high_confidence_threshold: 0.80,
+            high_confidence_threshold: 0.90,
             high_confidence_correction_windows: 5,
             low_confidence_correction_windows: 3,
             behavior_lock_timeout_secs: 30,
@@ -283,7 +283,8 @@ mod tests {
         assert_eq!(config.deepseek.worker_count, 3);
         assert_eq!(config.deepseek.batch_size, 24);
         assert_eq!(config.classification.behavior_lock_timeout_secs, 20);
-        assert_eq!(config.classification.process_semantic_min_age_secs, 0);
+        assert_eq!(config.classification.process_semantic_min_age_secs, 1);
+        assert_eq!(config.classification.high_confidence_threshold, 0.90);
         assert_eq!(config.classification.process_long_lived_secs, 5);
         assert!(config.validate().is_ok());
     }

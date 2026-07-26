@@ -22,7 +22,7 @@ scheduler/
 test/
   config.yaml                   3 物理核/6 vCPU 正式性能矩阵
   image/real_workloads/          镜像安装器、启动服务和指标汇总器
-  scripts/benchmark.py          latency/throughput/mix 实验入口
+  scripts/benchmark.py          latency/throughput/balanced/mix 实验入口
   scripts/build_workload_image.py  独立候选镜像构建器
   guest_tools/                  Guest 只读采集器
   test_core/                    配置、VM 编排、有效性检查和统计分析
@@ -74,7 +74,7 @@ sudo Adaptive-OS-Agent/target/release/adaptive-os-agent \
   --scheduler-bin scheduler/rust/target/release/scx_adaptive
 ```
 
-新任务先使用中性的 `Balanced`。当前启动命令中的显式 SLO/批处理目标、LLM 语义和 scheduler 行为窗口并行提供证据；`Balanced` 不会压制一致的 `Latency`/`Throughput` 证据，专用类型冲突则保守回到 `Balanced`。Agent 不读写持久化应用分类档案；进程内精确元数据缓存只在本次 Agent 生命期内有效。LLM 超时、失败或返回 `Unknown` 不会阻塞调度。`SIGINT` 或 `SIGTERM` 会触发 Agent 停止 scheduler，scheduler 随后 detach sched_ext。确定性离线诊断可以添加 `--offline`。
+新任务先使用中性的 `Balanced`。当前启动命令中的显式目标和进程完整元数据上的高置信 LLM 目标可建立进程默认，并按精确父子生命期传给短子任务；低置信进程 proposal 与所有线程 proposal 都等待 scheduler 连续行为确认，专用类型冲突保守回到 `Balanced`。Agent 不读写持久化应用分类档案；进程内精确元数据缓存只在本次 Agent 生命期内有效，且仍遵守相同置信规则。LLM 超时、失败或返回 `Unknown` 不会阻塞调度。`SIGINT` 或 `SIGTERM` 会触发 Agent 停止 scheduler，scheduler 随后 detach sched_ext。确定性离线诊断可以添加 `--offline`。
 
 ## 真实负载镜像
 
@@ -86,7 +86,8 @@ libvirt 通过 SMBIOS serial 选择场景，服务开机后启动对应 server�
 | --- | --- | --- |
 | `latency` | Redis、Memcached、Nginx、PostgreSQL，加 zstd 后台压力 | 四个应用 P99 的几何平均，越低越好 |
 | `throughput` | Redis、FFmpeg、RocksDB、zstd、OpenSSL、ImageMagick | 有效应用速率的几何平均，越高越好 |
-| `mix` | Redis、Nginx、PostgreSQL、FFmpeg、RocksDB、zstd、ImageMagick、etcd、NATS | P99 与吞吐几何平均必须同时改善 |
+| `balanced` | 无 SLO 的 Redis、Memcached、PostgreSQL、NATS 普通远程工作 | 四个应用速率的几何平均，越高越好 |
+| `mix` | Redis、Nginx、PostgreSQL、FFmpeg、RocksDB、zstd、ImageMagick、etcd、NATS | P99、吞吐与 Balanced 速率必须同时改善 |
 
 镜像构建器始终先生成独立候选文件，不会在安装过程中修改正式模板：
 
@@ -107,14 +108,16 @@ qemu-img check /tmp/aoa-real-workloads-template.qcow2
 python3 test/scripts/check_env.py
 python3 test/scripts/benchmark.py latency --dry-run
 python3 test/scripts/benchmark.py throughput --dry-run
+python3 test/scripts/benchmark.py balanced --dry-run
 python3 test/scripts/benchmark.py mix --dry-run
 ```
 
-只需用第一个参数选择一种场景；省略或传 `all` 会运行三种场景。正式执行每种场景包含 Native/Agent 两个变体和 3 次重复：
+只需用第一个参数选择一种场景；省略或传 `all` 会运行四种场景。正式执行每种场景包含 Native/Agent 两个变体和 3 次重复：
 
 ```bash
 python3 test/scripts/benchmark.py latency
 python3 test/scripts/benchmark.py throughput
+python3 test/scripts/benchmark.py balanced
 python3 test/scripts/benchmark.py mix
 python3 test/scripts/benchmark.py all
 ```

@@ -22,7 +22,12 @@ from test_core.benchmark.analysis import (
     _schedstat_metrics,
     analyze_run,
 )
-from test_core.benchmark.config import build_spec, campaign_schedule, load_performance
+from test_core.benchmark.config import (
+    SCENARIOS,
+    build_spec,
+    campaign_schedule,
+    load_performance,
+)
 from test_core.benchmark.guest import write_guest_script
 from test_core.config.parser import load_config
 from test_core.vm.domain import build_domain_xml, domain_name
@@ -61,16 +66,16 @@ class BenchmarkConfigTests(unittest.TestCase):
 
     def test_schedule_keeps_each_pair_adjacent(self) -> None:
         schedule = campaign_schedule(
-            ["latency", "throughput", "mix"], ["native", "agent"], 3, 17
+            list(SCENARIOS), ["native", "agent"], 3, 17
         )
-        self.assertEqual(len(schedule), 18)
-        self.assertEqual(len(set(schedule)), 18)
+        self.assertEqual(len(schedule), 24)
+        self.assertEqual(len(set(schedule)), 24)
         for index in range(0, len(schedule), 2):
             first, second = schedule[index : index + 2]
             self.assertEqual(first[:2], second[:2])
             self.assertEqual({first[2], second[2]}, {"native", "agent"})
 
-    def test_single_round_all_scenarios_has_six_runs(self) -> None:
+    def test_single_round_all_scenarios_has_eight_runs(self) -> None:
         completed = subprocess.run(
             [sys.executable, TEST_ROOT / "scripts" / "benchmark.py", "--single-round", "--dry-run"],
             check=True,
@@ -78,8 +83,8 @@ class BenchmarkConfigTests(unittest.TestCase):
             text=True,
         )
         self.assertIn("profile: single-round", completed.stdout)
-        self.assertIn("runs: 6", completed.stdout)
-        self.assertEqual(completed.stdout.count(" repeat=1 "), 6)
+        self.assertIn("runs: 8", completed.stdout)
+        self.assertEqual(completed.stdout.count(" repeat=1 "), 8)
 
     def test_single_scenario_argument_has_one_native_agent_pair(self) -> None:
         completed = subprocess.run(
@@ -97,11 +102,12 @@ class BenchmarkConfigTests(unittest.TestCase):
         self.assertIn("runs: 2", completed.stdout)
         self.assertEqual(completed.stdout.count("scenario=throughput"), 2)
         self.assertNotIn("scenario=latency", completed.stdout)
+        self.assertNotIn("scenario=balanced", completed.stdout)
         self.assertNotIn("scenario=mix", completed.stdout)
 
     def test_guest_scripts_use_image_workload_and_valid_shell(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            for scenario in ("latency", "throughput", "mix"):
+            for scenario in SCENARIOS:
                 for variant in ("native", "agent"):
                     spec = build_spec(
                         self.config,
@@ -117,6 +123,10 @@ class BenchmarkConfigTests(unittest.TestCase):
                     self.assertIn("SERVERS_READY", script)
                     self.assertIn("--targets", script)
                     self.assertIn("measurement duration is", script)
+                    self.assertIn("missing_target_apps = metric_apps - target_apps", script)
+                    self.assertIn(
+                        'set(collector.get("target_apps", [])) != target_apps', script
+                    )
                     self.assertIn("aoa-real-workload-autostart.service", script)
                     self.assertNotIn("taskbench", script)
                     self.assertNotIn("workload-build", script)
@@ -181,6 +191,20 @@ class BenchmarkConfigTests(unittest.TestCase):
             "aoa-profile-latency",
         )
         self.assertEqual(root.find("./devices/disk/driver").attrib["discard"], "unmap")
+
+    def test_domain_xml_selects_balanced_workload_profile(self) -> None:
+        spec = build_spec(
+            self.config,
+            self.performance,
+            scenario="balanced",
+            variant="native",
+            repeat=1,
+        )
+        root = ET.fromstring(build_domain_xml(spec, "test-balanced", "/tmp/test.qcow2"))
+        self.assertEqual(
+            root.find("./sysinfo/system/entry[@name='serial']").text,
+            "aoa-profile-balanced",
+        )
 
     def test_host_control_scripts_have_valid_shell_syntax(self) -> None:
         for name in ("cpu_isolation.sh", "set_cpu_frequency.sh", "restore_cpu_frequency.sh"):
@@ -420,6 +444,15 @@ class CollectorTests(unittest.TestCase):
 
 
 class WorkloadSummaryTests(unittest.TestCase):
+    def test_server_targets_are_objective_neutral(self) -> None:
+        dispatcher = (
+            TEST_ROOT / "image" / "real_workloads" / "aoa-real-workload"
+        ).read_text(encoding="utf-8")
+        self.assertNotRegex(
+            dispatcher,
+            r"start_server\s+\S+\s+(?:latency|throughput)\b",
+        )
+
     def test_throughput_profile_keeps_redis_as_latency_sentinel(self) -> None:
         dispatcher = (
             TEST_ROOT / "image" / "real_workloads" / "aoa-real-workload"
@@ -515,10 +548,13 @@ class AnalysisTests(unittest.TestCase):
             _write_metric(run_dir, "nginx", "latency", p99_ms=4.0, throughput=4000.0)
             _write_metric(run_dir, "ffmpeg", "throughput", throughput=100.0)
             _write_metric(run_dir, "rocksdb", "throughput", throughput=400.0)
+            _write_metric(run_dir, "etcd", "balanced", throughput=25.0)
+            _write_metric(run_dir, "nats", "balanced", throughput=100.0)
             analyzed = analyze_run(run_dir)
             self.assertTrue(analyzed["valid"])
             self.assertAlmostEqual(analyzed["latency"]["p99_us"]["geometric_mean"], 2000.0)
             self.assertAlmostEqual(analyzed["throughput"]["operations_per_second"], 200.0)
+            self.assertAlmostEqual(analyzed["balanced"]["operations_per_second"], 50.0)
 
     def test_comparisons_pair_by_repeat(self) -> None:
         rows = []
@@ -552,6 +588,20 @@ class AnalysisTests(unittest.TestCase):
         ]
         comparison = _comparisons(rows, bootstrap_samples=100, seed=1)[0]
         self.assertEqual(comparison["metric"], "p99_latency_geomean_us")
+        self.assertAlmostEqual(comparison["paired_improvement"]["median"], 10.0)
+
+    def test_balanced_improvement_uses_higher_is_better(self) -> None:
+        rows = [
+            {
+                "scenario": "balanced",
+                "variant": variant,
+                "repeat": 1,
+                "balanced": {"operations_per_second": value},
+            }
+            for variant, value in (("native", 100.0), ("agent", 110.0))
+        ]
+        comparison = _comparisons(rows, bootstrap_samples=100, seed=1)[0]
+        self.assertEqual(comparison["metric"], "balanced_geomean_per_second")
         self.assertAlmostEqual(comparison["paired_improvement"]["median"], 10.0)
 
 

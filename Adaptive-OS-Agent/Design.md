@@ -160,10 +160,10 @@ API key 读取顺序：先读 `api_key_env` 指定的环境变量；非空即返
 
 | `ClassificationConfig` 字段 | 类型 | 默认值 | 校验 |
 | --- | --- | --- | --- |
-| `process_semantic_min_age_secs` | u64 | 0 | - |
+| `process_semantic_min_age_secs` | u64 | 1 | - |
 | `process_long_lived_secs` | u64 | 5 | `> 0` |
 | `task_long_lived_secs` | u64 | 2 | `> 0` |
-| `high_confidence_threshold` | f32 | 0.80 | `0.0..=1.0` |
+| `high_confidence_threshold` | f32 | 0.90 | `0.0..=1.0` |
 | `high_confidence_correction_windows` | u32 | 5 | `>= 2` |
 | `low_confidence_correction_windows` | u32 | 3 | `>= 2` |
 | `behavior_lock_timeout_secs` | u64 | 30 | `>= 5` |
@@ -221,9 +221,9 @@ API key 读取顺序：先读 `api_key_env` 指定的环境变量；非空即返
 ```text
 class 含义                         stage 含义
 +-------------+                      +-----------+
-| latency     | 交互/短响应       | inherited | 跟随进程默认
-| balanced    | 未知/混合/默认   | semantic  | 线程 LLM 结果，可修正一次
-| throughput  | 持续 CPU/总吞吐      | locked    | 行为已定案，不再变更
+| latency     | 明确低延迟目标       | inherited | 跟随进程默认
+| balanced    | 未知/混合/默认       | semantic  | 协议兼容的语义阶段
+| throughput  | 持续 CPU/总吞吐      | locked    | 行为已确认，不再变更
 +-------------+                      +-----------+
 ```
 
@@ -354,7 +354,7 @@ Supervisor 子进程命令严格为：
 
 - `/proc` reconciliation 周期为 `reconcile_interval_secs`，默认 10 s。
 - 进程/线程批次规划和 snapshot file 周期均为 `behavior_window_secs`，默认 1 s。
-- 语义计时器启动时立即到期；首批不额外等待预热。
+- 语义计时器启动时立即到期；进程仍须达到 `process_semantic_min_age_secs`（默认 1 s），用于过滤短生命期任务。
 - scheduler 新 epoch 必须先收到 replay complete，才可发 Registry snapshot。
 - snapshot 失败后下次尝试至少间隔 500 ms。
 
@@ -595,9 +595,9 @@ remember_metadata
   -> metadata_by_instance[instance] = metadata
   -> process_semantics.entry(instance) = Pending
 
-take_process_batches(batch_size, max_batches)
-  -> select all Pending instances
-  -> sort ProcessInstanceKey ascending
+take_process_batches_at(now, min_age, batch_size, max_batches)
+  -> select scheduler-observed Pending instances with age >= min_age
+  -> newest process lifetime first
   -> chunks(max(batch_size,1)), take max(max_batches,1)
   -> allocate one request_id per chunk
   -> mark every included instance Requested + request_id
@@ -605,15 +605,14 @@ take_process_batches(batch_size, max_batches)
 
 - `defer_process_batch`：仅当 instance 仍指向 plan.request_id 时删除 ID 并恢复 `Pending`。
 - `mark_process_batch_failed`：同样核对 request ID，然后转 `Failed`，并同步所有已绑定 record。
-- `apply_process_proposals`：必须匹配 instance 的当前 request ID。保留 proposal，更新 semantic。
-  对每个已绑定进程，如果结果为 Classified 且 class 不同或 generation 为 0，则
-  `expected=applied_generation`、`class_generation += 1`，生成 `SetProcessDefault`。
+- `apply_process_proposals`：必须匹配 instance 的当前 request ID。保留 proposal 并更新 semantic；
+  达到 `high_confidence_threshold` 的进程专用目标可生成 `SetProcessDefault`，较低置信结果只作为候选。
 - 同一 request ID 中未被模型结果覆盖的 instance 标记为 `Failed`，并同步已绑定进程记录。
 - process action 同时把该进程下所有 `Inherited` task 的 effective class 和 desired generation 镜像更新。
 
-`on_process_discovered` 创建初始 `balanced/generation=0/applied=0`，并先对当前有界 argv 做与程序名无关的保守目标判定：显式 deadline/SLO 或“限速+尾延迟报告”为 `Latency`，显式 throughput 目标或“无远端 endpoint 的本地 benchmark+工作预算”为 `Throughput`，无 SLO 的远端 benchmark 为 `Balanced`。其余返回 None，保持中性默认并继续提交 LLM。
+`on_process_discovered` 创建初始 `balanced/generation=0/applied=0`，并先对当前有界 argv 做与程序名无关的保守目标判定：显式 deadline/SLO 或“限速+尾延迟报告”为 `Latency`；显式 throughput 目标、“无远端 endpoint 的本地 benchmark+工作预算”或“有时间边界和完成量计数的本地重复工作”为 `Throughput`；无 SLO 的远端 benchmark 为 `Balanced`。其余返回 None，保持中性默认并继续提交 LLM。
 
-本地目标、LLM 和后续行为证据由 Registry 融合：`Balanced` 是中性意见，不覆盖高置信专用目标；`Latency` 与 `Throughput` 冲突则取 `Balanced`。完全相同的有界元数据指纹可在当前 Agent 进程内复用已完成语义；缓存容量有界，不写入磁盘，Agent 重启后为空。已存在的完整 ProcessKey 事件幂等忽略。
+本地目标、LLM 和后续行为证据由 Registry 融合。当前命令中的显式目标可立即应用；进程完整元数据上的高置信专用目标也可建立进程默认，并按精确父子生命期传给短子任务。低置信专用语义保持当前 `Balanced` 或父进程默认，等待独立运行时证据；即使行为同类，也不能扩大为专用进程默认。线程语义始终只是行为确认的上下文。`Latency` 与 `Throughput` 冲突则取 `Balanced`。完全相同的有界元数据指纹只在当前 Agent 进程内复用 proposal，并遵守相同置信规则；缓存容量有界、不写磁盘，Agent 重启后为空。已存在的完整 ProcessKey 事件幂等忽略。
 
 ### 10.2 线程批次
 
@@ -644,8 +643,7 @@ record.pending_request_id is None
 record.applied_generation == record.class_generation
 ```
 
-接受的 known class 使 stage 变为 `Semantic`，`class_generation += 1`，产生 task action。进程默认是 `Balanced` 时，线程的专用类型可立即精炼该线程；两个专用类型冲突时仍需运行时证据确认。
-Unknown/low confidence 只改 semantic 状态，不改当前 inherited class。
+接受的 known class 只更新 task semantic 状态，不改变 inherited class，也不产生 scheduler action。专用线程 proposal 必须由后续连续行为窗口确认；Unknown/low confidence 同样只更新 semantic 状态。
 
 ## 11. 行为窗口与一次修正
 
@@ -724,10 +722,10 @@ Throughput 不要求墙钟利用率，因为 CPU 争用下的持续计算任务�
 
 ```text
 Inherited ---------------------> Locked
-    |        enough evidence       ^
-    |                              |
-    `------> Semantic -------------+
-              thread LLM       enough contrary evidence
+              enough confirmed evidence
+
+process/thread semantic proposal -----^
+runtime behavior windows --------------^
 
 Locked -- no outgoing transition
 ```
@@ -737,7 +735,7 @@ Locked -- no outgoing transition
 1. task/process 完整身份必须匹配，stage 不得是 Locked。
 2. sequence 必须大于已见值；重复/逆序丢弃。sequence 不连续先清 evidence。
 3. `quality=bad`、有 pending action 或 desired != applied 都清 evidence 并停止。
-4. 运行时 `Latency` 形态不能独立创建延迟目标；只有进程默认或进程/线程语义已经支持 `Latency` 时才可投票。持续 slice-exhausting 行为可独立证明 `Throughput`。
+4. 运行时 `Latency` 形态不能独立创建延迟目标；只有进程默认已是 `Latency`，或进程/线程语义以至少 `high_confidence_threshold` 支持 `Latency` 时才可投票。持续 slice-exhausting 行为可独立证明 `Throughput`。
 5. `Balanced` 语义对专用运行时候选为中性；只有另一个专用类型才是矛盾。候选必须连续达到配置窗口数才可 lock。
 6. task age 到 `behavior_lock_timeout_secs` 时视为超时；lock 时未完成的 task semantic 改为 Failed。
 7. proposal 的 task/process 必须与 window 相同，否则当 None。
@@ -762,7 +760,7 @@ else if timed_out:
 ```
 
 lock 时 stage=`Locked`、`class_generation += 1`、`expected_generation=applied_generation`，清空 evidence，
-生成一个 `SetTaskClass`。同一进程至少两个独立 locked task 给出一致专用类型后，Registry 可将它提升为临时进程默认；不一致时保持 `Balanced`。
+生成一个 `SetTaskClass`。同一进程至少两个独立 locked task 给出一致专用类型后，Registry 才可形成进程行为候选；存在专用进程语义时还必须同类且达到高置信阈值，否则保持 `Balanced`。不一致行为同样保持 `Balanced`。
 Locked 是终止 stage，不再收集新行为窗口。只有晚到的高置信进程专用类型与已 locked 的另一专用类型直接冲突时，Registry 才可在保持 `Locked` stage 的同时通过新 generation 保守调整为 `Balanced`；晚到的语义 `Balanced` 不会撤销强本地 lock。
 
 ## 12. 生命周期、exec 和 scheduler replay
@@ -966,10 +964,10 @@ kind, identity, class, stage="process_default", source,
 confidence|null, generation, applied_generation
 ```
 
-process source 可为 `local_metadata`、`llm`、`semantic_cache`、`parent_default`、`behavior` 或多种证据的 `hybrid`；Unknown/Failed=`fallback`，Pending/Requested=`default`。
+process source 可为 `local_metadata`、`llm`、`semantic_cache`、`parent_default`、`behavior` 或多种证据的 `hybrid`；尚待行为确认的 proposal 为 `llm_pending_behavior` 或 `semantic_cache_pending_behavior`，Unknown/Failed=`fallback`，Pending/Requested=`default`。
 
-`classification.get(task)` 额外返回 process；source 由 stage 决定：
-Inherited=`process_default`，Semantic=`llm`，Locked=`behavior`。confidence 仅 Classified 状态非 null。
+`classification.get(task)` 额外返回 process；source 由 stage 和 proposal 决定：
+Inherited=`process_default`，存在不同专用 proposal 时为 `llm_pending_behavior`，Semantic=`llm`，Locked=`behavior`。confidence 仅已应用的专用证据非 null。
 
 `scheduler.health` 从一次实时 `get_snapshot` 投影
 `attached=true,scheduler_epoch,registry_ready,degraded,control_connected,control_messages_dropped`，以及
