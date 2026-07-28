@@ -14,6 +14,19 @@ from typing import Any
 
 stop_requested = False
 
+CPU_STAT_FIELDS = (
+    "user_ticks",
+    "nice_ticks",
+    "system_ticks",
+    "idle_ticks",
+    "iowait_ticks",
+    "irq_ticks",
+    "softirq_ticks",
+    "steal_ticks",
+    "guest_ticks",
+    "guest_nice_ticks",
+)
+
 
 def _request_stop(_signal_number: int, _frame: Any) -> None:
     global stop_requested
@@ -86,6 +99,53 @@ class JsonlWriter:
 
     def close(self) -> None:
         self.stream.close()
+
+
+def _parse_proc_cpu_stats(text: str) -> list[dict[str, int]]:
+    rows: list[dict[str, int]] = []
+    for line in text.splitlines():
+        fields = line.split()
+        if not fields or not fields[0].startswith("cpu") or not fields[0][3:].isdigit():
+            continue
+        try:
+            values = [int(value) for value in fields[1 : len(CPU_STAT_FIELDS) + 1]]
+        except ValueError:
+            continue
+        values.extend([0] * (len(CPU_STAT_FIELDS) - len(values)))
+        rows.append(
+            {
+                "cpu": int(fields[0][3:]),
+                **dict(zip(CPU_STAT_FIELDS, values, strict=True)),
+            }
+        )
+    return rows
+
+
+def _cpu_topology() -> dict[int, tuple[int, int]]:
+    topology: dict[int, tuple[int, int]] = {}
+    for cpu_path in Path("/sys/devices/system/cpu").glob("cpu[0-9]*"):
+        try:
+            cpu = int(cpu_path.name[3:])
+            package_id = int(
+                (cpu_path / "topology/physical_package_id").read_text(encoding="utf-8")
+            )
+            core_id = int((cpu_path / "topology/core_id").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        topology[cpu] = (package_id, core_id)
+    return topology
+
+
+def _read_cpu_stats(topology: dict[int, tuple[int, int]]) -> list[dict[str, int]]:
+    try:
+        rows = _parse_proc_cpu_stats(Path("/proc/stat").read_text(encoding="utf-8"))
+    except OSError:
+        return []
+    for row in rows:
+        package_id, core_id = topology.get(row["cpu"], (-1, row["cpu"]))
+        row["package_id"] = package_id
+        row["core_id"] = core_id
+    return rows
 
 
 def _proc_identity(pid: int) -> tuple[int, int] | None:
@@ -332,6 +392,7 @@ def _read_schedstat(target: dict[str, Any]) -> dict[str, Any] | None:
     try:
         fields = (task_root / "schedstat").read_text(encoding="utf-8").split()
         sched = (task_root / "sched").read_text(encoding="utf-8")
+        stat = (task_root / "stat").read_text(encoding="utf-8")
         run_ns, wait_ns, timeslices = (int(value) for value in fields[:3])
         migrations = next(
             (
@@ -349,7 +410,28 @@ def _read_schedstat(target: dict[str, Any]) -> dict[str, Any] | None:
         "wait_ns": wait_ns,
         "timeslices": timeslices,
         "migrations": migrations,
+        "last_cpu": _parse_proc_stat_last_cpu(stat),
+        "sched_ext_enabled": _parse_sched_ext_enabled(sched),
     }
+
+
+def _parse_proc_stat_last_cpu(stat: str) -> int | None:
+    fields = stat[stat.rfind(")") + 2 :].split() if ")" in stat else []
+    try:
+        return int(fields[36])
+    except (IndexError, ValueError):
+        return None
+
+
+def _parse_sched_ext_enabled(sched: str) -> int | None:
+    for line in sched.splitlines():
+        name, separator, value = line.partition(":")
+        if separator and name.strip() == "ext.enabled":
+            try:
+                return int(value.strip().split()[0])
+            except (IndexError, ValueError):
+                return None
+    return None
 
 
 def _read_process_stat(pid: int, role: str) -> dict[str, Any] | None:
@@ -357,6 +439,7 @@ def _read_process_stat(pid: int, role: str) -> dict[str, Any] | None:
         text = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
         fields = text[text.rfind(")") + 2 :].split()
         status = Path(f"/proc/{pid}/status").read_text(encoding="utf-8")
+        sched = Path(f"/proc/{pid}/sched").read_text(encoding="utf-8")
     except OSError:
         return None
     voluntary = 0
@@ -375,6 +458,7 @@ def _read_process_stat(pid: int, role: str) -> dict[str, Any] | None:
             "rss_pages": int(fields[21]),
             "voluntary_context_switches": voluntary,
             "involuntary_context_switches": involuntary,
+            "sched_ext_enabled": _parse_sched_ext_enabled(sched),
         }
     except (IndexError, ValueError):
         return None
@@ -402,35 +486,17 @@ def _scheduler_sample(stats: dict[str, Any], observed_ns: int) -> dict[str, Any]
             key: scheduler.get(key)
             for key in (
                 "events_processed",
-                "refill_commands",
-                "command_rejects_by_reason",
-                "preempt_dispatches",
-                "latency_slo_admissions",
-                "root_latency_dispatches",
-                "latency_budget_denials",
-                "preemption_budget_denials",
-                "repeated_preemptions_avoided",
-                "latency_preemptions_by_victim_class",
-                "request_resumptions",
-                "planned_migrations_by_class",
-                "smt_busy_placements_by_class",
-                "dispatch_overhead_samples",
-                "dispatch_overhead_ns",
-                "dispatches_by_class",
-                "runtime_by_class_ns",
+                "stale_events",
                 "task_capacity_hits",
+                "bad_behavior_windows",
                 "degraded_transitions",
             )
         },
         "data_plane": {
             key: data_plane.get(key)
             for key in (
-                "commands_accepted",
-                "commands_rejected",
                 "event_overflows",
                 "fallback_dispatches",
-                "stale_heartbeat_fallbacks",
-                "max_normal_staged_depth",
                 "fast_path_enqueues",
                 "fast_path_dispatches",
                 "fast_path_dispatch_failures",
@@ -443,7 +509,6 @@ def _scheduler_sample(stats: dict[str, Any], observed_ns: int) -> dict[str, Any]
                 "fast_path_direct_dispatches",
                 "fast_path_prev_continuations",
                 "fast_path_steal_claim_conflicts",
-                "cpu_state_events_suppressed",
                 "fast_path_empty_steal_skips",
                 "fast_path_preemption_throttles",
                 "fast_path_latency_backlog_boosts",
@@ -462,8 +527,10 @@ def collect(args: argparse.Namespace) -> int:
         "scheduler": JsonlWriter(output_dir / "scheduler-stats.jsonl"),
         "schedstat": JsonlWriter(output_dir / "task-schedstat.jsonl"),
         "process": JsonlWriter(output_dir / "process-stats.jsonl"),
+        "cpu": JsonlWriter(output_dir / "cpu-stats.jsonl"),
         "errors": JsonlWriter(output_dir / "collector-errors.jsonl"),
     }
+    cpu_topology = _cpu_topology()
     classification_snapshot: dict[str, Any] | None = None
     seen_targets: dict[tuple[int, int], dict[str, Any]] = {}
     samples = 0
@@ -481,6 +548,9 @@ def collect(args: argparse.Namespace) -> int:
             observed_ns = time.monotonic_ns()
             targets, active = _load_process_targets(targets_path)
             seen_targets.update(targets)
+
+            for row in _read_cpu_stats(cpu_topology):
+                writers["cpu"].write({"observed_ns": observed_ns, **row})
 
             if (
                 client is not None
@@ -515,10 +585,18 @@ def collect(args: argparse.Namespace) -> int:
                 if row is not None:
                     writers["schedstat"].write({"observed_ns": observed_ns, **row})
 
-            process_roles = {
-                pid: f"workload:{targets[(pid, tid)]['mode']}"
-                for pid, tid in active
-            }
+            process_roles = {1: "protected:init"}
+            process_roles.update(
+                {
+                    pid: f"workload:{targets[(pid, tid)]['mode']}"
+                    for pid, tid in active
+                }
+            )
+            try:
+                if Path("/proc/2/comm").read_text(encoding="utf-8").strip() == "kthreadd":
+                    process_roles[2] = "protected:kthreadd"
+            except OSError:
+                pass
             if args.agent_pid:
                 process_roles[args.agent_pid] = "agent"
                 for pid in _scheduler_pids(args.agent_pid):

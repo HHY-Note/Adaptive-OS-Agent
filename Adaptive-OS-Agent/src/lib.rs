@@ -15,5 +15,6 @@ pub mod registry;
 pub mod scheduler_client;
 pub mod skills;
 pub mod supervisor;
+pub mod task_admission;
 mod thread_classifier;
 pub mod tools;

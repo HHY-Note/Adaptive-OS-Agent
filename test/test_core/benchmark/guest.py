@@ -184,6 +184,12 @@ workload_ready_rc="$?"
 if [ "$workload_ready_rc" -eq 0 ]; then
     [ "$(cat "$REAL/profile" 2>/dev/null)" = "$SCENARIO" ] || workload_ready_rc=1
 fi
+if [ "$workload_ready_rc" -ne 0 ]; then
+    systemctl status --no-pager --full "$WORKLOAD_SERVICE" \
+        >"$BENCH/workload-service.status" 2>&1 || true
+    journalctl --no-pager -b -u "$WORKLOAD_SERVICE" -n 200 \
+        >"$BENCH/workload-service.journal" 2>&1 || true
+fi
 """
 
     environment = r'''python3 - "$BENCH/environment.json" "$EXPECTED_VCPUS" \
@@ -368,7 +374,15 @@ def load_jsonl(path):
         errors.append(f"cannot read {path}: {exc}")
     return rows
 
-if (real / "profile").read_text(encoding="utf-8").strip() != scenario:
+def load_text(path):
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        errors.append(f"cannot read {path}: {exc}")
+        return None
+
+profile = load_text(real / "profile")
+if profile is not None and profile != scenario:
     errors.append("workload profile mismatch")
 window = load_json(real / "measurement-window.json")
 if start_ns <= 0 or end_ns <= start_ns:
@@ -452,6 +466,16 @@ if collector.get("timed_out") is True:
     errors.append("collector timed out")
 
 if agent_required:
+    process_rows = [row for row in load_jsonl(bench / "observations" / "process-stats.jsonl") if start_ns <= int(row.get("observed_ns", 0)) <= end_ns]
+    protected_roles = {"protected:init", "agent", "scheduler"}
+    observed_protected_roles = {str(row.get("role")) for row in process_rows} & protected_roles
+    if observed_protected_roles != protected_roles:
+        errors.append(f"protected scheduler roles were not fully observed: {sorted(observed_protected_roles)}")
+    if any(row.get("sched_ext_enabled") != 0 for row in process_rows if str(row.get("role")) in protected_roles or row.get("role") == "protected:kthreadd"):
+        errors.append("a protected init, kernel, Agent, or scheduler task entered sched_ext")
+    task_rows = [row for row in load_jsonl(bench / "observations" / "task-schedstat.jsonl") if start_ns <= int(row.get("observed_ns", 0)) <= end_ns]
+    if not task_rows or any(row.get("sched_ext_enabled") != 1 for row in task_rows):
+        errors.append("one or more ordinary workload threads did not enter sched_ext")
     if collector.get("classification_snapshot_available") is not True:
         errors.append("classification snapshot was not collected")
     else:
@@ -462,8 +486,6 @@ if agent_required:
     epochs = {row.get("scheduler_epoch") for row in scheduler_rows if row.get("scheduler_epoch") is not None}
     if len(epochs) != 1:
         errors.append("scheduler epoch changed or was not observed during measurement")
-    if any(int(row.get("data_plane", {}).get("stale_heartbeat_fallbacks") or 0) > 0 for row in scheduler_rows):
-        errors.append("scheduler heartbeat fallback occurred during measurement")
     snapshot = load_json(snapshot_path) if snapshot_path else {}
     if snapshot.get("registry_ready") is not True or snapshot.get("degraded") is not False:
         errors.append("final scheduler snapshot is not healthy")

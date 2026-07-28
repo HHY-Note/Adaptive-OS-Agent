@@ -1,0 +1,18 @@
+#!/bin/sh
+set -eu
+
+for compiler in clang-20 clang-19 clang-18 clang-17 clang-16; do
+    if command -v "$compiler" >/dev/null 2>&1; then
+        exec "$compiler" "$@"
+    fi
+done
+
+if command -v clang >/dev/null 2>&1; then
+    major="$(clang --version 2>/dev/null | sed -n '1s/.*clang version \([0-9][0-9]*\).*/\1/p')"
+    if [ "${major:-0}" -ge 16 ]; then
+        exec clang "$@"
+    fi
+fi
+
+echo "scx_adaptive requires clang 16 or newer for BPF" >&2
+exit 127

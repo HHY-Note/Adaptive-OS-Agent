@@ -1,12 +1,13 @@
-schema_version: 2
+schema_version: 3
 
-upstream:
-  scx:
+compatibility:
+  sched_ext:
     repository: https://github.com/sched-ext/scx.git
-    checkout: scheduler/scx
-    tag: v1.0.19
-    commit: 85f140fd5e2cbc9385272003058278ee13574f9f
-    clone_mode: shallow-tag
+    source: crates.io
+    scx_cargo: 1.0.25
+    scx_utils: 1.0.25
+    scx_stats: 1.0.20
+    integrity: scheduler/rust/Cargo.lock
 
 target:
   distribution: openEuler 24.03 LTS-SP4

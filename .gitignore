@@ -24,9 +24,6 @@ test/.local/
 *.raw
 *.seed
 
-# External reference projects / cloned upstream repositories
-scx_agent/
-
 # Editor and OS files
 .git/
 .agents/
@@ -36,3 +33,5 @@ scx_agent/
 *.swp
 *~
 .DS_Store
+
+第三届中国研究生操作系统开源创新大赛暨开放原子大赛操作系统专项赛赛题.docx

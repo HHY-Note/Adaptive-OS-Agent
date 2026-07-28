@@ -89,15 +89,12 @@ class BenchmarkConfigTests(unittest.TestCase):
         self.assertEqual(completed.stdout.count(" repeat=1 "), 8)
 
     def test_single_scenario_argument_has_one_native_agent_pair(self) -> None:
-        template_image = Path("/tmp/aoa-controlled-image.qcow2")
         completed = subprocess.run(
             [
                 sys.executable,
                 TEST_ROOT / "scripts" / "benchmark.py",
                 "throughput",
                 "--single-round",
-                "--template-image",
-                template_image,
                 "--dry-run",
             ],
             check=True,
@@ -109,7 +106,10 @@ class BenchmarkConfigTests(unittest.TestCase):
         self.assertNotIn("scenario=latency", completed.stdout)
         self.assertNotIn("scenario=balanced", completed.stdout)
         self.assertNotIn("scenario=mix", completed.stdout)
-        self.assertIn(f"template_image: {template_image}", completed.stdout)
+        self.assertIn(
+            f"template_image: {self.config['libvirt']['template_image']}",
+            completed.stdout,
+        )
 
     def test_guest_scripts_use_image_workload_and_valid_shell(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

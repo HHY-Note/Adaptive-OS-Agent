@@ -997,6 +997,8 @@ dependencies = [
 [[package]]
 name = "scx_cargo"
 version = "1.0.25"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7c4a12aa9f550db5bf3efd43aff548ff9ef3dc538dd75ef3857df9df0b8f3347"
 dependencies = [
  "anyhow",
  "bindgen",
@@ -1017,6 +1019,8 @@ dependencies = [
 [[package]]
 name = "scx_stats"
 version = "1.0.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "da5dbe9658a436c8ddf008cb7598942dc9d82ff6a6621aa11d2fd9ed6bc6c869"
 dependencies = [
  "anyhow",
  "crossbeam",
@@ -1032,6 +1036,8 @@ dependencies = [
 [[package]]
 name = "scx_utils"
 version = "1.0.25"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "85593062f5521b0764ef9f8b9b561116ddee7431ac83ced0a9eed6a879f5944b"
 dependencies = [
  "anyhow",
  "bindgen",

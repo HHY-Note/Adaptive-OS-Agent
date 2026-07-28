@@ -1,84 +1,138 @@
 # scx_adaptive 当前实现设计
 
-本文档描述 2026-07-25 工作区中的实际实现。源码是最终事实来源：
+本文描述 2026-07-28 工作区中的实际实现。源码是最终事实来源：
 
-- BPF 数据面：rust/bpf/scx_adaptive.bpf.c
-- Rust/BPF ABI：rust/bpf/intf.h
-- Rust 控制面与慢路径：rust/src
-- 基准框架：../test
+- BPF 数据面：`rust/bpf/scx_adaptive.bpf.c`
+- Rust/BPF ABI：`rust/bpf/intf.h`
+- Rust 控制面：`rust/src`
+- 性能协议：`../test`
 
-本文只描述已经存在且通过构建的行为，不把试验方案写成既定设计。
+## 1. 目标与边界
 
-## 1. 目标与硬约束
+一个 `scx_adaptive` 同时调度 Latency、Balanced 和 Throughput 普通任务，目标是：
 
-scx_adaptive 的目标是在同一套调度器中同时改善两类指标：
+1. Balanced 达到或超过相同机器上的 Linux EEVDF；
+2. Latency 降低尾延迟；
+3. Throughput 提高单位时间完成量；
+4. Mix 中三类目标同时可用，任何一类都不能无限侵占 CPU；
+5. 算法不依赖测试应用名称，所有循环、map 和状态都有静态上界；
+6. 用户态失效时普通任务仍能执行，受保护任务始终保持原生调度。
 
-- Latency 场景的 P99 响应时间；
-- Throughput 场景的单位时间完成量；
-- Mix 场景中，Latency 不能被长时间片吞吐任务饿死；
-- 性能优化不能依赖无限队列、无限循环或不可恢复的用户态状态。
+性能结论只能来自同镜像、同 CPU、同时间窗的 Native/Agent 配对实验，不能由代码结构直接推断。
 
-安全约束高于性能目标：
+### 1.1 当前支持基线
 
-1. 不改变 SCHED_FIFO、SCHED_RR、SCHED_DEADLINE 等实时调度策略。
-2. 不对 PF_KTHREAD、Agent 进程和 scheduler 进程执行自定义分类、CPU 放置或抢占。
-3. safe task 始终进入 sched_ext 的 GLOBAL DSQ，使用 SCX_SLICE_DFL。
-4. 未分类任务、状态失配和用户态故障必须存在不依赖 Agent 决策的执行路径。
-5. 所有用户态命令在 BPF 中重新校验实时 identity、generation、affinity、CPU 和 slice。
-6. 任一容量不变量失败时受控 detach，由内核恢复正常调度，不能带病继续。
+```text
+正式 Guest   openEuler 24.03 LTS-SP4 / x86_64 / 6.6.0-scx
+sched_ext 库  scx_cargo 1.0.25 / scx_utils 1.0.25 / scx_stats 1.0.20
+锁定工具链  clang/LLVM 17.0.6 / rustc+cargo 1.96.0
+BPF ABI     v8
+```
 
-这里的 GLOBAL 是 sched_ext 全局 DSQ，不等同于 CFS。它不执行本项目的 class EEVDF、定制放置和
-Latency 抢占。Linux 的 RT/DL 调度类仍由内核更高优先级的原生调度类处理。
+构建包装器会依次寻找 Clang 20..16；Clang 16 可用于当前本地构建，但会提示推荐
+17 以上。完整基线和镜像哈希位于 [`versions.lock`](versions.lock)。策略不按应用名称分支，
+但能否加载 sched_ext 仍取决于目标内核、BTF 和 BPF kfunc 兼容性。
 
-## 2. 总体架构
+## 2. 单数据面架构
 
-当前实现是 BPF 快路径与 Rust 慢路径并存的双数据面。
+```text
+                    低频控制路径：不参与每次 dispatch
 
-~~~text
-Adaptive-OS-Agent
-  process/task class + stage + generation
-                     |
-                     v
-              task_control map
-                     |
-     +---------------+----------------+
-     |                                |
-     v                                v
-有效 BPF_SCHED control            control 缺失或失配
-BPF 自主快路径                     Rust 有界慢路径
-     |                                |
-select_cpu / class DSQ                | lifecycle event
-per-CPU root EEVDF                    v
-direct dispatch / steal         task EEVDF -> root EEVDF
-throughput continuation         -> placement -> reservation
-     |                                |
-     +---------------+----------------+
-                     v
-            BPF 最终校验与 DSQ
-                     |
-                     v
-                 Linux CPU
+ ┌────────────────────┐      ┌────────────────────┐      ┌────────────────────┐
+ │ Adaptive-OS-Agent  │      │ Rust control plane │      │ task_control map   │
+ │ class/stage/gen    │─────▶│ identity/CAS/ACK   │─────▶│ exact lifetime     │
+ └────────────────────┘      └──────────┬─────────┘      └──────────┬─────────┘
+                                              │ lifecycle/window          │ lookup
+                                              ▲                           ▼
+                    高频数据路径：全部在 BPF
 
-safe task / context 缺失 / 慢路径心跳失效
-                     |
-                     v
-              SCX_DSQ_GLOBAL
-~~~
+ ┌────────────────────┐      ┌────────────────────┐      ┌────────────────────┐
+ │ Linux runnable task│─────▶│ select_cpu/enqueue │─────▶│ per-CPU class DSQ  │
+ └────────────────────┘      └────────────────────┘      └──────────┬─────────┘
+                                                                         │ root EEVDF
+                                                                         ▼
+                                                               local DSQ ─▶ Linux CPU
+```
 
-职责分工如下。
+一次 runnable 事件不会上送 Rust 等待决策：
+
+```text
+control 精确匹配？
+   ├─ 是 ─▶ 使用 class/generation/observe flags
+   └─ 否 ─▶ 当场使用 Balanced + 粗采样
+                 │
+                 ▼
+        选 CPU ─▶ 写 vtime DSQ ─▶ dispatch
+```
 
 | 组件 | 负责 | 不负责 |
 | --- | --- | --- |
-| Agent | 进程/线程语义分类、generation、一次纠正 | 直接选择 CPU、直接操作 DSQ |
-| Rust | 控制协议、分类事务、生命周期观测、未分类慢路径、诊断 | 绕过 BPF 最终校验 |
-| BPF | 内核事实、已分类快路径、DSQ、抢占、steal、liveness fallback | 调用模型或依赖网络 |
-| 内核 | RT/DL 类、sched_ext 框架、CPU 执行、detach 后恢复 | Agent 语义分类 |
+| Agent | 普通任务准入、进程/线程分类、generation | CPU 选择、DSQ |
+| Rust | 控制协议、分类事务、稳定身份、行为窗口、detach | runnable 调度算法 |
+| BPF | CPU 选择、virtual time、DSQ、抢占、steal、fallback | 模型和网络 |
+| Linux | RT/DL、sched_ext 框架、partial 切换、detach 恢复 | 语义分类 |
 
-## 3. 调度对象与分类生命周期
+不存在 Rust 慢路径调度。task_control 缺失、失配或尚未生成时，BPF 直接使用可观测的 Balanced
+默认值，因此不会等待 Agent 或 Rust 做出每次 runnable 决策。
 
-### 3.1 稳定身份
+## 3. 任务范围与系统安全
 
-仅使用 PID/TID 会受到复用影响，因此调度对象使用三层身份：
+### 3.1 partial admission
+
+struct_ops 使用 `SCX_OPS_SWITCH_PARTIAL`。Agent 对 `/proc` 做有界周期性 reconciliation，并在
+INIT/EXEC 生命周期通知后及时补充准入：
+
+- 只处理普通用户态进程；
+- 只把当前策略为 `SCHED_OTHER` 的线程切换为 `SCHED_EXT`；
+- PID 1、Agent、scheduler、内核线程和非普通策略保持原生；
+- TID 和 start time 在系统调用前后都复核，竞态记入 `identity_races`；
+- 创建/退出竞态由生命周期事件和周期 reconciliation 恢复。
+
+```text
+Linux 原生策略
+      │
+      ├─ PID 1 / kernel / Agent / scheduler ─────▶ 保持原生
+      ├─ SCHED_FIFO/RR/DEADLINE/其他非 OTHER ─▶ 保持原生
+      └─ ordinary SCHED_OTHER
+                    │ Agent sched_setscheduler(SCHED_EXT)
+                    ▼
+             scx_adaptive BPF
+                    │ is_safe_task() 再检查
+                    ├─ protected ▶ local/GLOBAL fallback，保证可运行
+                    └─ ordinary  ▶ 三类数据面
+```
+
+BPF 的 `is_safe_task()` 再次拒绝 PID 1、`PF_KTHREAD`、Agent TGID 和 scheduler TGID。
+`init_task` 对 attach 前已存在的受保护任务设置 `scx.disallow`；enqueue 中仍保留 local/GLOBAL
+fallback，作为异常进入 BPF 时不依赖用户态的可运行性保护。正常安全不变量仍由
+partial admission 保证：受保护任务根本不进入自定义数据面。
+
+### 3.2 故障恢复
+
+以下情况触发受控 detach：
+
+- Agent 身份消失超过 2 秒 grace；
+- 连续三个一秒窗口出现 BPF event overflow；
+- Rust 活跃身份达到 `max_tasks`；
+- BPF/struct_ops 报告退出；
+- SIGINT 或 SIGTERM。
+
+detach 释放 struct_ops link。普通 `SCHED_EXT` 任务由内核恢复，受保护任务此前从未进入自定义数据面。
+
+```text
+running
+  │
+  ├─ Agent identity 连续消失 >= 2 s ─┐
+  ├─ event overflow 连续 3 个窗口 ───├─▶ controlled detach
+  ├─ userspace task capacity hit/degraded ───┤        │
+  ├─ BPF exit / SIGINT / SIGTERM ───────┘        ▼
+  └─ 短时 control 断开 ─▶ 数据面继续，重连时 replay + snapshot
+                                                    Linux 接管 SCHED_EXT task
+```
+
+## 4. 身份与分类事务
+
+### 4.1 稳定身份
 
 ~~~text
 ProcessKey = tgid + process_cookie + exec_generation
@@ -86,454 +140,291 @@ TaskKey    = tid + task_cookie
 Runnable   = TaskKey + enqueue_sequence
 ~~~
 
-- process_cookie 和 task_cookie 由 BPF 分配，零值无效；
-- process map 的内核 key 是 tgid 与 group leader start_boottime；
-- exec 每发生一次，exec_generation 递增并跳过零；
-- 每个新的 runnable incarnation 都递增 enqueue_sequence 并跳过零；
-- dispatch command 必须同时匹配上述身份和 class_generation。
+- cookie 由 BPF 单调分配，零值无效；
+- process map 的 kernel key 同时包含 TGID 和 group leader start time；
+- exec_generation 和 enqueue_sequence 递增时跳过零；
+- task_control 同时匹配 task/process cookie 与 exec_generation，TID 复用不会命中旧分类。
 
-### 3.2 三个 workload class
+### 4.2 class 与 stage
 
-| Class | 初始请求 | 主要目标 |
+| Class | 基础 request | 目标 |
 | --- | ---: | --- |
-| Latency | 250 us | 降低唤醒到运行的尾延迟 |
-| Balanced | 4 ms | 未知和通用负载的稳定折中 |
-| Throughput | 8 ms | 保持 CPU/缓存局部性并减少切换 |
+| Latency | 250 us | 降低 runnable wait 和尾延迟 |
+| Balanced | 4 ms | 通用公平性与稳定吞吐 |
+| Throughput | 8 ms | 降低切换并保持局部性 |
 
-Class 编号固定为 Latency=0、Balanced=1、Throughput=2。
-
-### 3.3 分类 stage
+Class 编号固定为 0、1、2。分类 stage 为：
 
 ~~~text
 Inherited -> Semantic -> Locked
 Inherited ------------> Locked
 ~~~
 
-- Inherited：继承进程默认值；初始默认值为 Balanced、generation 为 0；
-- Semantic：Agent 给出线程语义判断，仍收集运行行为；
-- Locked：完成行为确认或纠正，不再发送行为观测；
-- stage 在 Locked 后不再转换。仅 Agent 发现晚到的专用语义与专用本地 lock 直接冲突时，可以新 generation 将 class 保守调整为 Balanced；语义 Balanced 不撤销 lock。
+- Inherited 使用当前 process default；新未知 process 是 Balanced/generation 0，使用 16 ms 粗采样；
+- Semantic 使用 4 ms 行为采样；
+- Locked 不再发送 ENQUEUE/RUNNING/STOP 行为事件；
+- Locked 专用类只允许一次保守冲突收敛到 Balanced。
 
-task_control 中始终设置 BPF_SCHED。Inherited 和 Semantic 同时设置 OBSERVE；Locked 清除 OBSERVE。
-因此三种 stage 都能走 BPF 快路径，但只有未锁定任务继续发送 ENQUEUE、RUNNING、STOP 等观测事件。
+当前 Agent 不会仅因 thread LLM proposal 就发送 Semantic 更新；正常线上 task 是
+`Inherited -> Locked`。Semantic 仍是 ABI/control 状态机支持的合法中间阶段，用于完整协议
+兼容性和恢复校验。
 
-### 3.4 分类更新事务
+### 4.3 更新事务
 
-进程和任务更新均使用严格的 compare-and-swap generation：
+增量更新必须满足：
 
 ~~~text
-new_generation == expected_generation + 1
 current_generation == expected_generation
+new_generation == expected_generation + 1
 ~~~
 
-提交顺序固定为：
+提交顺序为校验身份和 stage、写 BPF task_control、提交 Rust cache。任何后续失败都会恢复旧
+task_control。进程默认更新涉及多个 inherited task 时逐项写入，任一失败回滚此前写入。
 
-1. 校验 identity、stage 和 generation；
-2. 先写 BPF task_control；
-3. 再提交 Rust Engine 状态；
-4. Rust 提交失败则恢复旧 BPF control；
-5. 进程默认更新涉及多个 inherited task 时，任一写入失败则回滚已写项。
+scheduler 每次启动生成非零 epoch。Agent 通过 Hello 和有序 RegistrySnapshotBatch 恢复已有分类；
+live process/task replay 完成后发送 `LifecycleReplayComplete`。响应按 request_id 在有界 cache 中幂等重放。
 
-这个顺序保证 BPF 不会使用 Rust 尚未确认的旧 generation。
+## 5. BPF 调度算法
 
-## 4. BPF 快路径
+### 5.1 默认 Balanced 与控制查找
 
-### 4.1 快路径准入
+`select_cpu` 和 `enqueue` 都从以下默认值开始：
 
-fast_control_for 必须同时满足：
+~~~text
+class = Balanced
+flags = BPF_SCHED | OBSERVE | COARSE_OBSERVE
+~~~
 
-- task_control 存在；
-- BPF_SCHED flag 已设置，且不存在未知 flag；
-- class_id 在 0..3；
-- task_cookie、process_cookie、exec_generation 与 task storage 完全一致。
+只有 task_control 的 flag、class、task cookie、process cookie 和 exec generation 全部有效时才覆盖
+默认值。无效控制不是错误路径，也不会唤醒 Rust 做调度决定。
 
-任何一项不满足都不会猜测分类，而是进入 Rust 慢路径。
+### 5.2 CPU-owned class DSQ
 
-### 4.2 select_cpu
-
-Balanced 和 Throughput 以局部性为主：
-
-- Throughput 先尝试原 CPU 的 idle claim；
-- 然后使用内核默认 CPU 选择；
-- 默认结果繁忙时，Throughput 尽量保留合法的 prev_cpu；
-- Balanced 接受合法的默认选择。
-
-Latency 以启动延迟为主：
-
-1. 先原子 claim 一个允许的空闲 SMT CPU；
-2. 再 claim 任意允许的空闲 CPU；
-3. 没有空闲 CPU 时选择可抢占 victim；
-4. victim 顺序是 prev_cpu 上的 Throughput、其他 Throughput、Balanced；
-5. 不选择 Latency victim，不选择 safe task，不绕过 cpus_ptr。
-
-Latency 在 select_cpu 已原子取得空闲 CPU，且该 CPU 没有 local DSQ、class DSQ、normal slot 或
-urgent slot 工作时，直接完成 local DSQ 插入。这条路径省去 enqueue callback、重复 map 查询和
-额外 kick。
-
-### 4.3 enqueue 与 task EEVDF
-
-所有 runnable 记账由 begin_enqueue 统一完成，避免快慢路径重复维护 sequence 和时间戳。
-
-快路径为每个可能 CPU 保留三个 class DSQ ID：
+每个 possible CPU 有三个 virtual-time DSQ：
 
 ~~~text
 FAST_CLASS_DSQ_BASE + class_id * MAX_CPUS + cpu
 ~~~
 
-Balanced 和 Throughput 插入目标 CPU 的 class DSQ。Latency 首个任务保留在目标 CPU 私有队列，同 CPU 已有 Latency 积压时后续任务进入有界共享 overflow vtime DSQ；dispatch 优先保留 target CPU，等待超过一个 latency slice 后才允许远端 CPU 接管。select_cpu 已原子取得空闲 CPU 且该 CPU 没有私有积压时，Latency 仍可直接插入 local DSQ。
+队列的实际布局是：
 
-task 在 class 内携带：
+```text
+                         task-level EEVDF order
 
-~~~text
-vruntime
-request
-deadline = vruntime + request
-~~~
+ CPU 0   ┌─────────────┐ ┌─────────────┐ ┌─────────────┐
+         │ Latency DSQ │ │ Balanced DSQ│ │Throughput DSQ│
+         └─────────────┘ └─────────────┘ └─────────────┘
 
-插入使用 scx_bpf_dsq_insert_vtime。新任务或唤醒任务最多获得一个 request 的 sleep credit；
-class 变化时把 source lag 限制在 source/target 各自一个 request 内再转换，不能清零历史服务来
-获得无限信用。
+ CPU 1   ┌─────────────┐ ┌─────────────┐ ┌─────────────┐
+         │ Latency DSQ │ │ Balanced DSQ│ │Throughput DSQ│
+         └─────────────┘ └─────────────┘ └─────────────┘
+           ... 每个 possible CPU 各自三条队列 ...
 
-每次 custom DSQ 插入前精确增加 `class_queued_tasks`，只有成功 move-to-local 后才减少；该计数是
-Throughput epoch、空扫描跳过和 liveness 判断共享的总体积压不变量。
+ 全局   ┌──────────────────────┐
+        │ Latency overflow DSQ │  目标 CPU 已有 Latency 积压，或 overflow 已活跃时使用
+        └──────────────────────┘
+```
 
-task EEVDF 的 request、实际运行时间和 class 转换 lag 都通过 Linux task weight 换算为 virtual service。因此 `nice` 不为 0 的 Balanced 任务仍保留内核类似的比例公平性，而默认 weight 下不产生额外策略偏置。
+这不是“三条全局任务队列”。全局状态只有：
 
-### 4.4 每 CPU root EEVDF
+- `class_state[3].virtual_time_ns`：三个 class 的 task-level virtual-time 基准；
+- `class_queued_tasks`：自定义 class DSQ 中等待任务的原子计数，只用于快速判断是否值得 steal/增长 epoch；
+- `specialized_tasks`：存活非 Balanced 任务数，用于切换 Balanced-only 与 mixed-class 路径。
 
-每个 CPU 保存三个 class root entity：
+每 CPU 的 `root_virtual_time_ns` 和三个 `root_vruntime_ns` 均在 `cpu_state[cpu]`中，不在全局
+共用。task 自身保存 `vruntime`、`request_ns` 和 `request_deadline_ns`，使用
+`scx_bpf_dsq_insert_vtime` 排队。实际服务通过 Linux task weight 换算为 virtual service，
+因此 nice 权重仍参与同 class 公平性。
+
+新任务和睡眠唤醒最多获得一个 request 的负 lag。class 转换把 source lag 限制在 source 和 target
+各自一个 request 内，不能通过改 class 清零历史服务。
+
+Balanced-only 时 `specialized_tasks == 0`，dispatch 直接移动本 CPU Balanced DSQ，跳过三类 root
+选择。这是当前恢复 Balanced 基线的低开销路径。
+
+### 5.3 per-CPU root EEVDF
+
+存在专用类时，每 CPU 维护：
 
 ~~~text
 root_virtual_time_ns
 root_vruntime_ns[Latency, Balanced, Throughput]
 ~~~
 
-活跃 class 的 root deadline 是：
+活跃 class 的 deadline 为 `root_vruntime + class_request`。先选择 eligible 中最早 deadline；没有
+eligible entity 时把 virtual time 前移到最小 vruntime。重新活跃的 class 最多保留一个 request
+的 credit。
 
-~~~text
-root_vruntime + class_base_request
-~~~
+Latency backlog 超过一个任务时，root request 从 250 us 临时缩短为 227,273 ns；积压消失后恢复。
+该加权有界，仍对 root vruntime 计费。
 
-eligible class 中选择最早 deadline；没有 eligible class 时把 root virtual time 前移到最小
-vruntime。休眠后重新活跃的 class 最多保留一个 base request 的正 lag。
+### 5.4 select_cpu
 
-root base request 固定为 0.25/4/8 ms。Latency 的短 root deadline 提供低延迟，但 EEVDF 服务记账
-防止其无限占用 CPU。
-Latency 队列中多于一个任务时，root request 临时缩短为 `latency_slice * 100 / (100 + latency_guarantee_percent)`，默认为 227,273 ns；队列恢复单任务后自动回到 250 us。
+Balanced 和 Throughput 使用 sched_ext 的默认 CPU selector；Throughput 在 previous CPU 空闲且合法时
+优先原地复用。全忙时不在 BPF 中逐 CPU 累加精确队列长度，避免热路径开销和 verifier 状态爆炸。
 
-### 4.5 Latency urgent lane
+Latency 顺序为：
 
-非 direct 的 Latency enqueue 只有在以下条件全部满足时才可 arm urgent lane：
+1. 原子取得 previous CPU 上空闲 SMT sibling；
+2. 取得任意允许的空闲 CPU；
+3. previous CPU 正在运行 Latency 且本地无 Latency 排队时，保留 previous CPU 但不抢占；
+4. 否则优先可抢占的 previous CPU，再选 Throughput victim，最后选 Balanced victim；
+5. 所有分支都不跨越实时 `p->cpus_ptr`。
 
-- 目标 CPU 在线且正在运行已知普通 class；
-- CPU 不 idle；
-- victim 是 Balanced 或 Throughput；
-- victim 已连续运行至少 250 us；
-- 该 CPU 距上次快路径抢占至少 5 ms。
-- urgent slot 当前为空；
-- Latency root entity 没有超过 root virtual time 一个 Latency request。
+空闲目标没有 local/class 积压时，Latency 在 select_cpu 直接插入 local DSQ，省去后续 dispatch。
 
-成功后使用 SCX_KICK_PREEMPT。普通任务只在确有必要时使用 SCX_KICK_IDLE。select_cpu 已经直接
-插入的任务不再重复 kick。
+```text
+                    select_cpu
+                        │
+       ┌────────────────┼────────────────┐
+       ▼                ▼                ▼
+   Latency             Balanced          Throughput
+       │                │                │
+ idle SMT sibling     kernel default     previous CPU idle？
+       │             selector             │
+ any idle CPU             │          yes ──▶ previous CPU
+       │               allowed fallback    └─ no ─▶ kernel default
+ previous Latency CPU or non-Latency victim
+       │
+ allowed fallback
 
-### 4.6 Throughput 自适应 epoch
+所有分支最终都必须在当下 p->cpus_ptr 中。
+```
 
-Throughput 从 8 ms 开始。连续耗尽且保持 runnable 时按以下序列增长：
+### 5.5 Latency 抢占
+
+只有以下条件全部成立才设置 urgent sentinel 并 `SCX_KICK_PREEMPT`：
+
+- victim 是 Balanced 或 Throughput，不是 Latency；
+- victim 已运行至少 250 us；
+- 同 CPU 距上次抢占至少 2.5 ms；
+- urgent sentinel 当前为空；
+- Latency root entity 没有领先超过一个 request；
+- CPU 在线、非 idle 且 affinity 允许。
+
+这限制了 IPI、短任务打断和连续抢占造成的吞吐退化。
+
+### 5.6 Throughput epoch
+
+Throughput 从 8 ms 开始，在无竞争、持续 runnable 时增长：
 
 ~~~text
 8 ms -> 16 ms -> 32 ms -> 64 ms
 ~~~
 
-以下情况恢复为 8 ms：
+阻塞、cancel、exec、class 变化或出现其他 class 排队都会恢复 8 ms。提前打断且剩余 request 至少
+250 us 时保留剩余服务与原 deadline。
 
-- 主动阻塞；
-- dequeue/cancel；
-- exec；
-- class 变化；
-- 系统中已有其他已分类任务排队。
+Locked Throughput 在本地和全局都没有竞争时可以续接 prev，不经过完整 dequeue/dispatch cycle；
+每次续接仍更新 task/class/root virtual time，且上限保持 64 ms。
 
-提前打断且剩余时间不少于 250 us 时，保留原 deadline 和剩余 request，不把打断误判成完整 epoch。
+### 5.7 有界 steal
 
-当 dispatch 回调看到同一 Throughput prev 仍可运行，并且全局没有已分类排队任务、
-同 CPU 也没有 local、class、normal 或 urgent 工作时，可直接续接下一个 epoch：
+本 CPU 没有任务时才尝试 remote steal：
 
-- task 必须仍在同 CPU 且 affinity 允许；
-- task 必须是快路径 Throughput；
-- task 必须已关闭 OBSERVE；
-- control identity 和 class 必须仍有效；
-- 每次续接都更新 task/class vruntime，并向 root continuation 计费；
-- 上限始终是 max_slice_ns=64 ms。
-
-这条路径减少停止、重新入队、再次 dispatch 和上下文切换，但任何本地竞争都会立即阻止续跑。
-
-### 4.7 共享 Latency 调度与有界 steal
-
-每个 CPU 的 root EEVDF 都能看到共享 Latency backlog。选择 Latency 后按以下顺序搬运一个 task：
-
-1. 尝试兼容旧状态的本 CPU Latency class DSQ；
-2. 扫描共享队列头部最多 8 项，优先选择 home CPU 等于当前 CPU 且 affinity 允许的 task；
-3. 若当前 CPU 没有私有 Balanced/Throughput 积压，直接取共享队首以保持 work-conserving；
-4. 若已有私有工作，非 home fallback 每 `2 * latency_slice_ns` 最多一次（默认 500 us）。
-
-这个结构把 Latency 的跨核可执行性与 Balanced/Throughput 的缓存局部性分开控制。跨核 fallback 仍计入
-remote dispatch 统计，所有 move 成功后都更新精确 custom DSQ 总数。
-
-本 CPU 没有可运行 class 后才尝试 steal：
-
-- class_queued_tasks 为零时直接跳过扫描；
+- 全局 custom-DSQ 计数为零时直接跳过；
 - 每次最多扫描 8 个 source CPU；
-- 起点由每 CPU steal_cursor 轮转；
-- source 只有一个等待任务时，仅当它正在运行非 Latency 工作才允许搬运，避免移走唯一 Latency successor；
-- source 有多个等待任务或 offline 时允许搬运；
-- 每个 source 使用原子 steal_claim，避免多个 destination 同时搬运；
-- class 仍由 destination 的 root EEVDF 选择；
-- 一次 dispatch 最多搬运一个 task。
+- 起点由 per-CPU cursor 轮转；
+- source 使用原子 claim，避免多个 destination 同时搬运；
+- 一次 dispatch 最多搬运一个 task；
+- 离线 source 可直接搬运；空闲 source 在队列不超过 2 时保留本地工作；
+- 正在运行非 Latency 任务的 source 可借出后继任务。
 
-所有循环由常量或 num_possible_cpus 限界，满足 BPF verifier 和运行时上限。
+Latency overflow 头部最多扫描 8 项。所有 BPF 循环由常量或 `num_possible_cpus <= 1024` 限界。
 
-### 4.8 dispatch 顺序
+### 5.8 dispatch 总决策图
 
-adaptive_dispatch 的固定顺序是：
+```text
+adaptive_dispatch(cpu, prev)
+        │
+        ├─ urgent sentinel 已置位？
+        │       └─是─▶ 先移入一个 Latency task ─▶ return
+        │
+        ├─ specialized_tasks == 0？
+        │       └─是─▶ 直接搬本 CPU Balanced DSQ
+        │                    └─空─▶ 最多扫描 8 个 CPU steal ─▶ return
+        │
+        └─ mixed-class
+                │
+                ├─ per-CPU root EEVDF 选 class
+                │       ├─成功─▶ 搬一个 task ─▶ return
+                │       └─失败─▶ 排除该 class，最多重试三类
+                │
+                ├─ Locked Throughput prev 且全局无等待？
+                │       └─是─▶ 续接 8/16/32/64 ms epoch ─▶ return
+                │
+                └─ 最多扫描 8 个 CPU steal
+```
 
-1. 如有 usersched_needed，请求运行 Rust scheduler；
-2. 消费当前 CPU 的 BPF Latency urgent sentinel；
-3. 在最多 64 次 verifier-bounded 循环中消费 Rust command；
-4. 通过 root EEVDF 从共享 Latency DSQ 或当前 CPU 的 Balanced/Throughput class DSQ 取任务；
-5. 尝试无竞争 Throughput prev continuation；
-6. 仍无本地工作时执行一次有界 steal。
+## 6. Rust 控制面与行为观测
 
-## 5. Rust 慢路径
+```text
+BPF ringbuf
+   │
+   ├─ INIT / EXEC / EXIT ──▶ 稳定身份与 lifecycle notice
+   │
+   └─ ENQUEUE / RUNNING / STOP / CANCEL
+                    │
+                    ▼
+            BehaviorAccumulator
+                    │ 1 s snapshot
+                    ├─ 序列/时间完整 ─▶ Good window ─▶ Agent 可投票
+                    └─ 溢出/缺口/矛盾 ─▶ Bad window  ─▶ Agent 必须丢弃
+```
 
-慢路径服务于尚无有效 task_control 的短暂窗口，以及需要完整用户态策略的恢复场景。它不是已锁定
-任务的常规数据面。
+`SchedulerEngine` 只保存：
 
-### 5.1 task pool EEVDF
+- process default 和 task class/stage/generation；
+- TaskKey/ProcessKey 生命周期和反向索引；
+- 最近 enqueue/running 状态；
+- 每任务一秒行为累计窗口；
+- stale、capacity、bad-window 和 degraded 计数。
 
-三个 class 使用同一个 EevdfPool 实现，每个 pool 有：
+它不保存 runnable heap、root EEVDF、CPU placement、reservation、preemption budget 或 dispatch ID。
 
-- eligible deadline min-heap；
-- future vruntime min-heap；
-- oldest-wait min-heap；
-- lazy invalidation，用 identity、sequence、class、generation 和 run state 验证节点。
+Inherited/Semantic task 的每组采样包含 ENQUEUE、RUNNING、STOP/CANCEL。窗口输出 runtime、runnable
+wait、sleep、run burst、slice exhaustion、voluntary block、migration 和 previous-CPU hit。时间倒退、
+顺序冲突或 ring overflow 会把窗口标为 Bad，Agent 不用 Bad 窗口锁定分类。
 
-任务正常完成 request 后，使用 run burst EWMA 估算下一请求：
+INIT、EXEC 和 EXIT 使用强制 ring wakeup；高频行为事件不强制唤醒，Rust 最多每 1 ms poll 一次。
 
-~~~text
-estimate = first ? sample : (7 * old + sample) / 8
-Latency headroom = 2.0
-Balanced/Throughput headroom = 1.25
-~~~
+## 7. ABI v8 与 maps
 
-Rust 慢路径请求范围：
+`rust/bpf/intf.h` 是唯一二进制契约。结构变化必须提升 ABI version 并同步 static_assert、bindgen、
+Rust decoder、collector 和测试。
 
-| Class | 最小 | 最大 |
-| --- | ---: | ---: |
-| Latency | 250 us | 250 us |
-| Balanced | 500 us | 4 ms |
-| Throughput | 2 ms | 8 ms |
-
-在 slice 的 90% 前被打断时保留原 deadline 和剩余 service。
-
-### 5.2 pool 间 RootEevdf
-
-三个非空 task pool 是等权 root entity。Rust 创建 reservation 时立即把 planned runtime 计入 root，
-STOP 再以 actual runtime 对账。这样单次 refill 不会因为尚未收到 RUNNING/STOP 而把所有 CPU
-预留给同一 class。
-
-10/50/200 ms 的 class max-wait 是异常饥饿 watchdog，不是常规静态优先级。
-
-### 5.3 放置和慢路径抢占
-
-Rust 放置同时考虑：
-
-- live cached affinity，BPF 后续再次检查 cpus_ptr；
-- previous CPU、逐步稳定的 home CPU 和 home LLC；
-- CPU 当前 slice 的预计剩余时间；
-- SMT sibling 上的 class 和工作量；
-- class-specific migration hysteresis；
-- 每 CPU 一个 normal slot 和一个 urgent slot。
-
-Latency 预计超过 2 ms SLO 时，才可能在 root 选择之外申请 10% CPU-time service budget。
-真正的 urgent preemption 还受到独立 10% disruption budget、victim 最小运行 250 us、重复抢占
-guard 和 victim class 限制。Latency 永远不能抢占 Latency。
-
-### 5.4 BPF 最终校验
-
-Rust command 到达 dispatch callback 后，BPF逐项检查：
-
-- ABI version、struct size、dispatch_id 和 flag mask；
-- task/process cookie 与 exec generation；
-- task 必须仍是 PendingUser；
-- enqueue_sequence 与 class_generation；
-- dispatch 不能重复；
-- target CPU 范围、online 状态和实时 affinity；
-- migration-disabled task 不能跨 CPU；
-- slice 必须在 250 us..64 ms；
-- normal/urgent slot 必须原子 claim 成功。
-
-失败返回稳定 reject reason，Rust 取消 reservation；可重试的竞态重新入池。
-
-## 6. 生命周期与状态
-
-### 6.1 BPF task state
-
-| 值 | 状态 | 含义 |
-| ---: | --- | --- |
-| 0 | Blocked | 不可运行或已取消 |
-| 1 | PendingUser | 等待 Rust command |
-| 2 | Staged | Rust command 已插入 local DSQ |
-| 3 | Running | 正在 CPU 上运行 |
-| 4 | Exited | task 生命周期结束 |
-| 5 | PendingBpf | BPF class/local DSQ 拥有 runnable |
-
-### 6.2 Rust RunState
-
-| 状态 | 含义 |
-| --- | --- |
-| Blocked | 当前不可运行 |
-| Queued | Rust pool 拥有 runnable |
-| KernelQueued | BPF fast DSQ 拥有 runnable，Rust仅观测 |
-| KernelManaged | Locked task，runnable 生命周期完全由 BPF 管理 |
-| Reserved | Rust 已提交 command 并占用 slot |
-| Running | RUNNING 已确认 |
-| Exited | 清理中的终态 |
-
-### 6.3 关键 callback
-
-- init_task：分配稳定 process/task identity，非 safe task 发送 INIT；
-- sched_process_exec：递增 generation，清理快路径 request，恢复 Balanced 初始状态，发送 EXEC；
-- enqueue：safe/global、BPF fast、Rust slow 三选一；
-- running：释放匹配 slot，更新 CPU running_class 和 vruntime，按 OBSERVE 决定是否发事件；
-- stopping：记 actual runtime，保留被打断 request 或推进 Throughput epoch；
-- dequeue：除 CORE_SCHED_EXEC 外取消 request，避免错误清理 core-sched 切换；
-- exit_task：释放 slot、删除 task_control，最后一个线程退出时删除 process entry；
-- cpu_online/offline/update_idle：立即更新 cpu_state，按规则发布 CPU_STATE。
-
-## 7. 安全路径和故障语义
-
-### 7.1 safe task
-
-is_safe_task 只包含三类：
-
-~~~text
-PF_KTHREAD
-task.tgid == usersched_pid
-task.tgid == agent_pid
-~~~
-
-它们不查 task_control、不进入 class DSQ、不参与自定义 victim 选择。当当前 CPU 仍在线且
-符合 affinity 时，fallback 直接进入该 CPU 的 local DSQ；只有本地目标无效时才进入
-SCX_DSQ_GLOBAL。scheduler 自身在 usersched_needed 时仍由 dispatch callback 显式插入 GLOBAL，
-避免等待自己做出的用户态决策。
-
-### 7.2 heartbeat
-
-Rust 在 attach 前写入 heartbeat，主循环每轮刷新；批量处理事件时每 64 个事件额外刷新。fresh 条件：
-
-~~~text
-last != 0
-now >= last
-now - last <= 250 ms
-~~~
-
-已有有效 task_control 的快路径不依赖 Rust heartbeat。未分类慢路径发现 heartbeat stale 时：
-
-1. 当前 task 进入 GLOBAL；
-2. stale_heartbeat_fallbacks 加一；
-3. 只触发一次 scx_bpf_error，请求 sched_ext ejection。
-
-### 7.3 event overflow
-
-- 慢路径 ENQUEUE 无法写 event queue 时，当前 task 立即进入 GLOBAL；
-- 快路径观测事件写入失败时，调度继续，窗口被标记为不完整；
-- Rust 每秒检查 event_overflows；
-- 连续三个窗口发生 overflow 时受控 detach。
-
-### 7.4 其他 detach 条件
-
-- Agent 进程退出并超过 2 s grace；
-- Engine 达到不可维持的不变量或容量上限；
-- BPF/struct_ops 报告退出；
-- SIGINT/SIGTERM；
-- 持续事件丢失。
-
-detach 先停止主循环，再释放 struct_ops link 和 control socket。link 释放后由内核接管公平调度。
-
-## 8. ABI v6
-
-rust/bpf/intf.h 是 Rust 与 BPF 的唯一二进制契约。所有结构固定宽度、自然对齐，只允许通过提升
-ABI version 做兼容性变更。
+```text
+                       写者                 读者
+task_ctx_stor          BPF task callbacks       BPF
+process_ctx            BPF lifecycle            BPF
+task_events            BPF                      Rust ring consumer
+task_control           Rust control transaction BPF select/enqueue/continue
+class_state            BPF                      BPF task EEVDF
+cpu_state              BPF                      BPF root/idle/steal/preempt
+global_stats           each BPF CPU             Rust aggregate/Agent Tool
+```
 
 | 结构 | 大小 |
 | --- | ---: |
-| task_event | 96 bytes |
-| dispatch_command | 72 bytes |
+| task_event | 88 bytes |
 | task_control_value | 40 bytes |
-| adaptive_cpu_state | 112 bytes |
-| adaptive_global_stats | 224 bytes |
+| adaptive_cpu_state | 80 bytes |
+| adaptive_global_stats | 152 bytes |
 
-关键容量：
+Event kind 只有 INIT=1、EXEC=2、ENQUEUE=3、CANCEL=4、RUNNING=5、STOP=6、EXIT=7。
+Event flag 只有 RUNNABLE 和 WAKEUP。不存在 command queue、COMMAND_REJECT、CPU_STATE event 或 heartbeat map。
 
-| 常量 | 值 |
-| --- | ---: |
-| SCX_ADAPTIVE_ABI_VERSION | 6 |
-| SCX_ADAPTIVE_MAX_CPUS | 1024 |
-| event queue | 16384 |
-| command queue | 16384 |
-| max dispatch batch | 64 |
-
-### 8.1 event kind
-
-| Kind | 编号 |
-| --- | ---: |
-| INIT | 1 |
-| EXEC | 2 |
-| ENQUEUE | 3 |
-| CANCEL | 4 |
-| RUNNING | 5 |
-| STOP | 6 |
-| EXIT | 7 |
-| CPU_STATE | 8 |
-| COMMAND_REJECT | 9 |
-
-Event flags 包含 RUNNABLE、CPU_ONLINE、CPU_IDLE、WAKEUP、BPF_SCHEDULED。
-
-### 8.2 command reject reason
-
-| 编号 | 原因 |
-| ---: | --- |
-| 1 | TASK_GONE |
-| 2 | IDENTITY |
-| 3 | NOT_PENDING |
-| 4 | SEQUENCE |
-| 5 | CLASS_GENERATION |
-| 6 | CPU_OFFLINE |
-| 7 | AFFINITY |
-| 8 | TARGET_SLOT_BUSY |
-| 9 | SLICE |
-| 10 | DUPLICATE_DISPATCH |
-| 11 | MIGRATION_DISABLED |
-| 12 | FLAGS |
-
-## 9. BPF maps
-
-| Map | 类型 | 容量 | 用途 |
+| Map | 类型 | 容量/大小 | 用途 |
 | --- | --- | ---: | --- |
-| task_ctx_stor | TASK_STORAGE | task lifetime | BPF task 状态 |
-| process_ctx | HASH | 32768 | process cookie、exec generation、线程数 |
-| task_events | QUEUE | 16384 | BPF 到 Rust 生命周期/诊断 |
-| dispatch_commands | QUEUE | 16384 | Rust 到 BPF command |
-| task_control | HASH | 65536 | class、stage flags、generation |
+| task_ctx_stor | TASK_STORAGE | task lifetime | BPF 调度状态 |
+| process_ctx | HASH | 32,768 | process cookie/exec generation |
+| task_events | RINGBUF | 2 MiB | 生命周期与采样行为 |
+| task_control | HASH | 65,536 | class/generation/observe flags |
 | class_state | ARRAY | 3 | class global virtual time |
-| cpu_state | ARRAY | 1024 | slot、idle、root、steal 状态 |
-| heartbeat | ARRAY | 1 | Rust monotonic heartbeat |
-| global_stats | PERCPU_ARRAY | 每 CPU 1 项 | 无共享 cache-line 的数据面统计 |
+| cpu_state | ARRAY | 1,024 | idle/root/steal/urgent 状态 |
+| global_stats | PERCPU_ARRAY | 每 CPU 1 项 | 无共享写竞争诊断 |
 
-Rust 读取 global_stats 时对计数器做 saturating sum，对 max_normal_staged_depth 取最大值。
-
-## 10. 默认配置
-
-配置在打开 BPF object 前校验，attach 后不可变。
+## 8. 默认配置
 
 | 配置 | 默认值 |
 | --- | ---: |
@@ -542,203 +433,117 @@ Rust 读取 global_stats 时对计数器做 saturating sum，对 max_normal_stag
 | throughput_slice_ns | 8,000,000 |
 | min_slice_ns | 250,000 |
 | max_slice_ns | 64,000,000 |
-| dispatch_batch_limit | 64 |
-| placement_scan_limit | 8 |
 | preemption_min_runtime_ns | 250,000 |
-| latency_target_ns | 2,000,000 |
 | latency_guarantee_percent | 10 |
 | preemption_budget_percent | 10 |
-| heartbeat_timeout | 250 ms |
 | poll_interval | 1 ms |
-| latency_max_wait_ns | 10,000,000 |
-| balanced_max_wait_ns | 50,000,000 |
-| throughput_max_wait_ns | 200,000,000 |
 | max_tasks | 65,536 |
-| max_pool_nodes | 524,288 |
-| max_reservations | 4,096 |
 | control_queue_capacity | 1,024 |
-| max_control_frame_bytes | 1,048,576 |
+| max_control_frame_bytes | 1 MiB |
 | max_snapshot_items | 256 |
 | response_cache_capacity | 4,096 |
 | agent_exit_grace | 2 s |
 
-BPF 内部额外常量：
+BPF 内部扫描上限为 8 个 source CPU 和 8 个 Latency task；struct_ops dispatch batch 上限为 64。
 
-| 常量 | 值 |
-| --- | ---: |
-| FAST_STEAL_SCAN_LIMIT | 8 CPUs |
-| FAST_LATENCY_SCAN_LIMIT | 8 tasks |
-| FAST_EVENT_SAMPLE_INTERVAL_NS | 4,000,000 |
-| CPU_STATE_EVENT_INTERVAL_NS | 1,000,000 |
-| FAST_CLASS_DSQ_BASE | 0x10000 |
+## 9. 诊断指标
 
-struct_ops flags 为 SCX_OPS_ENQ_LAST 与 SCX_OPS_KEEP_BUILTIN_IDLE。
+Rust 控制面：
 
-## 11. Agent 控制协议
+- `events_processed`、`stale_events`；
+- `task_capacity_hits`、`bad_behavior_windows`、`degraded_transitions`。
 
-控制 socket 默认是 /run/scx_adaptive.sock。协议版本为 1，使用 4-byte network-order 长度前缀加
-JSON envelope。control thread 只负责 framing、校验和有界转发，SchedulerEngine 仍由 main thread
-单 owner。
+BPF 数据面：
 
-请求类型：
+- `fast_path_enqueues`、`fast_path_dispatches` 和按 class dispatch；
+- local、remote steal、claim conflict、empty-steal skip；
+- direct dispatch、Throughput continuation；
+- Latency preemption、throttle、backlog boost；
+- event overflow、fallback、dispatch failure、suppressed events。
 
-- Hello；
-- RegistrySnapshotBatch；
-- SetProcessDefault；
-- SetTaskProvisional；
-- LockTaskClass；
-- GetSnapshot。
+`fallback_dispatches` 包含保护路径，不能单独视为故障。正式 run 必须要求 event overflow、capacity hit
+和 degraded transition 为零，并结合 sched_ext admission 观测确认普通任务为 1、受保护角色为 0。
 
-每次 scheduler 启动生成非零 scheduler_epoch。除 Hello 外，请求必须匹配 epoch。Hello 后先按稳定
-顺序 replay live process/task，再发送 LifecycleReplayComplete。Registry snapshot 必须从 batch 0
-开始、batch 连续且 snapshot_id 非零。
+## 10. 当前性能证据
 
-成功响应按 request_id 缓存在有界 response cache 中。相同 request_id 与相同 payload 重放原响应；
-相同 request_id 携带不同 payload 返回 request_id_collision。
-
-## 12. 性能优化对应关系
-
-| 优化 | 主要收益 | 保护条件 |
-| --- | --- | --- |
-| Latency idle direct dispatch | 减少 wakeup 到 local DSQ 的路径长度 | 原子 idle claim 且 CPU 无本地积压 |
-| 已分类 BPF fast path | 移除每次运行的 Rust round trip | 完整 task_control identity/generation |
-| 行为事件采样/Locked 抑制 | 降低 queue、usersched 和 JSON 观测开销 | 未锁定 task 每 4 ms 至多一组；Locked 仅保留生命周期事件 |
-| CPU_STATE 1 ms 合并 | 减少 idle churn | map 状态立即更新，hotplug/必要唤醒不合并 |
-| Throughput 8..64 ms epoch | 降低切换与重新入队开销 | 全局无分类排队竞争、上限 64 ms、阻塞即复位 |
-| prev continuation | 避免完整 dispatch cycle | Locked Throughput 且全局/本地均无其他工作 |
-| fallback 本地化 | 降低未分类与 safe task 的迁移/控制面开销 | CPU 在线且 affinity 允许，否则 GLOBAL |
-| 快路径抢占限流 | 避免短 victim 和连续 IPI 抖动 | victim >=250 us，每 CPU 间隔 >=2.5 ms |
-| 有界 rotating steal | 改善负载不均 | 8 CPU 上限、source claim、保留 source 工作 |
-| PERCPU stats | 消除全局统计 cache-line 竞争 | Rust 聚合并饱和计数 |
-| 单次 stats lookup 记 enqueue | 缩短热路径 | 仅合并相同生命周期的计数 |
-| 条件 kick | 避免无效 IPI | direct 不 kick；仅 urgent/非运行任务 kick |
-
-## 13. 诊断指标
-
-GetSnapshot 同时返回 Rust SchedulerStats 和聚合后的 BPF DataPlaneStats。性能路径重点观察：
-
-- fast_path_enqueues；
-- fast_path_dispatches 与 fast_path_dispatches_by_class；
-- fast_path_direct_dispatches；
-- fast_path_prev_continuations；
-- fast_path_empty_steal_skips；
-- fast_path_steal_attempts、remote_steals、claim_conflicts；
-- fast_path_dispatch_failures；
-- fast_path_events_suppressed；
-- cpu_state_events_suppressed；
-- fast_path_preemptions；
-- fast_path_preemption_throttles；
-- fallback_dispatches、stale_heartbeat_fallbacks、event_overflows；
-- commands_rejected 与 identity/slot reject。
-
-fallback_dispatches 包含 PF_KTHREAD、Agent、scheduler 等预期 safe-task 插入，不能单独视为
-故障；它可能进入 local 或 GLOBAL DSQ。liveness 应结合 stale_heartbeat_fallbacks、
-event_overflows 和 detach 状态判断。
-
-出现以下组合时需要停止调参并先排查正确性：
-
-- event_overflows 持续增加；
-- stale_heartbeat_fallbacks 在稳定运行时增加；
-- identity_rejects 非零且增长；
-- fast_path_dispatch_failures 与 dispatches 同量级；
-- Latency victim 发生自抢占；
-- max_normal_staged_depth 超过 1；
-- 分类覆盖率或 generation 应用率不是 100%。
-
-## 14. 当前性能证据与验收规则
-
-2026-07-26 的分类里程碑使用 Guest 独占 3 个物理核、6 个 SMT 线程，每个 run 预热 20 s、测量 60 s。Latency、Throughput 和 Mix 各执行一次 Native/Agent 配对，这些数据用于分类验收和调度器下一轮定位，不构成正式置信区间。
+2026-07-27 最近一次有效 Balanced 单轮基线：
 
 | 场景 | Native | Agent | Agent 相对 Native |
 | --- | ---: | ---: | ---: |
-| latency P99 | 2,331.099 us | 1,905.623 us | +18.25% |
-| throughput | 681.611 units/s | 615.187 units/s | -9.75% |
-| mix P99 | 7,846.650 us | 13,946.100 us | -77.73% |
-| mix throughput | 13.226 units/s | 11.781 units/s | -10.92% |
+| balanced | 38,189.196 units/s | 35,445.303 units/s | -7.18% |
 
-分类报告目录为 `20260726-123923-141354`、`20260726-124803-054361` 和 `20260726-123509-125295`。Throughput 曾有一次测量窗口延长到 66.018 s 的无效 run，原样复跑后有效，但仍作为调度饥饿风险保留。
+该单轮结果已覆盖当前控制面瘦身、partial admission 和 BPF verifier 修复，只证明仍有 Balanced 差距，
+不构成正式统计结论。随后把全局队列计数改为 per-CPU 计数的候选得到 Native 38,368.251、Agent
+35,291.914（-8.02%），IPC、cache miss 和控制面 CPU 均未改善，因此已完整撤销。旧 Latency、
+Throughput、Mix 结果来自更早算法，不能代表当前源码。
 
-- Mix 进程/线程、9/9 根任务和运行时加权准确率均为 100%；
-- Throughput 进程/线程、6/6 根任务和运行时加权准确率均为 100%；
-- Latency 的 5/5 根任务、已解析、活跃与运行时加权准确率均为 100%；总体统计中未解析的是快照前已退出的零运行时后台子进程。
-- 当前主要差距已从分类转移到 Scheduler：优先定位 Mix 尾延迟和通用 Throughput 公平性/利用率。
+候选保留门槛：
 
-分类 snapshot 是测量期内的时点观测，可能早于异步 LLM 批次提交；因此必须与最终 class
-dispatch 计数、Locked 行为纠错和 scheduler log 一起解读，不能把早期 snapshot 当成全程分类。
+1. verifier/load、安全 admission、Agent detach 全部通过；
+2. Native/Agent 同 repeat 配对且两边 run 均有效；
+3. Balanced 单轮先明显改善当前保留实现的 -7.18% 差距，再用三轮置信区间确认；
+4. Latency、Throughput 和 Mix 必须重新测试，不能用 Balanced 结果外推；
+5. event overflow、capacity、degraded、分类覆盖和 generation 应用无回归；
+6. 任何应用名称都不能进入 scheduler policy。
 
-后续候选必须继续运行默认三轮 paired campaign，并同时满足：
+最终目标是多场景、多 CPU 拓扑上的统计改善，不承诺任意硬件和负载必然优于内核。
 
-1. 所有 Native/Agent paired run 有效；
-2. 根任务、已解析、活跃与运行时加权分类正确率为 100%，generation 应用率为 100%；
-3. latency P99 相对优化前实现有正向中位改善；
-4. throughput ops/s 相对优化前实现有正向中位改善；
-5. mix P99 不出现统计显著退化；
-6. deadline miss、event overflow、fallback 和 reject 无正确性回归；
-7. verifier smoke、Rust 测试、Python benchmark 测试全部通过。
-
-性能是硬件、内核、负载和分类共同作用的结果，因此代码不能诚实地“保证任意环境必然提升”。
-本项目用相同镜像、独占 CPU、paired 顺序、重复实验和置信区间把提升变成可验证的验收条件。
-
-## 15. 构建、校验与基准
-
-在仓库根目录执行：
-
-~~~bash
-cargo fmt --manifest-path scheduler/rust/Cargo.toml --all -- --check
-cargo build --manifest-path scheduler/rust/Cargo.toml --release --locked
-cargo clippy --manifest-path scheduler/rust/Cargo.toml --all-targets --locked -- -D warnings
-cargo test --manifest-path scheduler/rust/Cargo.toml --locked
-scheduler/rust/target/release/scx_adaptive --validate-only
-python3 -m unittest discover -s test/tests -v
-~~~
-
-单轮迭代：
-
-~~~bash
-python3 test/scripts/benchmark.py --single-round
-~~~
-
-正式三轮：
-
-~~~bash
-python3 test/scripts/benchmark.py
-~~~
-
-报告必须同时检查 report.md、preflight.json、每个 run 的 benchmark-summary.json 和
-scheduler-snapshot.json。外部分类服务失败导致的错误 class 不能用于判断调度器性能。
-
-## 16. 源码导航
+## 11. 源码导航
 
 | 文件 | 职责 |
 | --- | --- |
-| rust/bpf/intf.h | ABI v6、event/command/control/stats |
-| rust/bpf/scx_adaptive.bpf.c | callbacks、快路径 EEVDF、steal、fallback |
-| rust/src/main.rs | attach、主循环、事务协调、detach |
-| rust/src/bpf.rs | skeleton、map/queue I/O、PERCPU stats 聚合 |
-| rust/src/wire.rs | ABI 解码、reject、command 序列化 |
-| rust/src/engine.rs | 生命周期、慢路径 refill、reservation、rollback |
-| rust/src/eevdf.rs | root EEVDF 和 lag 算术 |
-| rust/src/pool/mod.rs | 三个共享实现的 task EEVDF pool |
-| rust/src/placement.rs | topology/SMT/locality 放置 |
-| rust/src/admission.rs | Latency service 与 preemption token budget |
-| rust/src/process.rs | class cache、stage、generation |
+| rust/bpf/intf.h | ABI v8 event/control/stats |
+| rust/bpf/scx_adaptive.bpf.c | 唯一调度数据面 |
+| rust/src/main.rs | attach、控制事务、主循环、detach |
+| rust/src/bpf.rs | skeleton、map/ring I/O、PERCPU 聚合 |
+| rust/src/wire.rs | event 解码和 task_control 转换 |
+| rust/src/engine.rs | 身份、分类 cache、行为窗口 |
+| rust/src/process.rs | class stage/generation |
 | rust/src/control.rs | 有界 Unix socket 协议 |
-| rust/src/topology.rs | CPU/core/LLC 发现和 affinity |
-| rust/src/stats.rs | Rust 决策计数与行为窗口 |
+| rust/src/topology.rs | possible/online CPU |
+| rust/src/stats.rs | 控制面计数与行为结构 |
+| rust/build.rs | scx_cargo 构建、BPF skeleton 和 bindgen 生成入口 |
+| rust/tools/bpf-clang | 有界选择 Clang 20..16 的本地构建包装器 |
 
-scheduler/scx 是锁定的上游 sched_ext 构建与兼容依赖，不承载本项目调度策略。
+sched_ext 构建和加载兼容层来自 `Cargo.lock` 精确校验的官方
+`scx_cargo`、`scx_utils` crate，不提供或承载本项目调度策略。
 
-## 17. 修改时必须保持的不变量
+## 12. 必须保持的不变量
 
-1. safe task 判定和 usersched 显式 GLOBAL 逃生路径不能因性能调参被旁路。
-2. Latency victim 只能是 Balanced 或 Throughput。
-3. direct dispatch 必须先成功 claim idle CPU，并确认没有本地工作。
-4. Throughput epoch/continuation 必须在存在任何全局已分类排队竞争时停止增长。
-5. 所有 slice 必须位于 250 us..64 ms。
-6. 所有 BPF 扫描、repeat 和 map 容量必须有静态上界。
-7. normal/urgent lane 每 CPU 各最多一个 reservation。
-8. class 变化必须保留有界 lag，不能清零服务历史。
-9. interrupted request 必须保留剩余 service 和原 deadline。
-10. 控制更新必须 BPF-first，并具备 Rust 失败回滚。
-11. ABI 结构变化必须同步 version、static_assert、Rust bindgen 使用方、collector 和测试。
-12. 任何性能结论必须区分单轮迭代结果与正式重复实验。
+1. 只有明确准入的普通 SCHED_OTHER task 进入 sched_ext。
+2. PID 1、kernel、Agent、scheduler 和 RT/DL task 保持原生。
+3. control 缺失或失配必须立即落到 Balanced，不等待 Rust。
+4. Latency victim 只能是 Balanced 或 Throughput。
+5. Throughput continuation 必须在出现竞争时停止。
+6. 所有 slice 保持在 250 us..64 ms。
+7. class 变化保留有界 lag，不能清零服务历史。
+8. 所有 BPF 扫描和 map 都有静态上界。
+9. 控制更新必须 BPF-first 且可回滚。
+10. Bad 行为窗口不能用于锁定分类。
+11. ABI 变化必须同步所有生成物、消费者和测试。
+12. 单轮结果只能筛选候选，正式结论必须使用重复配对与置信区间。
+
+## 13. 构建与基准
+
+以 `scheduler/rust` 为工作目录：
+
+~~~bash
+cargo fmt --all -- --check
+cargo clippy --all-targets --locked -- -D warnings
+cargo test --all-targets --locked
+cargo build --release --locked
+target/release/scx_adaptive --validate-only
+~~~
+
+以仓库根目录为工作目录：
+
+~~~bash
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s test/tests -v
+python3 test/scripts/benchmark.py all --dry-run
+~~~
+
+~~~bash
+python3 test/scripts/benchmark.py balanced --single-round
+python3 test/scripts/benchmark.py balanced
+python3 test/scripts/benchmark.py all
+~~~

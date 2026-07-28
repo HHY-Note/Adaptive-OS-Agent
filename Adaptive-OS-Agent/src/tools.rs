@@ -382,7 +382,6 @@ fn scheduler_health(snapshot: Option<&Value>) -> Result<Value, String> {
         "control_messages_dropped": snapshot.get("control_messages_dropped"),
         "event_overflows": snapshot.pointer("/data_plane/event_overflows"),
         "fallback_dispatches": snapshot.pointer("/data_plane/fallback_dispatches"),
-        "stale_heartbeat_fallbacks": snapshot.pointer("/data_plane/stale_heartbeat_fallbacks"),
     }))
 }
 
@@ -392,8 +391,6 @@ fn scheduler_stats(snapshot: Option<&Value>) -> Result<Value, String> {
         "scheduler_epoch": snapshot.get("scheduler_epoch"),
         "cpu_count": snapshot.get("cpu_count"),
         "tasks": snapshot.get("tasks"),
-        "pool_nodes": snapshot.get("pool_nodes"),
-        "reservations": snapshot.get("reservations"),
         "scheduler": snapshot.get("scheduler"),
         "data_plane": snapshot.get("data_plane"),
     }))

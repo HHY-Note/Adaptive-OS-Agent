@@ -78,10 +78,6 @@ def main(argv: list[str] | None = None) -> int:
             )
             for repeat, scenario, variant in schedule
         ]
-        if args.template_image is not None:
-            template_image = str(args.template_image.expanduser().resolve())
-            for spec in specs:
-                spec.libvirt["template_image"] = template_image
     except ConfigError as exc:
         print(f"config error: {exc}", file=sys.stderr)
         return 2
@@ -95,7 +91,7 @@ def main(argv: list[str] | None = None) -> int:
     if not preflight.ok:
         return 1
 
-    campaign_dir = args.output or _default_output()
+    campaign_dir = _default_output()
     try:
         campaign_dir.mkdir(parents=True, exist_ok=False)
         (campaign_dir / "runs").mkdir()
@@ -155,12 +151,6 @@ def _parser() -> argparse.ArgumentParser:
         choices=(*SCENARIOS, "all"),
         default="all",
         help="只运行一种镜像内真实应用负载；默认 all",
-    )
-    parser.add_argument("--output", type=Path)
-    parser.add_argument(
-        "--template-image",
-        type=Path,
-        help="override the configured VM image for this controlled campaign",
     )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--analyze-only", type=Path)

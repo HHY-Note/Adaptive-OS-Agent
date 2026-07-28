@@ -1,106 +1,107 @@
 # scx_adaptive Scheduler
 
-本目录实现项目自研的 sched_ext scheduler。Agent 只提交 Latency、Balanced、Throughput 分类和
-generation；scheduler 负责内核调度、故障回退和诊断。
+`scx_adaptive` 是项目自研的单一 sched_ext scheduler。Agent 负责识别
+Latency、Balanced、Throughput 及其 generation；BPF 是普通任务唯一的调度数据面；Rust 只维护
+分类事务、稳定身份、行为观测、诊断与可恢复生命周期。
 
-当前实现采用双路径：
+```text
+ordinary SCHED_OTHER task                 Agent class/stage/generation
+          │                                         │
+          ▼                                         ▼
+ Agent partial admission                 Rust BPF-first transaction
+          │                                         │
+          ▼                                         ▼
+ ┌────────────────────────────────────────────────────────────┐
+ │ BPF: task_control lookup ─▶ select_cpu ─▶ per-CPU class DSQ│
+ │      │                                    │                │
+ │      └─ missing/mismatch ─▶ Balanced      └─ root EEVDF    │
+ └───────────────────────────────────────────────┬────────────┘
+                                                 ▼
+                                           local DSQ / CPU
+```
 
-~~~text
-有效 task_control
-      |
-      v
-BPF 快路径
-  per-CPU/class virtual-deadline DSQ
-  per-CPU root EEVDF
-  latency direct dispatch / bounded preemption
-  throughput bounded epoch / continuation
-  bounded rotating steal
+Rust 不选择 CPU、不保存 runnable queue，也不产生 dispatch 命令。
 
-control 缺失或 generation 失配
-      |
-      v
-Rust 慢路径
-  task EEVDF -> root EEVDF -> topology placement
-  reservation -> BPF final validation
-~~~
-
-完整算法、状态、ABI 和安全不变量见 [Design.md](Design.md)。
+完整算法、ABI、安全边界和验收规则见 [Design.md](Design.md)。
 
 ## 性能路径
 
-- 已分类任务在 BPF 中直接调度，不为每个 runnable 周期等待 Rust；
-- Latency 优先原子取得空闲 CPU，无本地积压时直接进入 local DSQ；
-- Throughput 从 8 ms 开始，在无竞争时按 8/16/32/64 ms 有界增长；
-- Locked task 关闭逐任务观测事件，CPU_STATE 事件最多每 1 ms 发布一次；
-- global_stats 使用 PERCPU_ARRAY，Rust 读取时聚合；
-- 本地无任务时最多扫描 8 个 source CPU，并用 source claim 串行化 steal。
-
-任何本地竞争都会终止 Throughput continuation。Latency 只允许抢占 Balanced/Throughput，
-不允许抢占 Latency。
+- task_control 缺失或失配时默认使用 Balanced，任务不等待用户态；
+- 每个 possible CPU 各有 Latency/Balanced/Throughput 三条 DSQ，不是三条全局任务队列；
+- Balanced-only 运行时跳过三类 root 选择，直接消费本 CPU Balanced DSQ；
+- Latency 优先取得空闲 CPU，必要时按最小运行时间和速率限制抢占非 Latency；
+- Throughput 从 8 ms 开始，无竞争时有界增长到 64 ms；
+- 本 CPU 无任务时最多扫描 8 个 source CPU；
+- Inherited/Semantic 行为事件采样，Locked 任务关闭调度事件；
+- global_stats 使用 PERCPU_ARRAY，避免热路径共享统计 cache line。
 
 ## 安全边界
 
-以下任务不进入自定义 class、放置或抢占逻辑：
+调度器使用 `SCX_OPS_SWITCH_PARTIAL`。Agent 只把普通 `SCHED_OTHER` 任务显式切换到
+`SCHED_EXT`，以下任务保持 Linux 原生调度：
 
-- PF_KTHREAD；
-- scheduler 所在 TGID；
-- Agent 所在 TGID。
+- PID 1；
+- `PF_KTHREAD`；
+- Agent；
+- scheduler；
+- RT/DL 或其他非 `SCHED_OTHER` 任务。
 
-它们直接进入 sched_ext GLOBAL DSQ。GLOBAL 不等同于 CFS，但不执行本项目的 class policy。
-Linux RT/DL 调度类仍由内核原生高优先级调度类处理。
-
-未分类慢路径的 heartbeat 超过 250 ms 时，当前任务进入 GLOBAL，并触发一次受控 sched_ext
-ejection。event overflow、容量不变量失败、Agent 退出或进程信号也会导致受控 detach。
+BPF 在 `init_task` 和每次 enqueue 中重复检查 PID 1、内核线程、Agent 和 scheduler，作为第二道
+保护。Agent 退出、持续事件溢出、身份容量耗尽、BPF 错误或进程信号都会触发受控 detach。
 
 ## 目录
 
 ~~~text
 scheduler/
-├── Design.md                     当前实现的完整设计
-├── README.md                     本页
-├── versions.lock                 上游依赖版本锁
-├── rust/
-│   ├── bpf/
-│   │   ├── intf.h                ABI v6
-│   │   └── scx_adaptive.bpf.c    callbacks 与 BPF 快路径
-│   ├── src/
-│   │   ├── main.rs               attach、主循环、控制事务
-│   │   ├── engine.rs             生命周期与 Rust 慢路径
-│   │   ├── eevdf.rs              root EEVDF
-│   │   ├── pool/mod.rs           task EEVDF pools
-│   │   ├── placement.rs          topology/SMT 放置
-│   │   ├── admission.rs          SLO 与抢占预算
-│   │   ├── bpf.rs                skeleton、maps、stats 聚合
-│   │   ├── wire.rs               ABI 转换
-│   │   ├── process.rs            class stage/generation
-│   │   ├── control.rs            Agent socket
-│   │   └── stats.rs              诊断与行为窗口
-│   └── README.md
-└── scx/                           锁定的上游兼容依赖
+|-- Design.md
+|-- README.md
+|-- versions.lock
+`-- rust/
+    |-- .cargo/config.toml        scheduler BPF 编译器配置
+    |-- bpf/
+    |   |-- intf.h                 ABI v8
+    |   `-- scx_adaptive.bpf.c     唯一调度数据面
+    |-- src/
+    |   |-- main.rs                attach、控制事务、detach
+    |   |-- engine.rs              身份、分类缓存、行为观测
+    |   |-- bpf.rs                 skeleton、maps、stats
+    |   |-- wire.rs                event/control ABI
+    |   |-- process.rs             class stage/generation
+    |   |-- control.rs             Agent socket
+    |   |-- topology.rs            possible/online CPU
+    |   `-- stats.rs               诊断与行为窗口
+    |-- tools/bpf-clang            选择 Clang 20..16
+    `-- README.md
 ~~~
 
-scheduler/scx 不承载本项目调度策略。
+sched_ext 构建和加载兼容层使用 `Cargo.lock` 精确校验的官方
+`scx_cargo`、`scx_utils` crate；项目目录不包含上游 scheduler 源码。
+
+正式目标是 openEuler 24.03 LTS-SP4 x86_64 的 `6.6.0-scx` 内核，锁定工具链为
+Clang/LLVM 17 和 Rust 1.96。完整版本与镜像哈希见 [`versions.lock`](versions.lock)。
 
 ## 构建与检查
 
-在仓库根目录执行：
+在 `scheduler/rust` 目录执行 scheduler 检查：
 
 ~~~bash
-cargo fmt --manifest-path scheduler/rust/Cargo.toml --all -- --check
-cargo build --manifest-path scheduler/rust/Cargo.toml --release --locked
-cargo clippy --manifest-path scheduler/rust/Cargo.toml --all-targets --locked -- -D warnings
-cargo test --manifest-path scheduler/rust/Cargo.toml --locked
-scheduler/rust/target/release/scx_adaptive --validate-only
-python3 -m unittest discover -s test/tests -v
+cargo fmt --all -- --check
+cargo clippy --all-targets --locked -- -D warnings
+cargo test --all-targets --locked
+cargo build --release --locked
+target/release/scx_adaptive --validate-only
 ~~~
 
-基准入口：
+回到仓库根目录检查测试编排：
 
 ~~~bash
-python3 test/scripts/benchmark.py --single-round
-python3 test/scripts/benchmark.py
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s test/tests -v
+python3 test/scripts/benchmark.py all --dry-run
 ~~~
 
-单轮用于迭代，默认三轮 paired campaign 才用于正式结论。测试说明见
-[test/README.md](../test/README.md)，Agent 说明见
-[Adaptive-OS-Agent/README.md](../Adaptive-OS-Agent/README.md)。
+单轮配对只用于迭代，正式结论必须使用三轮 campaign：
+
+~~~bash
+python3 test/scripts/benchmark.py balanced --single-round
+python3 test/scripts/benchmark.py balanced
+~~~

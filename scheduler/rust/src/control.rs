@@ -154,12 +154,8 @@ pub struct ControlSnapshot {
     pub data_plane: DataPlaneStats,
     /// Number of possible CPUs represented by the engine.
     pub cpu_count: usize,
-    /// Number of submitted or running reservations.
-    pub reservations: usize,
     /// Number of live scheduler task records.
     pub tasks: usize,
-    /// Current number of primary and wait-index pool nodes.
-    pub pool_nodes: usize,
 }
 
 impl Serialize for DataPlaneStats {
@@ -171,14 +167,6 @@ impl Serialize for DataPlaneStats {
         struct Fields {
             event_overflows: u64,
             fallback_dispatches: u64,
-            commands_accepted: u64,
-            commands_rejected: u64,
-            target_slot_busy_rejects: u64,
-            pipeline_hits: u64,
-            pipeline_misses: u64,
-            max_normal_staged_depth: u64,
-            stale_heartbeat_fallbacks: u64,
-            identity_rejects: u64,
             fast_path_enqueues: u64,
             fast_path_dispatches: u64,
             fast_path_dispatch_failures: u64,
@@ -191,7 +179,6 @@ impl Serialize for DataPlaneStats {
             fast_path_direct_dispatches: u64,
             fast_path_prev_continuations: u64,
             fast_path_steal_claim_conflicts: u64,
-            cpu_state_events_suppressed: u64,
             fast_path_empty_steal_skips: u64,
             fast_path_preemption_throttles: u64,
             fast_path_latency_backlog_boosts: u64,
@@ -200,14 +187,6 @@ impl Serialize for DataPlaneStats {
         Fields {
             event_overflows: self.event_overflows,
             fallback_dispatches: self.fallback_dispatches,
-            commands_accepted: self.commands_accepted,
-            commands_rejected: self.commands_rejected,
-            target_slot_busy_rejects: self.target_slot_busy_rejects,
-            pipeline_hits: self.pipeline_hits,
-            pipeline_misses: self.pipeline_misses,
-            max_normal_staged_depth: self.max_normal_staged_depth,
-            stale_heartbeat_fallbacks: self.stale_heartbeat_fallbacks,
-            identity_rejects: self.identity_rejects,
             fast_path_enqueues: self.fast_path_enqueues,
             fast_path_dispatches: self.fast_path_dispatches,
             fast_path_dispatch_failures: self.fast_path_dispatch_failures,
@@ -220,7 +199,6 @@ impl Serialize for DataPlaneStats {
             fast_path_direct_dispatches: self.fast_path_direct_dispatches,
             fast_path_prev_continuations: self.fast_path_prev_continuations,
             fast_path_steal_claim_conflicts: self.fast_path_steal_claim_conflicts,
-            cpu_state_events_suppressed: self.cpu_state_events_suppressed,
             fast_path_empty_steal_skips: self.fast_path_empty_steal_skips,
             fast_path_preemption_throttles: self.fast_path_preemption_throttles,
             fast_path_latency_backlog_boosts: self.fast_path_latency_backlog_boosts,

@@ -15,20 +15,16 @@ pub enum EventKind {
     Init,
     /// Existing process lifetime entered a new exec generation.
     Exec,
-    /// New runnable incarnation waiting in a Rust pool.
+    /// New runnable incarnation waiting in a BPF-owned queue.
     Enqueue,
     /// Runnable incarnation was dequeued or cancelled.
     Cancel,
-    /// Staged task actually began on a CPU.
+    /// A BPF-selected task actually began on a CPU.
     Running,
     /// Running task stopped and reports actual service.
     Stop,
     /// Task lifetime exited.
     Exit,
-    /// CPU idle or hotplug state changed.
-    CpuState,
-    /// BPF rejected a stale or invalid dispatch command.
-    CommandReject,
 }
 
 impl TryFrom<u16> for EventKind {
@@ -44,95 +40,8 @@ impl TryFrom<u16> for EventKind {
             bpf_intf::SCX_ADAPTIVE_EVENT_RUNNING => Ok(Self::Running),
             bpf_intf::SCX_ADAPTIVE_EVENT_STOP => Ok(Self::Stop),
             bpf_intf::SCX_ADAPTIVE_EVENT_EXIT => Ok(Self::Exit),
-            bpf_intf::SCX_ADAPTIVE_EVENT_CPU_STATE => Ok(Self::CpuState),
-            bpf_intf::SCX_ADAPTIVE_EVENT_COMMAND_REJECT => Ok(Self::CommandReject),
             _ => Err(WireError::UnknownEventKind(value)),
         }
-    }
-}
-
-/// Stable BPF command-rejection reason.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RejectReason {
-    /// Task exited before BPF consumed its command.
-    TaskGone,
-    /// Task/process cookies or exec generation did not match.
-    Identity,
-    /// Task was no longer waiting for a userspace decision.
-    NotPending,
-    /// Runnable enqueue sequence changed.
-    Sequence,
-    /// Agent class generation changed.
-    ClassGeneration,
-    /// Target CPU was absent or offline.
-    CpuOffline,
-    /// Target CPU was no longer in the live affinity mask.
-    Affinity,
-    /// Another dispatch callback atomically claimed the selected CPU lane.
-    TargetSlotBusy,
-    /// Planned slice fell outside loader bounds.
-    Slice,
-    /// Runnable incarnation already consumed another dispatch ID.
-    DuplicateDispatch,
-    /// Task temporarily cannot move away from its current CPU.
-    MigrationDisabled,
-    /// Dispatch command contained an unsupported flag bit.
-    Flags,
-    /// Future BPF reason not known to this userspace binary.
-    Unknown(u32),
-}
-
-impl From<u64> for RejectReason {
-    /// Decodes the rejection code carried in `task_event.flags`.
-    fn from(value: u64) -> Self {
-        match value as u32 {
-            bpf_intf::SCX_ADAPTIVE_REJECT_TASK_GONE => Self::TaskGone,
-            bpf_intf::SCX_ADAPTIVE_REJECT_IDENTITY => Self::Identity,
-            bpf_intf::SCX_ADAPTIVE_REJECT_NOT_PENDING => Self::NotPending,
-            bpf_intf::SCX_ADAPTIVE_REJECT_SEQUENCE => Self::Sequence,
-            bpf_intf::SCX_ADAPTIVE_REJECT_CLASS_GENERATION => Self::ClassGeneration,
-            bpf_intf::SCX_ADAPTIVE_REJECT_CPU_OFFLINE => Self::CpuOffline,
-            bpf_intf::SCX_ADAPTIVE_REJECT_AFFINITY => Self::Affinity,
-            bpf_intf::SCX_ADAPTIVE_REJECT_TARGET_SLOT_BUSY => Self::TargetSlotBusy,
-            bpf_intf::SCX_ADAPTIVE_REJECT_SLICE => Self::Slice,
-            bpf_intf::SCX_ADAPTIVE_REJECT_DUPLICATE_DISPATCH => Self::DuplicateDispatch,
-            bpf_intf::SCX_ADAPTIVE_REJECT_MIGRATION_DISABLED => Self::MigrationDisabled,
-            bpf_intf::SCX_ADAPTIVE_REJECT_FLAGS => Self::Flags,
-            unknown => Self::Unknown(unknown),
-        }
-    }
-}
-
-impl RejectReason {
-    /// Returns the stable BPF reason code, with unknown values folded into zero.
-    pub const fn counter_index(self) -> usize {
-        match self {
-            Self::TaskGone => bpf_intf::SCX_ADAPTIVE_REJECT_TASK_GONE as usize,
-            Self::Identity => bpf_intf::SCX_ADAPTIVE_REJECT_IDENTITY as usize,
-            Self::NotPending => bpf_intf::SCX_ADAPTIVE_REJECT_NOT_PENDING as usize,
-            Self::Sequence => bpf_intf::SCX_ADAPTIVE_REJECT_SEQUENCE as usize,
-            Self::ClassGeneration => bpf_intf::SCX_ADAPTIVE_REJECT_CLASS_GENERATION as usize,
-            Self::CpuOffline => bpf_intf::SCX_ADAPTIVE_REJECT_CPU_OFFLINE as usize,
-            Self::Affinity => bpf_intf::SCX_ADAPTIVE_REJECT_AFFINITY as usize,
-            Self::TargetSlotBusy => bpf_intf::SCX_ADAPTIVE_REJECT_TARGET_SLOT_BUSY as usize,
-            Self::Slice => bpf_intf::SCX_ADAPTIVE_REJECT_SLICE as usize,
-            Self::DuplicateDispatch => bpf_intf::SCX_ADAPTIVE_REJECT_DUPLICATE_DISPATCH as usize,
-            Self::MigrationDisabled => bpf_intf::SCX_ADAPTIVE_REJECT_MIGRATION_DISABLED as usize,
-            Self::Flags => bpf_intf::SCX_ADAPTIVE_REJECT_FLAGS as usize,
-            Self::Unknown(_) => 0,
-        }
-    }
-
-    /// Returns true only when a fresh placement attempt can resolve the rejection.
-    pub const fn is_retryable(self) -> bool {
-        matches!(
-            self,
-            Self::ClassGeneration
-                | Self::CpuOffline
-                | Self::Affinity
-                | Self::TargetSlotBusy
-                | Self::MigrationDisabled
-        )
     }
 }
 
@@ -141,14 +50,12 @@ impl RejectReason {
 pub struct KernelEvent {
     /// Lifecycle transition represented by this record.
     pub kind: EventKind,
-    /// Stable task identity; absent only for CPU events or malformed rejection context.
+    /// Stable task identity.
     pub task: Option<TaskKey>,
-    /// Stable process image; absent for CPU events and task-gone rejections.
+    /// Stable process image.
     pub process: Option<ProcessKey>,
     /// Runnable generation owned by BPF.
     pub enqueue_sequence: u64,
-    /// Dispatch reservation identity, zero before dispatch.
-    pub dispatch_id: u64,
     /// Monotonic BPF timestamp.
     pub timestamp_ns: u64,
     /// Actual service reported by STOP.
@@ -173,26 +80,6 @@ impl KernelEvent {
     pub fn was_wakeup(&self) -> bool {
         self.flags & bpf_intf::SCX_ADAPTIVE_EVENT_FLAG_WAKEUP as u64 != 0
     }
-
-    /// Returns whether BPF selected this runnable instance without a Rust command.
-    pub fn bpf_scheduled(&self) -> bool {
-        self.flags & bpf_intf::SCX_ADAPTIVE_EVENT_FLAG_BPF_SCHEDULED as u64 != 0
-    }
-
-    /// Returns CPU online state from a CPU_STATE event.
-    pub fn cpu_online(&self) -> bool {
-        self.flags & bpf_intf::SCX_ADAPTIVE_EVENT_FLAG_CPU_ONLINE as u64 != 0
-    }
-
-    /// Returns CPU idle state from a CPU_STATE event.
-    pub fn cpu_idle(&self) -> bool {
-        self.flags & bpf_intf::SCX_ADAPTIVE_EVENT_FLAG_CPU_IDLE as u64 != 0
-    }
-
-    /// Returns the decoded command rejection reason.
-    pub fn reject_reason(&self) -> RejectReason {
-        RejectReason::from(self.flags)
-    }
 }
 
 impl TryFrom<bpf_intf::task_event> for KernelEvent {
@@ -213,16 +100,15 @@ impl TryFrom<bpf_intf::task_event> for KernelEvent {
         let task = TaskKey::new(raw.tid, raw.task_cookie);
         let process = ProcessKey::new(raw.tgid, raw.process_cookie, raw.exec_generation);
 
-        if !matches!(kind, EventKind::CpuState | EventKind::CommandReject)
-            && (task.is_none() || process.is_none())
-        {
+        if task.is_none() || process.is_none() {
             return Err(WireError::MissingIdentity(kind));
         }
-        if matches!(kind, EventKind::Enqueue) && raw.enqueue_sequence == 0 {
+        if matches!(
+            kind,
+            EventKind::Enqueue | EventKind::Cancel | EventKind::Running | EventKind::Stop
+        ) && raw.enqueue_sequence == 0
+        {
             return Err(WireError::MissingRunnableSequence);
-        }
-        if matches!(kind, EventKind::CommandReject) && raw.dispatch_id == 0 {
-            return Err(WireError::MissingDispatchId(kind));
         }
 
         Ok(Self {
@@ -230,7 +116,6 @@ impl TryFrom<bpf_intf::task_event> for KernelEvent {
             task,
             process,
             enqueue_sequence: raw.enqueue_sequence,
-            dispatch_id: raw.dispatch_id,
             timestamp_ns: raw.timestamp_ns,
             runtime_ns: raw.runtime_ns,
             sleep_ns: raw.sleep_ns,
@@ -241,60 +126,17 @@ impl TryFrom<bpf_intf::task_event> for KernelEvent {
     }
 }
 
-/// Policy decision ready to be serialized into the BPF command queue.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct DispatchRequest {
-    /// Stable task lifetime selected from a Rust pool.
-    pub task: TaskKey,
-    /// Stable owning process image.
-    pub process: ProcessKey,
-    /// Runnable generation selected from the pool node.
-    pub enqueue_sequence: u64,
-    /// Agent class generation used for BPF lazy invalidation.
-    pub class_generation: u64,
-    /// Non-zero scheduler reservation identity.
-    pub dispatch_id: u64,
-    /// CPU whose unique staging slot Rust reserved.
-    pub target_cpu: u32,
-    /// Planned EEVDF request and dispatch slice.
-    pub slice_ns: u64,
-    /// Insert at the head of a local DSQ and preempt its current task.
-    pub preempt: bool,
-}
-
-impl DispatchRequest {
-    /// Serializes this decision into the exact fixed-width C ABI.
-    pub fn to_raw(self) -> bpf_intf::dispatch_command {
-        bpf_intf::dispatch_command {
-            abi_version: bpf_intf::SCX_ADAPTIVE_ABI_VERSION as u16,
-            flags: if self.preempt {
-                bpf_intf::SCX_ADAPTIVE_DISPATCH_PREEMPT as u16
-            } else {
-                0
-            },
-            struct_size: mem::size_of::<bpf_intf::dispatch_command>() as u32,
-            tid: self.task.tid,
-            target_cpu: self.target_cpu,
-            task_cookie: self.task.task_cookie,
-            process_cookie: self.process.process_cookie,
-            exec_generation: self.process.exec_generation,
-            enqueue_sequence: self.enqueue_sequence,
-            class_generation: self.class_generation,
-            dispatch_id: self.dispatch_id,
-            slice_ns: self.slice_ns,
-        }
-    }
-}
-
 /// Converts a validated task class cache into a BPF generation value.
 pub fn task_control_raw(
     task: TaskKey,
     cache: TaskClassCache,
 ) -> (u32, bpf_intf::task_control_value) {
-    let observe = if cache.stage == ClassStage::Locked {
-        0
-    } else {
-        bpf_intf::SCX_ADAPTIVE_CONTROL_OBSERVE
+    let observe = match cache.stage {
+        ClassStage::Inherited => {
+            bpf_intf::SCX_ADAPTIVE_CONTROL_OBSERVE | bpf_intf::SCX_ADAPTIVE_CONTROL_COARSE_OBSERVE
+        }
+        ClassStage::Semantic => bpf_intf::SCX_ADAPTIVE_CONTROL_OBSERVE,
+        ClassStage::Locked => 0,
     };
     (
         task.tid,
@@ -332,40 +174,14 @@ pub enum WireError {
     /// ENQUEUE omitted the runnable generation.
     #[error("enqueue event has sequence zero")]
     MissingRunnableSequence,
-    /// RUNNING or reject event omitted its reservation identity.
-    #[error("{0:?} event has dispatch id zero")]
-    MissingDispatchId(EventKind),
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        task_control_raw, DispatchRequest, EventKind, KernelEvent, RejectReason, WireError,
-    };
+    use super::{task_control_raw, EventKind, KernelEvent, WireError};
     use crate::bpf_intf;
     use crate::identity::{ClassStage, ProcessKey, TaskClass, TaskKey};
     use crate::process::TaskClassCache;
-
-    /// Dispatch serialization carries complete runnable identity, not only TID.
-    #[test]
-    fn dispatch_request_serializes_complete_identity() {
-        let raw = DispatchRequest {
-            task: TaskKey::new(7, 70).unwrap(),
-            process: ProcessKey::new(6, 60, 2).unwrap(),
-            enqueue_sequence: 3,
-            class_generation: 4,
-            dispatch_id: 5,
-            target_cpu: 1,
-            slice_ns: 1_000_000,
-            preempt: true,
-        }
-        .to_raw();
-        assert_eq!(raw.task_cookie, 70);
-        assert_eq!(raw.process_cookie, 60);
-        assert_eq!(raw.exec_generation, 2);
-        assert_eq!(raw.enqueue_sequence, 3);
-        assert_eq!(raw.flags, bpf_intf::SCX_ADAPTIVE_DISPATCH_PREEMPT as u16);
-    }
 
     /// Only terminal Locked generations suppress fast-path behavior events.
     #[test]
@@ -398,7 +214,9 @@ mod tests {
         );
         assert_eq!(
             baseline.flags,
-            bpf_intf::SCX_ADAPTIVE_CONTROL_BPF_SCHED | bpf_intf::SCX_ADAPTIVE_CONTROL_OBSERVE
+            bpf_intf::SCX_ADAPTIVE_CONTROL_BPF_SCHED
+                | bpf_intf::SCX_ADAPTIVE_CONTROL_OBSERVE
+                | bpf_intf::SCX_ADAPTIVE_CONTROL_COARSE_OBSERVE
         );
 
         let (_, locked) = task_control_raw(
@@ -426,7 +244,6 @@ mod tests {
             process_cookie: 1,
             exec_generation: 1,
             enqueue_sequence: 1,
-            dispatch_id: 0,
             timestamp_ns: 0,
             runtime_ns: 0,
             sleep_ns: 0,
@@ -437,18 +254,6 @@ mod tests {
         assert_eq!(
             KernelEvent::try_from(raw),
             Err(WireError::MissingIdentity(EventKind::Enqueue))
-        );
-    }
-
-    /// A transient migration-disable race is decoded and retried explicitly.
-    #[test]
-    fn migration_disabled_rejection_is_retryable() {
-        let reason = RejectReason::from(bpf_intf::SCX_ADAPTIVE_REJECT_MIGRATION_DISABLED as u64);
-        assert_eq!(reason, RejectReason::MigrationDisabled);
-        assert!(reason.is_retryable());
-        assert_eq!(
-            reason.counter_index(),
-            bpf_intf::SCX_ADAPTIVE_REJECT_MIGRATION_DISABLED as usize
         );
     }
 }

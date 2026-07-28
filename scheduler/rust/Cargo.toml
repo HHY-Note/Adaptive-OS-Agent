@@ -18,13 +18,13 @@ serde_json = "1.0"
 simplelog = "0.12"
 thiserror = "2.0"
 
-# These path dependencies provide the pinned sched_ext compatibility layer.
-# They do not provide, and are not used for, this scheduler's policy.
-scx_utils = { path = "../scx/rust/scx_utils", version = "1.0.25" }
+# This pinned upstream crate provides only the sched_ext compatibility layer.
+# It does not provide, and is not used for, this scheduler's policy.
+scx_utils = "=1.0.25"
 
 [build-dependencies]
 anyhow = "1.0.65"
-scx_cargo = { path = "../scx/rust/scx_cargo", version = "1.0.25" }
+scx_cargo = "=1.0.25"
 
 [profile.release]
 lto = "thin"

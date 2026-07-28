@@ -27,7 +27,7 @@ log() {
 
 profile_from_dmi() {
     local serial
-    serial="$(tr -d '\n' </sys/class/dmi/id/product_serial 2>/dev/null || true)"
+    serial="$(tr -d '[:space:]' </sys/class/dmi/id/product_serial 2>/dev/null || true)"
     case "$serial" in
         aoa-profile-latency) printf 'latency' ;;
         aoa-profile-throughput) printf 'throughput' ;;
@@ -188,17 +188,18 @@ postgres_job() {
     local name="$1" phase="$2" duration="$3" rate="$4"
     local clients=$((CLIENTS * 2))
     run_job "$name" latency "$phase" /usr/bin/pgbench \
-        -h 127.0.0.1 -p 15432 -U postgres -d aoa_bench \
+        -h 127.0.0.1 -p 15432 -U postgres \
         -c"$clients" -j"$CLIENT_THREADS" -T"$duration" -R"$rate" \
-        --latency-limit=20 --log --log-prefix="$RESULT_ROOT/apps/$name/pgbench_log"
+        --latency-limit=20 --log \
+        --log-prefix="$RESULT_ROOT/apps/$name/pgbench_log" aoa_bench
 }
 
 postgres_balanced_job() {
     local name="$1" phase="$2" duration="$3"
     local clients=$((CLIENTS * 2))
     run_job "$name" balanced "$phase" /usr/bin/pgbench \
-        -h 127.0.0.1 -p 15432 -U postgres -d aoa_bench \
-        -c"$clients" -j"$CLIENT_THREADS" -T"$duration"
+        -h 127.0.0.1 -p 15432 -U postgres \
+        -c"$clients" -j"$CLIENT_THREADS" -T"$duration" aoa_bench
 }
 
 nats_job() {
@@ -487,7 +488,6 @@ main() {
     touch "$RESULT_ROOT/MEASUREMENT_STARTED"
     log "measurement profile=$profile seconds=$measurement_seconds"
     wait "$jobs_waiter"
-    /usr/local/libexec/aoa-summarize-workloads "$RESULT_ROOT"
     python3 - "$RESULT_ROOT/measurement-window.json" <<'PY'
 import json
 import sys
@@ -499,6 +499,7 @@ value = json.loads(path.read_text(encoding="utf-8"))
 value["end_ns"] = time.monotonic_ns()
 path.write_text(json.dumps(value, sort_keys=True) + "\n", encoding="utf-8")
 PY
+    /usr/local/libexec/aoa-summarize-workloads "$RESULT_ROOT"
     touch "$RESULT_ROOT/COMPLETE"
     log 'measurement complete'
 }

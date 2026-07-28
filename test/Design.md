@@ -2,7 +2,9 @@
 
 ## 1. 目标
 
-测试系统回答一个明确问题：在相同硬件、相同镜像、相同应用参数和相同测量窗口中，Adaptive OS Agent 是否能同时降低 latency 类应用的 P99，并提高 throughput 类应用的吞吐。
+测试系统回答一个明确问题：在相同硬件、相同镜像、相同应用参数和相同测量窗口中，
+Adaptive OS Agent 能否降低 Latency 应用的 P99、提高 Throughput 应用的完成量，
+并保持/改善 Balanced 普通工作；在 Mix 中三类指标是否能同时成立。
 
 设计目标：
 
@@ -27,9 +29,10 @@ Host benchmark.py
        │
        ├─ create qcow2 overlay from read-only template
        ├─ generate libvirt XML
-       │    └─ SMBIOS serial = aoa-profile-{latency|throughput|mix}
+       │    └─ SMBIOS serial = aoa-profile-{latency|throughput|balanced|mix}
        ├─ boot and validate live domain
-       ├─ upload only Agent/scheduler/collector payloads
+       ├─ upload generated Guest script + collector
+       │    └─ Agent 变体再上传 Agent/scheduler/config/secret
        └─ run one Guest script
             │
             ├─ image service starts servers and prepares data
@@ -42,7 +45,7 @@ Host benchmark.py
             ├─ artifact validation
             └─ stop Agent and require sched_ext=disabled
        │
-       ├─ download /bench_out
+       ├─ download /bench_out (SSH tar stream; SCP fallback)
        └─ destroy domain, undefine domain, remove overlay
 ```
 
@@ -82,37 +85,24 @@ vCPU 0..5 依次 pin 到 CPU 6..11，emulator pin 到 0..5。CPU 模式为 `host
 
 live domain 启动后，runner 再从 libvirt 实际 XML 验证 vCPU pin、emulator pin、拓扑、required features、SMBIOS serial 和 discard。只验证生成前 XML 不足以证明 libvirt 实际接受了配置。
 
-## 5. 镜像构建
+### 4.1 正常测试与镜像维护的边界
 
-`scripts/build_workload_image.py` 的完整构建流程：
+```text
+正常 benchmark
+  read-only template ─▶ 每 run 创建 overlay ─▶ 启动场景 ─▶ 删除 overlay
+          │
+          └─ 不调用镜像构建器，不修改 template
 
-1. 以指定 base image 创建一次性 overlay；
-2. 通过 libvirt 启动维护 VM；
-3. 上传 `image/real_workloads/`；
-4. 在 Guest 中安装 RPM 和固定版本源码工具；
-5. 校验 service、关键二进制和版本清单；
-6. 清除 dnf、下载和编译缓存；
-7. `sync`、`fstrim`、正常关机；
-8. 将 overlay 转换为无 backing file 的独立 qcow2；
-9. 写入候选镜像 manifest。
+镜像维护（仅应用/版本变更时）
+  clean base ─▶ disposable build overlay ─▶ Guest install + verify
+             ─▶ shutdown ─▶ qemu-img flatten ─▶ candidate image
+```
 
-只有 Guest 正常安装和关机后才会生成最终候选文件。失败时保留构建日志和 overlay 供诊断，不覆盖正式模板。
+`image/build_workload_image.py` 只是固化模板的维护工具。它永不直接挂载或修改正式模板，
+只有 Guest 正常关机、安装验证全部通过后才把临时 overlay 转换成独立 candidate。
+日常 `benchmark.py` 不导入、不执行该工具，参赛者正常测试时无需手工运行它。
 
-固定源码及 SHA-256：
-
-| 工具 | 版本 |
-| --- | --- |
-| memtier_benchmark | 2.5.1 |
-| wrk2 | commit `44a94c17d8e6a0bac8559b53da76848e430cb7a7` |
-| NATS server | 2.14.3 |
-| NATS CLI | 0.4.0 |
-| RocksDB db_bench | 8.5.4 |
-
-RPM 由镜像发行版仓库提供，实际 NEVRA 写入 `/opt/aoa-workloads/versions.txt`。
-
-`--compact-existing IMAGE --refresh-runtime` 只用于独立候选镜像的 dispatcher/config 快速迭代。它会直接写指定文件，所以不能指向正在使用的正式模板。
-
-## 6. 场景选择
+## 5. 场景选择
 
 libvirt 把 scenario 写入 SMBIOS system serial：
 
@@ -135,9 +125,18 @@ service 为 `Type=oneshot`、`TimeoutStartSec=infinity`、`KillMode=control-grou
 
 server 进程本身没有显式 SLO 或本机批处理目标，因此分类真值统一为 `balanced`；场景中的 latency/throughput 角色只属于携带该目标的 client/job。这样同一服务二进制不会因测试场景名称获得生产系统不可见的标签。
 
-## 7. 应用集合
+```text
+SMBIOS scenario ─▶ 镜像 dispatcher 选择应用组合
+                                   │
+                                   ├─ targets.jsonl role ─▶ 仅 collector/准确率真值
+                                   └─ process /proc ────▶ Agent 真实输入
 
-### 7.1 latency
+Agent 不读 scenario、targets.jsonl 或 metrics.json。
+```
+
+## 6. 应用集合
+
+### 6.1 latency
 
 | 名称 | 工具 | 角色 | 主要指标 |
 | --- | --- | --- | --- |
@@ -147,28 +146,28 @@ server 进程本身没有显式 SLO 或本机批处理目标，因此分类真�
 | postgresql | PostgreSQL + pgbench | latency | transaction p99 ms、tps |
 | zstd-background | zstd | throughput | iterations/s |
 
-### 7.2 throughput
+### 6.2 throughput
 
 | 名称 | 工具 | 角色 | 主要指标 |
 | --- | --- | --- | --- |
-| redis-sentinel | Redis + memtier | throughput | ops/s |
+| redis-sentinel | Redis + memtier | latency | p99 ms、ops/s |
 | ffmpeg | 1080p60 synthetic transcode | throughput | iterations/s |
 | rocksdb | readrandomwriterandom | throughput | ops/s |
 | zstd | LLVM shared library compression | throughput | iterations/s |
 | openssl | AES-256-GCM EVP speed（16 KiB block） | throughput | bytes/s |
 | imagemagick | fractal/blur/resize pipeline | throughput | iterations/s |
 
-### 7.3 balanced
+### 6.3 balanced
 
 Redis/Memcached memtier 与 PostgreSQL pgbench 不设置请求率、延迟百分位、deadline 或 SLO；NATS 连续发布固定消息批次。四项工作都只有普通远程服务目标，不携带 latency 或本机批处理目标，并分别输出 ops/s、tps 和 messages/s。
 
-### 7.4 mix
+### 6.4 mix
 
 `redis`、`nginx`、`postgresql` 为 latency；`ffmpeg`、`rocksdb`、`zstd`、`imagemagick` 为 throughput；`etcd check perf` 和 NATS publish 为 balanced。
 
 NATS 连续执行固定 100,000-message 批次，直到阶段窗口结束，再输出总消息 work units。etcd 在每个阶段开始前只删除自己的 `/etcdctl-check-perf/` 前缀；其固定时长检查用于施压，NATS rate 作为 mix 中的 Balanced 性能门禁。
 
-## 8. 压力缩放
+## 7. 压力缩放
 
 dispatcher 从 `_NPROCESSORS_ONLN` 读取 vCPU 数：
 
@@ -182,7 +181,7 @@ clients_per_thread  = client_threads * 2
 
 `reserved_latency_cpu=1` 只记录“不要让并发需求吃满全部 vCPU”的压力预算，不执行 affinity、cpuset 或 CPU hotplug。最终 CPU 选择仍完全属于被测内核调度器。
 
-## 9. 运行时安全边界
+## 8. 运行时安全边界
 
 `aoa-real-workload` 明确不调用以下接口：
 
@@ -196,7 +195,7 @@ dispatcher 只保存自己启动的 server/job PID，并在 service 退出时终
 
 Host 的 vCPU pin 是虚拟机实验环境控制，不是 Guest 内 workload 的任务调度策略。
 
-## 10. 阶段协议
+## 9. 阶段协议
 
 正式时间参数：
 
@@ -221,7 +220,7 @@ Guest:                  collector + perf ─────────────
 
 Agent 分类快照由 collector 在测量开始约 5 秒后通过只读 Tool 获取。快照失败会使 Agent run 无效，但不会暂停 workload。
 
-## 11. 采集器
+## 10. 采集器
 
 `guest_tools/benchmark_collector.py` 以 `targets.jsonl` 为根集合。每个采样周期：
 
@@ -233,17 +232,39 @@ Agent 分类快照由 collector 在测量开始约 5 秒后通过只读 Tool 获
 
 应用可以 fork、exec 或动态创建线程，不需要预先写死线程数量。采集器不写 `/proc`、不发送调度命令。
 
+```text
+                        测量窗口内的三条数据链
+
+targets.jsonl ─▶ /proc task/process + /proc/stat + CPU topology ─▶ JSONL
+      │
+      ├─ Agent Tool socket ─▶ classification snapshot + scheduler stats ─▶ JSON/JSONL
+      │
+      └─ 应用原生 stdout/JSON/log ─▶ summarize_workloads.py ─▶ metrics.json
+
+Guest 全局 perf stat -a ─▶ perf-stat.csv
+```
+
+通用 collector 由 Host 每 run 通过 SCP 上传；负载二进制、配置和数据已在镜像中，
+不会每轮上传。run 结束后 Host 优先通过 SSH tar stream 回收 `/bench_out`，探测或传输
+失败时退回 `scp -r`。
+
 主要输出：
 
 ```text
+observations/cpu-stats.jsonl
 observations/task-schedstat.jsonl
 observations/process-stats.jsonl
 observations/scheduler-stats.jsonl       Agent only
 observations/classification-snapshot.json Agent only
+observations/collector-errors.jsonl
 observations/collector-summary.json
 ```
 
-## 12. 应用指标
+调度数据采集不按应用名称分支。更换陌生 Linux 应用时，只要启动器把根 PID、
+start ticks、显示名称和验收角色写入 `targets.jsonl`，后代与线程由 collector 自动发现。
+陌生应用的业务 P99/吞吐格式则需在下一节的指标归一化层增加解析，不需要改 scheduler。
+
+## 11. 应用指标
 
 `summarize_workloads.py` 为每个应用生成 schema 1 的 `metrics.json`：
 
@@ -271,14 +292,14 @@ observations/collector-summary.json
 
 退出码 `0` 为自然完成，`124` 为被统一测量窗口正常终止；其他退出码失败。耗时文件从最后一个合法数值解析，兼容 GNU time 对非零退出的诊断行。
 
-## 13. 有效性检查
+## 12. 有效性检查
 
 Guest validation 使用 schema 2。最低应用角色数量：
 
 | 场景 | latency | throughput | balanced |
 | --- | ---: | ---: | ---: |
 | latency | 4 | 1 | 0 |
-| throughput | 0 | 5 | 0 |
+| throughput | 1 | 5 | 0 |
 | balanced | 0 | 0 | 4 |
 | mix | 3 | 4 | 2 |
 
@@ -288,13 +309,13 @@ Agent run 还必须满足：
 
 - 分类快照 schema 正确；
 - 测量期 scheduler epoch 唯一；
-- 无 stale heartbeat fallback；
+- 无持续 event overflow 或控制面 degraded；
 - 最终 snapshot `registry_ready=true` 且 `degraded=false`；
 - 停止 Agent 后 sched_ext 为 `disabled`。
 
 Host analysis 进一步拒绝 event overflow、capacity hit 和 degraded transition，并验证要求的 perf events。
 
-## 14. 汇总与比较
+## 13. 汇总与比较
 
 单 run 分析使用 schema 4。
 
@@ -314,7 +335,7 @@ Balanced 汇总同样对各普通应用的正 rate 计算 `balanced_geomean_per_
 
 campaign 只配对相同 scenario、相同 repeat 的 Native/Agent 有效 run。延迟改善方向为下降，吞吐改善方向为上升。正式三轮报告中位数、配对改善和 bootstrap 95% 区间；`single-round` 只作为实现迭代证据。
 
-## 15. 输出与清理
+## 14. 输出与清理
 
 ```text
 campaign/
@@ -337,7 +358,7 @@ campaign/
 
 runner 的 `finally` 路径总是尝试 destroy、undefine，并在确认 domain 不存在后删除 runtime overlay。清理失败会覆盖原 PASS 状态，使 run 无效。正式模板始终保留在固定位置，run 数据只存在于临时 overlay 和 Host 输出目录。
 
-## 16. 操作入口
+## 15. 操作入口
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s test/tests -v

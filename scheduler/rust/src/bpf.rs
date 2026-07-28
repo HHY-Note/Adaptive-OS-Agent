@@ -1,11 +1,16 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
+use std::cell::RefCell;
+use std::collections::VecDeque;
+use std::io;
 use std::mem::{self, MaybeUninit};
+use std::rc::Rc;
 use std::slice;
 
 use anyhow::{Context, Result};
 use libbpf_rs::libbpf_sys::bpf_object_open_opts;
-use libbpf_rs::{Link, MapCore, MapFlags, OpenObject};
+use libbpf_rs::{Link, MapCore, MapFlags, OpenObject, RingBuffer, RingBufferBuilder};
+use log::error;
 
 use crate::bpf_intf;
 use crate::bpf_skel::*;
@@ -13,7 +18,10 @@ use crate::config::SchedulerConfig;
 use crate::identity::TaskKey;
 use crate::process::TaskClassCache;
 use crate::topology::CpuTopology;
-use crate::wire::{task_control_raw, DispatchRequest, KernelEvent, WireError};
+use crate::wire::{task_control_raw, KernelEvent, WireError};
+
+const VERIFIER_LOG_BYTES: usize = 16 * 1024 * 1024;
+const VERIFIER_LOG_REPORT_BYTES: usize = 512 * 1024;
 
 /// Userspace projection of the aggregated per-CPU BPF diagnostics.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -22,22 +30,6 @@ pub struct DataPlaneStats {
     pub event_overflows: u64,
     /// Tasks sent to the global DSQ by safe, missing-context, or liveness paths.
     pub fallback_dispatches: u64,
-    /// Commands accepted into a target local DSQ.
-    pub commands_accepted: u64,
-    /// Commands rejected by final BPF validation.
-    pub commands_rejected: u64,
-    /// Atomic normal or urgent lane claim failures.
-    pub target_slot_busy_rejects: u64,
-    /// STOP events that observed a staged successor.
-    pub pipeline_hits: u64,
-    /// STOP events that observed no staged successor.
-    pub pipeline_misses: u64,
-    /// Maximum normal local-DSQ staged depth observed by BPF.
-    pub max_normal_staged_depth: u64,
-    /// Enqueues sent to fallback after heartbeat expiry.
-    pub stale_heartbeat_fallbacks: u64,
-    /// Commands rejected for cookie or exec-generation mismatch.
-    pub identity_rejects: u64,
     /// Runnable instances admitted directly into BPF class pools.
     pub fast_path_enqueues: u64,
     /// Tasks selected by the BPF root and class EEVDF policy.
@@ -62,8 +54,6 @@ pub struct DataPlaneStats {
     pub fast_path_prev_continuations: u64,
     /// Remote steal attempts rejected by another destination's source claim.
     pub fast_path_steal_claim_conflicts: u64,
-    /// Idle-state transitions coalesced before entering the event queue.
-    pub cpu_state_events_suppressed: u64,
     /// Dispatch callbacks skipped remote scanning because no fast task waited.
     pub fast_path_empty_steal_skips: u64,
     /// Urgent fast-path requests held back by victim-runtime or rate limits.
@@ -78,14 +68,6 @@ impl From<bpf_intf::adaptive_global_stats> for DataPlaneStats {
         Self {
             event_overflows: raw.event_overflows,
             fallback_dispatches: raw.fallback_dispatches,
-            commands_accepted: raw.commands_accepted,
-            commands_rejected: raw.commands_rejected,
-            target_slot_busy_rejects: raw.target_slot_busy_rejects,
-            pipeline_hits: raw.pipeline_hits,
-            pipeline_misses: raw.pipeline_misses,
-            max_normal_staged_depth: raw.max_normal_staged_depth,
-            stale_heartbeat_fallbacks: raw.stale_heartbeat_fallbacks,
-            identity_rejects: raw.identity_rejects,
             fast_path_enqueues: raw.fast_path_enqueues,
             fast_path_dispatches: raw.fast_path_dispatches,
             fast_path_dispatch_failures: raw.fast_path_dispatch_failures,
@@ -98,7 +80,6 @@ impl From<bpf_intf::adaptive_global_stats> for DataPlaneStats {
             fast_path_direct_dispatches: raw.fast_path_direct_dispatches,
             fast_path_prev_continuations: raw.fast_path_prev_continuations,
             fast_path_steal_claim_conflicts: raw.fast_path_steal_claim_conflicts,
-            cpu_state_events_suppressed: raw.cpu_state_events_suppressed,
             fast_path_empty_steal_skips: raw.fast_path_empty_steal_skips,
             fast_path_preemption_throttles: raw.fast_path_preemption_throttles,
             fast_path_latency_backlog_boosts: raw.fast_path_latency_backlog_boosts,
@@ -113,26 +94,6 @@ impl DataPlaneStats {
         self.fallback_dispatches = self
             .fallback_dispatches
             .saturating_add(sample.fallback_dispatches);
-        self.commands_accepted = self
-            .commands_accepted
-            .saturating_add(sample.commands_accepted);
-        self.commands_rejected = self
-            .commands_rejected
-            .saturating_add(sample.commands_rejected);
-        self.target_slot_busy_rejects = self
-            .target_slot_busy_rejects
-            .saturating_add(sample.target_slot_busy_rejects);
-        self.pipeline_hits = self.pipeline_hits.saturating_add(sample.pipeline_hits);
-        self.pipeline_misses = self.pipeline_misses.saturating_add(sample.pipeline_misses);
-        self.max_normal_staged_depth = self
-            .max_normal_staged_depth
-            .max(sample.max_normal_staged_depth);
-        self.stale_heartbeat_fallbacks = self
-            .stale_heartbeat_fallbacks
-            .saturating_add(sample.stale_heartbeat_fallbacks);
-        self.identity_rejects = self
-            .identity_rejects
-            .saturating_add(sample.identity_rejects);
         self.fast_path_enqueues = self
             .fast_path_enqueues
             .saturating_add(sample.fast_path_enqueues);
@@ -173,9 +134,6 @@ impl DataPlaneStats {
         self.fast_path_steal_claim_conflicts = self
             .fast_path_steal_claim_conflicts
             .saturating_add(sample.fast_path_steal_claim_conflicts);
-        self.cpu_state_events_suppressed = self
-            .cpu_state_events_suppressed
-            .saturating_add(sample.cpu_state_events_suppressed);
         self.fast_path_empty_steal_skips = self
             .fast_path_empty_steal_skips
             .saturating_add(sample.fast_path_empty_steal_skips);
@@ -193,14 +151,18 @@ impl DataPlaneStats {
 /// The `OpenObject` storage is owned by the caller and must outlive this value,
 /// matching libbpf skeleton lifetime requirements.
 pub struct BpfRuntime<'obj> {
-    /// Generated map/program skeleton.
-    skel: BpfSkel<'obj>,
     /// Owning link whose drop detaches sched_ext and restores the kernel scheduler.
     struct_ops: Option<Link>,
+    /// mmap-backed event consumer; it must be dropped before the skeleton maps.
+    event_ring: RingBuffer<'static>,
+    /// At most one bounded consume batch decoded by the ring callback.
+    pending_events: Rc<RefCell<VecDeque<Result<KernelEvent>>>>,
+    /// Generated map/program skeleton.
+    skel: BpfSkel<'obj>,
 }
 
 impl<'obj> BpfRuntime<'obj> {
-    /// Opens, configures, loads, primes heartbeat, and attaches the BPF scheduler.
+    /// Opens, configures, loads, and attaches the BPF scheduler.
     pub fn load(
         open_object: &'obj mut MaybeUninit<OpenObject>,
         config: &SchedulerConfig,
@@ -210,7 +172,21 @@ impl<'obj> BpfRuntime<'obj> {
     ) -> Result<Self> {
         let mut builder = BpfSkelBuilder::default();
         builder.obj_builder.debug(debug);
-        let open_opts: Option<bpf_object_open_opts> = None;
+        let mut verifier_log = if debug {
+            vec![0_u8; VERIFIER_LOG_BYTES]
+        } else {
+            Vec::new()
+        };
+        let mut open_opts_storage = bpf_object_open_opts::default();
+        let open_opts = if debug {
+            open_opts_storage.sz = mem::size_of::<bpf_object_open_opts>() as u64;
+            open_opts_storage.kernel_log_buf = verifier_log.as_mut_ptr().cast();
+            open_opts_storage.kernel_log_size = verifier_log.len() as u64;
+            open_opts_storage.kernel_log_level = 1;
+            Some(open_opts_storage)
+        } else {
+            None
+        };
         let mut skel = scx_utils::scx_ops_open!(builder, open_object, scx_adaptive, open_opts)?;
 
         let rodata = skel
@@ -221,61 +197,80 @@ impl<'obj> BpfRuntime<'obj> {
         rodata.usersched_pid = std::process::id();
         rodata.agent_pid = agent_pid;
         rodata.num_possible_cpus = topology.cpu_count() as u32;
-        rodata.dispatch_batch_limit = config.dispatch_batch_limit as u32;
         rodata.latency_slice_ns = config.latency_slice_ns;
         rodata.balanced_slice_ns = config.balanced_slice_ns;
         rodata.throughput_slice_ns = config.throughput_slice_ns;
         rodata.min_slice_ns = config.min_slice_ns;
         rodata.max_slice_ns = config.max_slice_ns;
-        rodata.heartbeat_timeout_ns = config.heartbeat_timeout.as_nanos() as u64;
         rodata.preemption_min_runtime_ns = config.preemption_min_runtime_ns;
         rodata.fast_preemption_interval_ns = config.fast_preemption_interval_ns();
         rodata.latency_backlog_request_ns = config.latency_backlog_request_ns();
 
-        let mut skel = scx_utils::scx_ops_load!(skel, scx_adaptive, uei)?;
+        let mut skel = match scx_utils::scx_ops_load!(skel, scx_adaptive, uei) {
+            Ok(skel) => skel,
+            Err(load_error) => {
+                if let Some(end) = verifier_log.iter().position(|byte| *byte == 0) {
+                    if end > 0 {
+                        let start = end.saturating_sub(VERIFIER_LOG_REPORT_BYTES);
+                        error!(
+                            "BPF verifier log (last {} of {} bytes):\n{}",
+                            end - start,
+                            end,
+                            String::from_utf8_lossy(&verifier_log[start..end])
+                        );
+                    }
+                }
+                return Err(load_error);
+            }
+        };
         for cpu in topology.cpus() {
             let state = initial_cpu_state(cpu.online);
             update_array_value(&skel.maps.cpu_state, cpu.id, &state)
                 .with_context(|| format!("initialize BPF state for CPU {}", cpu.id))?;
         }
-        update_array_value(&skel.maps.heartbeat, 0, &monotonic_now_ns()?)
-            .context("prime scheduler heartbeat before sched_ext attach")?;
+
+        let pending_events = Rc::new(RefCell::new(VecDeque::new()));
+        let event_sink = Rc::clone(&pending_events);
+        let mut ring_builder = RingBufferBuilder::new();
+        ring_builder
+            .add(&skel.maps.task_events, move |bytes| {
+                let event = copy_from_bytes::<bpf_intf::task_event>(bytes)
+                    .context("decode task_events value")
+                    .and_then(|raw| {
+                        KernelEvent::try_from(raw).map_err(|error: WireError| error.into())
+                    });
+                event_sink.borrow_mut().push_back(event);
+                0
+            })
+            .context("register task_events ring buffer")?;
+        let event_ring = ring_builder
+            .build()
+            .context("build task_events ring buffer")?;
         let struct_ops = Some(scx_utils::scx_ops_attach!(skel, scx_adaptive)?);
 
-        Ok(Self { skel, struct_ops })
+        Ok(Self {
+            struct_ops,
+            event_ring,
+            pending_events,
+            skel,
+        })
     }
 
-    /// Pops and validates one BPF lifecycle event, returning None when empty.
+    /// Pops one decoded event after greedily consuming a bounded mmap batch.
     pub fn pop_event(&self) -> Result<Option<KernelEvent>> {
-        let Some(bytes) = self
-            .skel
-            .maps
-            .task_events
-            .lookup_and_delete(&[])
-            .context("pop task_events queue")?
-        else {
-            return Ok(None);
-        };
-        let raw =
-            copy_from_bytes::<bpf_intf::task_event>(&bytes).context("decode task_events value")?;
-        KernelEvent::try_from(raw)
-            .map(Some)
-            .map_err(|error: WireError| error.into())
-    }
+        if let Some(event) = self.pending_events.borrow_mut().pop_front() {
+            return event.map(Some);
+        }
 
-    /// Pushes one complete dispatch request into the bounded BPF queue.
-    pub fn push_dispatch(&self, request: DispatchRequest) -> Result<()> {
-        let raw = request.to_raw();
-        self.skel
-            .maps
-            .dispatch_commands
-            .update(&[], bytes_of(&raw), MapFlags::ANY)
-            .with_context(|| {
-                format!(
-                    "push dispatch {} for tid {} to cpu {}",
-                    request.dispatch_id, request.task.tid, request.target_cpu
-                )
-            })
+        let consumed = self.event_ring.consume_raw_n(4096);
+        if consumed < 0 {
+            return Err(io::Error::from_raw_os_error(-consumed))
+                .context("consume task_events ring buffer");
+        }
+        match self.pending_events.borrow_mut().pop_front() {
+            Some(event) => event.map(Some),
+            None => Ok(None),
+        }
     }
 
     /// Mirrors one task class generation before the engine commits its update.
@@ -295,12 +290,6 @@ impl<'obj> BpfRuntime<'obj> {
             .task_control
             .delete(&task.tid.to_ne_bytes())
             .with_context(|| format!("delete BPF class generation for task {task:?}"))
-    }
-
-    /// Refreshes heartbeat entry zero using the kernel-compatible monotonic epoch.
-    pub fn refresh_heartbeat(&self, now_ns: u64) -> Result<()> {
-        update_array_value(&self.skel.maps.heartbeat, 0, &now_ns)
-            .context("refresh scheduler heartbeat")
     }
 
     /// Reads and aggregates the per-CPU BPF diagnostics records.
@@ -363,7 +352,6 @@ fn update_array_value<T>(map: &impl MapCore, key: u32, value: &T) -> Result<()> 
 /// Builds the pre-attach BPF state matching the scheduler's topology snapshot.
 fn initial_cpu_state(online: bool) -> bpf_intf::adaptive_cpu_state {
     bpf_intf::adaptive_cpu_state {
-        staged_dispatch_id: 0,
         urgent_dispatch_id: 0,
         online: u32::from(online),
         idle: 0,
@@ -371,11 +359,8 @@ fn initial_cpu_state(online: bool) -> bpf_intf::adaptive_cpu_state {
         steal_claim: 0,
         steal_cursor: 0,
         padding: 0,
-        last_idle_event_ns: 0,
         running_started_ns: 0,
         last_preemption_ns: 0,
-        accepted_commands: 0,
-        rejected_commands: 0,
         root_virtual_time_ns: 0,
         root_vruntime_ns: [0; 3],
     }
@@ -425,31 +410,26 @@ mod tests {
         let offline = initial_cpu_state(false);
         assert_eq!(online.online, 1);
         assert_eq!(offline.online, 0);
-        assert_eq!(online.staged_dispatch_id, 0);
-        assert_eq!(online.accepted_commands, 0);
-        assert_eq!(online.rejected_commands, 0);
+        assert_eq!(online.urgent_dispatch_id, 0);
     }
 
-    /// Per-CPU aggregation sums counters but preserves maximum-depth semantics.
+    /// Per-CPU aggregation saturates counters and preserves class indexes.
     #[test]
     fn data_plane_stats_aggregate_per_cpu_values() {
         let mut total = DataPlaneStats {
             fast_path_enqueues: u64::MAX - 1,
             fast_path_dispatches_by_class: [1, 2, 3],
-            max_normal_staged_depth: 1,
             ..DataPlaneStats::default()
         };
         total.accumulate(DataPlaneStats {
             fast_path_enqueues: 5,
             fast_path_dispatches_by_class: [4, 5, 6],
-            max_normal_staged_depth: 3,
             fast_path_prev_continuations: 7,
             ..DataPlaneStats::default()
         });
 
         assert_eq!(total.fast_path_enqueues, u64::MAX);
         assert_eq!(total.fast_path_dispatches_by_class, [5, 7, 9]);
-        assert_eq!(total.max_normal_staged_depth, 3);
         assert_eq!(total.fast_path_prev_continuations, 7);
     }
 }

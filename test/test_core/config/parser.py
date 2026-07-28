@@ -136,7 +136,7 @@ def _validate_libvirt(libvirt: dict[str, Any]) -> None:
         raise ConfigError(
             "libvirt.required_cpu_features must be a list of unique CPU feature names"
         )
-    for key in ("vm_warmup_seconds", "boot_timeout_seconds", "timeout_extra_seconds"):
+    for key in ("vm_warmup_seconds", "boot_timeout_seconds"):
         value = libvirt.get(key, 0)
         if not isinstance(value, int) or value < 0:
             raise ConfigError(f"libvirt.{key} must be a non-negative integer")

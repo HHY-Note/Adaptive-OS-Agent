@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build a standalone candidate image containing the real benchmark apps.
+"""Prepare a standalone candidate image containing the real benchmark apps.
 
 The canonical template is never mounted or written directly.  Installation runs
 inside a disposable qcow2 overlay, which is flattened into the requested output
@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import stat
 import shutil
 import subprocess
 import sys
@@ -48,16 +47,6 @@ def main(argv: list[str] | None = None) -> int:
         type=Path,
         help="optional host directory containing the five source archives",
     )
-    parser.add_argument(
-        "--compact-existing",
-        type=Path,
-        help="boot a standalone candidate only to TRIM its free filesystem blocks",
-    )
-    parser.add_argument(
-        "--refresh-runtime",
-        action="store_true",
-        help="with --compact-existing, refresh only the dispatcher and its configs",
-    )
     parser.add_argument("--timeout-seconds", type=int, default=1800)
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args(argv)
@@ -66,14 +55,6 @@ def main(argv: list[str] | None = None) -> int:
 
     config = load_config(TEST_ROOT / "config.yaml", base_dir=REPO_ROOT)
     spec = _build_spec(config)
-    if args.compact_existing is not None:
-        if args.base_image is not None or args.download_cache is not None:
-            parser.error("--compact-existing cannot be combined with build inputs")
-        return _compact_existing(
-            spec, args.compact_existing, refresh_runtime=args.refresh_runtime
-        )
-    if args.refresh_runtime:
-        parser.error("--refresh-runtime requires --compact-existing")
 
     output = args.output.expanduser().resolve()
     if output.exists() and not args.force:
@@ -161,89 +142,6 @@ def _build_spec(config: dict[str, Any]) -> RunSpec:
         config_path=Path(config["__config_path"]),
         benchmark={"scenario": "image-build"},
     )
-
-
-def _compact_existing(
-    spec: RunSpec, image_path: Path, *, refresh_runtime: bool
-) -> int:
-    image = image_path.expanduser().resolve()
-    if not image.is_file():
-        raise SystemExit(f"candidate does not exist: {image}")
-    info = subprocess.run(
-        ["qemu-img", "info", "--output=json", str(image)],
-        text=True,
-        stdout=subprocess.PIPE,
-        check=True,
-    )
-    if json.loads(info.stdout).get("backing-filename"):
-        raise SystemExit("--compact-existing requires a standalone qcow2 image")
-
-    workdir = Path(tempfile.mkdtemp(prefix="aoa-image-compact-", dir="/tmp"))
-    workdir.chmod(0o755)
-    original_mode = stat.S_IMODE(image.stat().st_mode)
-    spec.libvirt["template_image"] = str(image)
-    domain = domain_name(spec, workdir.name.rsplit("-", 1)[-1][:8])
-    xml_path = workdir / "domain.xml"
-    xml_path.write_text(
-        build_domain_xml(spec, domain, image, dynamic_ownership=False),
-        encoding="utf-8",
-    )
-    uri = str(spec.libvirt.get("uri", "qemu:///system"))
-    defined = False
-    mode_changed = False
-    before = image.stat().st_blocks * 512
-    try:
-        image.chmod(0o666)
-        mode_changed = True
-        _virsh(uri, ["define", str(xml_path)])
-        defined = True
-        _virsh(uri, ["start", domain])
-        host, _port = wait_for_ssh(
-            spec.libvirt, domain, int(spec.libvirt["boot_timeout_seconds"])
-        )
-        if refresh_runtime:
-            _refresh_runtime(spec.libvirt, host)
-        trim = run_ssh(
-            spec.libvirt,
-            host,
-            "systemctl is-enabled aoa-real-workload-autostart.service && sync && fstrim -av && sync",
-            timeout=120,
-        )
-        (workdir / "fstrim.stdout").write_text(trim.stdout, encoding="utf-8")
-        run_ssh(spec.libvirt, host, "shutdown -h now", check=False)
-        _wait_for_shutdown(uri, domain, timeout_seconds=120)
-        _virsh(uri, ["undefine", domain])
-        defined = False
-        subprocess.run(["qemu-img", "check", str(image)], check=True)
-        after = image.stat().st_blocks * 512
-        print(f"compacted image: {image} ({before} -> {after} bytes allocated)")
-        shutil.rmtree(workdir, ignore_errors=True)
-        return 0
-    finally:
-        if defined:
-            subprocess.run(["virsh", "--connect", uri, "destroy", domain], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
-            subprocess.run(["virsh", "--connect", uri, "undefine", domain], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
-        if mode_changed:
-            image.chmod(original_mode)
-
-
-def _refresh_runtime(libvirt: dict[str, Any], host: str) -> None:
-    source = TEST_ROOT / "image" / "real_workloads"
-    remote = "/tmp/aoa-real-workloads-runtime"
-    run_ssh(libvirt, host, f"rm -rf {remote}")
-    scp_to_guest(libvirt, host, source, remote)
-    commands = (
-        f"install -m 0644 {remote}/redis.conf /etc/aoa-workloads/redis.conf",
-        f"install -m 0644 {remote}/nginx.conf /etc/aoa-workloads/nginx.conf",
-        f"install -m 0644 {remote}/index.html /opt/aoa-workloads/www/index.html",
-        f"install -m 0755 {remote}/aoa-real-workload /usr/local/sbin/aoa-real-workload",
-        f"install -m 0755 {remote}/summarize_workloads.py /usr/local/libexec/aoa-summarize-workloads",
-        f"install -m 0644 {remote}/aoa-real-workload-autostart.service /usr/lib/systemd/system/aoa-real-workload-autostart.service",
-        "systemctl daemon-reload",
-        "systemctl enable aoa-real-workload-autostart.service",
-        f"rm -rf {remote}",
-    )
-    run_ssh(libvirt, host, " && ".join(commands), timeout=60)
 
 
 def _virsh(uri: str, arguments: list[str]) -> None:

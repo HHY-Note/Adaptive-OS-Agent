@@ -1,12 +1,23 @@
 # Adaptive OS Agent
 
-`Adaptive-OS-Agent` 是项目的分类与管理层。它从 Linux `/proc` 和
-`scx_adaptive` 提供的生命周期事件中识别进程/线程，调用 LLM
-生成语义分类，结合运行行为做一次有界修正，并将结果可靠地提交给
-sched_ext scheduler。
+`Adaptive-OS-Agent` 是项目的普通任务准入、语义分类和调度控制层。它从
+Linux `/proc` 和 `scx_adaptive` 生命周期事件中建立稳定的进程/线程身份，只将
+普通 `SCHED_OTHER` 线程准入 partial sched_ext，再融合显式启动目标、LLM 语义和
+scheduler 运行时行为，最后通过带 generation 的事务把分类提交给 scheduler。
 
-Agent 不参与每次 dispatch，LLM 也不在调度热路径上。分类尚未完成或
-远端请求失败时，scheduler 继续使用 `Balanced`。
+```text
+ /proc 普通任务              DeepSeek 批量语义          scheduler 行为窗口
+        │                         │                         │
+        ├─ 安全准入 SCHED_EXT      │                         │
+        │                         ▼                         ▼
+        └─ 有界元数据 ─────▶ ClassificationRegistry ◀─连续 good window
+                                      │
+                                      └─ class + generation ─▶ scx_adaptive
+```
+
+Agent 不参与每次 dispatch，LLM 也不在调度热路径上。新任务立即以
+`Balanced` 或已知进程默认类运行；远端请求失败时保留当前类，未分类任务继续
+使用 `Balanced`。
 
 - 跨组件数据流：[`../Design.md`](../Design.md)
 - Agent 内部设计：[`Design.md`](Design.md)
@@ -65,7 +76,7 @@ sudo Adaptive-OS-Agent/target/release/adaptive-os-agent \
 
 | 选项 | 作用 |
 | --- | --- |
-| `--offline` | 不访问远端模型，保留 `Balanced` 默认并继续运行 |
+| `--offline` | 不访问远端模型；`Balanced` 默认、本地显式目标和行为修正仍然工作 |
 | `--snapshot-file PATH` | 周期性原子写入 scheduler 诊断快照 |
 | `--debug` | 开启 Agent 和 scheduler 子进程的调试日志 |
 | `--validate-only` | 只校验配置 |
@@ -76,19 +87,12 @@ scheduler。scheduler 会 detach sched_ext；只有在有界宽限内无法退�
 ## 运行时结构
 
 ```text
-/proc + scheduler lifecycle events
-                |
-                v
-        ClassificationRegistry <---- LLM worker pool
-                |                         |
-                | actions + generation   | proposals only
-                v                         |
-         SchedulerClient ----------------+
-                |
-                v
-          scx_adaptive
-
-read-only Tool socket ---> Agent owner thread ---> Registry/scheduler snapshot
+                               唯一可写分类状态
+                                      │
+ /proc 发现/准入 ──────────▶ Registry ◀── proposal ── LLM worker pool
+ scheduler lifecycle/window ───▶    │
+                                           ├─ action/generation ─▶ SchedulerClient
+ read-only Tool socket ──▶ Agent 主线程 ─┘
 ```
 
 `ClassificationRegistry` 只由 Agent 主线程修改。LLM worker 只返回 proposal，
@@ -107,7 +111,7 @@ Agent 在 Unix socket 上提供有界、只读的查询接口：
 | `scheduler.health` | 读取 scheduler 连接与退化状态 |
 | `scheduler.stats` | 读取 scheduler 和 BPF 计数器 |
 
-Tool 不能改变 Registry 或调度器状态。性能测试使用它在预热结束时采集
+Tool 不能改变 Registry 或调度器状态。性能测试使用它在测量开始约 5 s 后采集
 一次分类快照。
 
 ## 目录
@@ -118,8 +122,8 @@ Tool 不能改变 Registry 或调度器状态。性能测试使用它在预热�
 | `src/registry.rs` | 权威分类状态机、generation、ACK 和重放 |
 | `src/deepseek.rs` | 有界 HTTP 请求、严格 JSON schema 和重试 |
 | `src/discovery.rs`, `src/metadata.rs` | `/proc` 发现、身份核对、元数据有界化与脱敏 |
+| `src/task_admission.rs` | 仅把稳定的普通 `SCHED_OTHER` 线程切换为 `SCHED_EXT` |
 | `src/*_classifier.rs`, `src/behavior.rs` | 进程、线程和行为 proposal |
 | `src/scheduler_client.rs` | 控制协议、epoch、重连和响应匹配 |
 | `src/supervisor.rs` | scheduler 子进程启停、attach 验证和有界重启 |
 | `src/tools.rs` | 只读 Tool socket |
-

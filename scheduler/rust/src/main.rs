@@ -28,11 +28,11 @@ use scx_adaptive::topology::CpuTopology;
 use simplelog::{ColorChoice, Config as LogConfig, LevelFilter, TermLogger, TerminalMode};
 
 const EVENT_BATCH_LIMIT: usize = 4096;
-const HEARTBEAT_REFRESH_EVENT_INTERVAL: usize = 64;
 const LIFECYCLE_REPLAY_BATCH_LIMIT: usize = 128;
 const MAX_PENDING_CONTROL_EVENTS: usize = EVENT_BATCH_LIMIT * 2;
 const BEHAVIOR_REPORT_INTERVAL_NS: u64 = 1_000_000_000;
 const MAX_CONSECUTIVE_OVERFLOW_WINDOWS: u32 = 3;
+const AGENT_WATCH_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Clone, Debug, Parser)]
 #[command(name = "scx_adaptive")]
@@ -105,12 +105,6 @@ fn handle_notices(
                     previous_process,
                     process,
                 })
-            }
-            EngineNotice::RefreshAffinity(task) => {
-                if let Err(error) = engine.refresh_affinity(task) {
-                    warn!("failed to refresh affinity for {task:?}: {error:#}");
-                }
-                None
             }
             EngineNotice::TaskExited { task, process } => {
                 Some(SchedulerMessage::TaskExited { task, process })
@@ -477,10 +471,8 @@ fn apply_control_request(
                 control_messages_dropped: control.dropped_messages(),
                 scheduler: engine.stats().clone(),
                 data_plane,
-                cpu_count: engine.cpus().len(),
-                reservations: engine.reservation_count(),
+                cpu_count: engine.cpu_count(),
                 tasks: engine.task_count(),
-                pool_nodes: engine.pool_node_count(),
             });
             match result {
                 Ok(snapshot) => SchedulerMessage::snapshot(request_id, snapshot),
@@ -685,6 +677,7 @@ impl ResponseCache {
 struct AgentWatch {
     pid: u32,
     start_time_ticks: u64,
+    next_check: Instant,
     missing_since: Option<Instant>,
 }
 
@@ -697,19 +690,25 @@ impl AgentWatch {
             pid,
             start_time_ticks: read_process_start_time(pid)
                 .with_context(|| format!("read Agent process identity for PID {pid}"))?,
+            next_check: Instant::now() + AGENT_WATCH_INTERVAL,
             missing_since: None,
         })
     }
 
     fn expired(&mut self, grace: Duration) -> bool {
-        let same_process = read_process_start_time(self.pid)
-            .is_ok_and(|start_time| start_time == self.start_time_ticks);
-        if same_process {
-            self.missing_since = None;
-            return false;
+        let now = Instant::now();
+        if now >= self.next_check {
+            self.next_check = now + AGENT_WATCH_INTERVAL;
+            let same_process = read_process_start_time(self.pid)
+                .is_ok_and(|start_time| start_time == self.start_time_ticks);
+            if same_process {
+                self.missing_since = None;
+            } else {
+                self.missing_since.get_or_insert(now);
+            }
         }
-        let since = self.missing_since.get_or_insert_with(Instant::now);
-        since.elapsed() >= grace
+        self.missing_since
+            .is_some_and(|since| now.duration_since(since) >= grace)
     }
 }
 
@@ -718,9 +717,9 @@ fn read_process_start_time(pid: u32) -> Result<u64> {
     let close = stat
         .rfind(')')
         .context("malformed /proc stat command field")?;
-    let fields: Vec<_> = stat[close + 1..].split_whitespace().collect();
-    fields
-        .get(19)
+    stat[close + 1..]
+        .split_whitespace()
+        .nth(19)
         .context("missing /proc stat starttime")?
         .parse()
         .context("parse /proc stat starttime")
@@ -782,15 +781,10 @@ fn run_scheduler(
             break;
         }
 
-        let mut now_ns = monotonic_now_ns()?;
-        bpf.refresh_heartbeat(now_ns)?;
         let mut did_work = false;
 
         if lifecycle_replay.is_empty() && !replay_complete_pending && pending_events.is_empty() {
-            for event_index in 0..EVENT_BATCH_LIMIT {
-                if event_batch_needs_heartbeat(event_index) {
-                    bpf.refresh_heartbeat(monotonic_now_ns()?)?;
-                }
+            for _ in 0..EVENT_BATCH_LIMIT {
                 let Some(event) = bpf.pop_event()? else {
                     break;
                 };
@@ -857,19 +851,7 @@ fn run_scheduler(
             break;
         }
 
-        now_ns = monotonic_now_ns()?;
-        for request in engine.refill(now_ns) {
-            did_work = true;
-            if let Err(error) = bpf.push_dispatch(request) {
-                engine.command_submission_failed(request.dispatch_id);
-                warn!(
-                    "dispatch queue rejected command {}: {error:#}",
-                    request.dispatch_id
-                );
-                break;
-            }
-        }
-
+        let now_ns = monotonic_now_ns()?;
         if lifecycle_replay.is_empty()
             && !replay_complete_pending
             && now_ns >= next_behavior_report_ns
@@ -915,19 +897,13 @@ fn run_scheduler(
     bpf.detach();
     control.join();
     info!(
-        "detached: events={} dispatches={} rejects={} pipeline={}/{} max_depth={}",
+        "detached: events={} fast_enqueues={} fast_dispatches={} fallbacks={}",
         scheduler_stats.events_processed,
-        scheduler_stats.refill_commands,
-        data_stats.commands_rejected,
-        data_stats.pipeline_hits,
-        data_stats.pipeline_misses,
-        data_stats.max_normal_staged_depth
+        data_stats.fast_path_enqueues,
+        data_stats.fast_path_dispatches,
+        data_stats.fallback_dispatches,
     );
     Ok(())
-}
-
-fn event_batch_needs_heartbeat(event_index: usize) -> bool {
-    event_index > 0 && event_index.is_multiple_of(HEARTBEAT_REFRESH_EVENT_INTERVAL)
 }
 
 fn main() -> Result<()> {
@@ -959,10 +935,11 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        event_batch_needs_heartbeat, read_process_start_time, validate_increment, ResponseCache,
-        EVENT_BATCH_LIMIT, HEARTBEAT_REFRESH_EVENT_INTERVAL,
-    };
+    use std::process::Command;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    use super::{read_process_start_time, validate_increment, AgentWatch, ResponseCache};
 
     #[test]
     fn reads_current_process_start_time() {
@@ -984,19 +961,16 @@ mod tests {
     }
 
     #[test]
-    fn long_event_batches_refresh_heartbeat_periodically() {
-        assert!(!event_batch_needs_heartbeat(0));
-        assert!(!event_batch_needs_heartbeat(
-            HEARTBEAT_REFRESH_EVENT_INTERVAL - 1
-        ));
-        assert!(event_batch_needs_heartbeat(
-            HEARTBEAT_REFRESH_EVENT_INTERVAL
-        ));
-        assert!(event_batch_needs_heartbeat(
-            HEARTBEAT_REFRESH_EVENT_INTERVAL * 2
-        ));
-        assert!(event_batch_needs_heartbeat(
-            EVENT_BATCH_LIMIT - HEARTBEAT_REFRESH_EVENT_INTERVAL
-        ));
+    fn agent_watch_detaches_only_after_the_missing_grace() {
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+        let mut watch = AgentWatch::new(child.id()).unwrap();
+        child.kill().unwrap();
+        child.wait().unwrap();
+
+        watch.next_check = Instant::now();
+        assert!(!watch.expired(Duration::from_millis(10)));
+        thread::sleep(Duration::from_millis(20));
+        watch.next_check = Instant::now();
+        assert!(watch.expired(Duration::from_millis(10)));
     }
 }

@@ -42,6 +42,7 @@ use adaptive_os_agent::skills::{
     ThreadSemanticClassificationSkill,
 };
 use adaptive_os_agent::supervisor::SchedulerSupervisor;
+use adaptive_os_agent::task_admission::{admit_process, AdmissionStats};
 use adaptive_os_agent::tools::{self, ToolServer};
 
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(3);
@@ -57,6 +58,7 @@ struct ReconcileStats {
     examined: usize,
     ordinary: usize,
     skipped: usize,
+    admission: AdmissionStats,
 }
 
 /// Command-line configuration for the Agent service.
@@ -378,7 +380,7 @@ fn run_agent(cli: Cli, config: AgentConfig) -> Result<()> {
     let result = (|| {
         scheduler.wait_ready(&client, READY_TIMEOUT)?;
         let started = Instant::now();
-        let mut excluded_tgids = vec![std::process::id(), scheduler_pid];
+        let mut excluded_tgids = vec![1, std::process::id(), scheduler_pid];
         let mut registry = ClassificationRegistry::new(
             limits,
             config.deepseek.min_confidence,
@@ -391,10 +393,15 @@ fn run_agent(cli: Cli, config: AgentConfig) -> Result<()> {
             initial.ordinary.div_ceil(config.deepseek.batch_size)
         };
         info!(
-            "initial process discovery examined={} ordinary={} skipped={} batch_size={} logical_batches={}",
+            "initial process discovery examined={} ordinary={} skipped={} admitted_threads={} already_ext={} skipped_policy={} admission_errors={} identity_races={} batch_size={} logical_batches={}",
             initial.examined,
             initial.ordinary,
             initial.skipped,
+            initial.admission.threads_admitted,
+            initial.admission.threads_already_ext,
+            initial.admission.threads_skipped_policy,
+            initial.admission.errors,
+            initial.admission.identity_races,
             config.deepseek.batch_size,
             logical_batches
         );
@@ -432,7 +439,7 @@ fn run_agent(cli: Cli, config: AgentConfig) -> Result<()> {
             if let Some(new_pid) = scheduler.check()? {
                 warn!("scheduler child restarted pid={new_pid}; awaiting new epoch snapshot");
                 excluded_tgids.clear();
-                excluded_tgids.extend([std::process::id(), new_pid]);
+                excluded_tgids.extend([1, std::process::id(), new_pid]);
                 client.invalidate_synchronization();
                 replay_ready_epoch = 0;
             }
@@ -552,20 +559,31 @@ fn reconcile_metadata(
     excluded_tgids: &[u32],
 ) -> Result<ReconcileStats> {
     let snapshot = scan_processes(excluded_tgids).context("scan /proc for Agent reconciliation")?;
-    let stats = ReconcileStats {
+    let mut stats = ReconcileStats {
         examined: snapshot.examined,
         ordinary: snapshot.processes.len(),
         skipped: snapshot.skipped,
+        admission: AdmissionStats::default(),
     };
-    debug!(
-        "reconciled /proc: examined={} ordinary={} skipped={}",
-        stats.examined, stats.ordinary, stats.skipped
-    );
     let live = snapshot.processes.keys().copied().collect();
     for metadata in snapshot.sorted_processes() {
+        stats
+            .admission
+            .merge(admit_process(&metadata, excluded_tgids));
         registry.remember_metadata(metadata);
     }
     registry.retain_live_instances(&live);
+    debug!(
+        "reconciled /proc: examined={} ordinary={} skipped={} admitted_threads={} already_ext={} skipped_policy={} admission_errors={} identity_races={}",
+        stats.examined,
+        stats.ordinary,
+        stats.skipped,
+        stats.admission.threads_admitted,
+        stats.admission.threads_already_ext,
+        stats.admission.threads_skipped_policy,
+        stats.admission.errors,
+        stats.admission.identity_races
+    );
     Ok(stats)
 }
 
@@ -636,7 +654,11 @@ fn drain_scheduler_events(
                 if excluded_tgids.contains(&process.tgid) {
                     Vec::new()
                 } else {
-                    let metadata = read_process(process.tgid).ok().flatten();
+                    let metadata = admit_discovered_process(
+                        read_process(process.tgid).ok().flatten(),
+                        excluded_tgids,
+                        "init",
+                    );
                     registry.on_process_discovered(process, metadata, now_ns)
                 }
             }
@@ -657,7 +679,11 @@ fn drain_scheduler_events(
                 if excluded_tgids.contains(&process.tgid) {
                     Vec::new()
                 } else {
-                    let metadata = read_process(process.tgid).ok().flatten();
+                    let metadata = admit_discovered_process(
+                        read_process(process.tgid).ok().flatten(),
+                        excluded_tgids,
+                        "exec",
+                    );
                     let start_time = read_task_start_time(process.tgid, task.tid).ok();
                     registry.on_process_exec(
                         task,
@@ -689,6 +715,31 @@ fn drain_scheduler_events(
         };
     }
     Ok(())
+}
+
+/// Uses the scheduler's existing lifecycle stream as the fast admission path.
+/// A periodic full reconciliation remains the recovery path for dropped events.
+fn admit_discovered_process(
+    metadata: Option<ProcessMetadata>,
+    excluded_tgids: &[u32],
+    source: &str,
+) -> Option<ProcessMetadata> {
+    if let Some(process) = metadata.as_ref() {
+        let stats = admit_process(process, excluded_tgids);
+        if stats.threads_admitted > 0 || stats.errors > 0 || stats.identity_races > 0 {
+            debug!(
+                "sched_ext lifecycle admission source={} tgid={} admitted_threads={} already_ext={} skipped_policy={} errors={} identity_races={}",
+                source,
+                process.instance.tgid,
+                stats.threads_admitted,
+                stats.threads_already_ext,
+                stats.threads_skipped_policy,
+                stats.errors,
+                stats.identity_races
+            );
+        }
+    }
+    metadata
 }
 
 fn apply_behavior_windows(
@@ -1189,12 +1240,12 @@ mod tests {
         ));
         write_snapshot(
             &path,
-            &serde_json::json!({"data_plane": {"max_normal_staged_depth": 1}}),
+            &serde_json::json!({"data_plane": {"fast_path_dispatches": 1}}),
         )
         .unwrap();
         let decoded: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        assert_eq!(decoded["data_plane"]["max_normal_staged_depth"], 1);
+        assert_eq!(decoded["data_plane"]["fast_path_dispatches"], 1);
         std::fs::remove_file(path).unwrap();
     }
 }

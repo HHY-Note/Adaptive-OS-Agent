@@ -1,6 +1,4 @@
 [env]
-# The development host's unversioned clang is 14, which corrupts sched_ext's
-# 64-bit enum constants for BPF. Callers may still override this environment
-# variable explicitly when the locked clang 17 toolchain is available.
-BPF_CLANG = { value = "clang-16", force = false }
-
+# scx_utils is built before scx_adaptive's build.rs, so select a compatible
+# BPF compiler for the whole scheduler build. Explicit caller values win.
+BPF_CLANG = { value = "tools/bpf-clang", relative = true, force = false }

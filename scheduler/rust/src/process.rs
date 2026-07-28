@@ -27,7 +27,7 @@ impl Default for ProcessDefaultCache {
 pub struct TaskClassCache {
     /// Process image from which this task inherited its initial semantics.
     pub process: ProcessKey,
-    /// Class currently used to choose a Rust pool and time slice.
+    /// Class currently mirrored into the BPF scheduling policy.
     pub effective_class: TaskClass,
     /// Whether the class is inherited, semantic, or locally locked.
     pub stage: ClassStage,
@@ -124,7 +124,7 @@ fn valid_stage_transition(from: ClassStage, to: ClassStage) -> bool {
     )
 }
 
-/// Classification update rejected before it can affect a pool or BPF command.
+/// Classification update rejected before it can affect BPF task control.
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 pub enum ClassUpdateError {
     /// Task update names a different process lifetime or exec generation.

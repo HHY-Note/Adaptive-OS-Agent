@@ -64,7 +64,6 @@ def analyze_run(run_dir: str | Path) -> dict[str, Any]:
     if variant == "agent":
         invalid_counters = (
             "event_overflows",
-            "stale_heartbeat_fallbacks",
             "task_capacity_hits",
             "degraded_transitions",
         )
@@ -92,6 +91,7 @@ def analyze_run(run_dir: str | Path) -> dict[str, Any]:
         "throughput": throughput,
         "balanced": balanced,
         "perf": perf,
+        "cpu_utilization": _cpu_utilization_metrics(bench_dir, start_ns, end_ns),
         "task_scheduling": _schedstat_metrics(bench_dir, start_ns, end_ns),
         "overhead": _overhead_metrics(bench_dir, start_ns, end_ns),
         "scheduler": scheduler,
@@ -323,6 +323,95 @@ def _schedstat_metrics(bench_dir: Path, start_ns: int, end_ns: int) -> dict[str,
     }
 
 
+def _cpu_utilization_metrics(
+    bench_dir: Path, start_ns: int, end_ns: int
+) -> dict[str, Any]:
+    rows = _read_jsonl(bench_dir / "observations" / "cpu-stats.jsonl")
+    grouped: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        grouped[int(row.get("cpu", -1))].append(row)
+
+    collector = _read_json(bench_dir / "observations" / "collector-summary.json")
+    clock_ticks = int(collector.get("clock_ticks_per_second", 100))
+    tick_fields = (
+        "user_ticks",
+        "nice_ticks",
+        "system_ticks",
+        "idle_ticks",
+        "iowait_ticks",
+        "irq_ticks",
+        "softirq_ticks",
+        "steal_ticks",
+    )
+    by_cpu_ticks: dict[int, dict[str, int]] = {}
+    topology: dict[int, tuple[int, int]] = {}
+    for cpu, values in grouped.items():
+        delta = _window_delta(values, start_ns, end_ns)
+        if delta is None:
+            continue
+        before, after = delta
+        by_cpu_ticks[cpu] = {
+            field: max(0, int(after.get(field, 0)) - int(before.get(field, 0)))
+            for field in tick_fields
+        }
+        topology[cpu] = (
+            int(after.get("package_id", -1)),
+            int(after.get("core_id", cpu)),
+        )
+
+    def summarize(counters: dict[str, int]) -> dict[str, float | None]:
+        user = counters.get("user_ticks", 0) + counters.get("nice_ticks", 0)
+        system = (
+            counters.get("system_ticks", 0)
+            + counters.get("irq_ticks", 0)
+            + counters.get("softirq_ticks", 0)
+        )
+        steal = counters.get("steal_ticks", 0)
+        idle = counters.get("idle_ticks", 0) + counters.get("iowait_ticks", 0)
+        busy = user + system + steal
+        total = busy + idle
+        return {
+            "busy_seconds": busy / clock_ticks,
+            "idle_seconds": idle / clock_ticks,
+            "user_seconds": user / clock_ticks,
+            "system_seconds": system / clock_ticks,
+            "iowait_seconds": counters.get("iowait_ticks", 0) / clock_ticks,
+            "steal_seconds": steal / clock_ticks,
+            "utilization": busy / total if total else None,
+        }
+
+    by_cpu = {str(cpu): summarize(counters) for cpu, counters in sorted(by_cpu_ticks.items())}
+    by_core_ticks: dict[tuple[int, int], dict[str, int]] = defaultdict(
+        lambda: {field: 0 for field in tick_fields}
+    )
+    total_ticks = {field: 0 for field in tick_fields}
+    for cpu, counters in by_cpu_ticks.items():
+        for field, value in counters.items():
+            by_core_ticks[topology[cpu]][field] += value
+            total_ticks[field] += value
+    by_core = {
+        f"{package_id}:{core_id}": summarize(counters)
+        for (package_id, core_id), counters in sorted(by_core_ticks.items())
+    }
+    core_busy = [float(values["busy_seconds"] or 0.0) for values in by_core.values()]
+    mean_core_busy = statistics.fmean(core_busy) if core_busy else 0.0
+    result = summarize(total_ticks) if by_cpu_ticks else {}
+    result.update(
+        {
+            "cpus": len(by_cpu),
+            "cores": len(by_core),
+            "core_busy_coefficient_of_variation": (
+                statistics.pstdev(core_busy) / mean_core_busy
+                if len(core_busy) > 1 and mean_core_busy
+                else 0.0 if core_busy else None
+            ),
+            "by_cpu": by_cpu,
+            "by_core": by_core,
+        }
+    )
+    return result
+
+
 def _schedstat_breakdown(
     values: dict[str, dict[str, int]],
 ) -> dict[str, dict[str, int | float | None]]:
@@ -383,76 +472,10 @@ def _scheduler_metrics(bench_dir: Path, start_ns: int, end_ns: int) -> dict[str,
     before, after = delta
     fields = {
         "events_processed": ("scheduler", "events_processed"),
-        "refill_commands": ("scheduler", "refill_commands"),
-        "slice_rejects": ("scheduler", "command_rejects_by_reason", 9),
-        "preempt_dispatches": ("scheduler", "preempt_dispatches"),
-        "latency_slo_admissions": ("scheduler", "latency_slo_admissions"),
-        "root_latency_dispatches": ("scheduler", "root_latency_dispatches"),
-        "latency_budget_denials": ("scheduler", "latency_budget_denials"),
-        "preemption_budget_denials": ("scheduler", "preemption_budget_denials"),
-        "repeated_preemptions_avoided": (
-            "scheduler",
-            "repeated_preemptions_avoided",
-        ),
-        "latency_preemptions_latency": (
-            "scheduler",
-            "latency_preemptions_by_victim_class",
-            0,
-        ),
-        "latency_preemptions_balanced": (
-            "scheduler",
-            "latency_preemptions_by_victim_class",
-            1,
-        ),
-        "latency_preemptions_throughput": (
-            "scheduler",
-            "latency_preemptions_by_victim_class",
-            2,
-        ),
-        "request_resumptions": ("scheduler", "request_resumptions"),
-        "planned_migrations_latency": (
-            "scheduler",
-            "planned_migrations_by_class",
-            0,
-        ),
-        "planned_migrations_balanced": (
-            "scheduler",
-            "planned_migrations_by_class",
-            1,
-        ),
-        "planned_migrations_throughput": (
-            "scheduler",
-            "planned_migrations_by_class",
-            2,
-        ),
-        "smt_busy_placements_latency": (
-            "scheduler",
-            "smt_busy_placements_by_class",
-            0,
-        ),
-        "smt_busy_placements_balanced": (
-            "scheduler",
-            "smt_busy_placements_by_class",
-            1,
-        ),
-        "smt_busy_placements_throughput": (
-            "scheduler",
-            "smt_busy_placements_by_class",
-            2,
-        ),
-        "dispatch_overhead_samples": ("scheduler", "dispatch_overhead_samples"),
-        "dispatch_overhead_ns": ("scheduler", "dispatch_overhead_ns"),
-        "dispatches_latency": ("scheduler", "dispatches_by_class", 0),
-        "dispatches_balanced": ("scheduler", "dispatches_by_class", 1),
-        "dispatches_throughput": ("scheduler", "dispatches_by_class", 2),
-        "runtime_latency_ns": ("scheduler", "runtime_by_class_ns", 0),
-        "runtime_balanced_ns": ("scheduler", "runtime_by_class_ns", 1),
-        "runtime_throughput_ns": ("scheduler", "runtime_by_class_ns", 2),
-        "commands_accepted": ("data_plane", "commands_accepted"),
-        "commands_rejected": ("data_plane", "commands_rejected"),
+        "stale_events": ("scheduler", "stale_events"),
+        "bad_behavior_windows": ("scheduler", "bad_behavior_windows"),
         "event_overflows": ("data_plane", "event_overflows"),
         "fallback_dispatches": ("data_plane", "fallback_dispatches"),
-        "stale_heartbeat_fallbacks": ("data_plane", "stale_heartbeat_fallbacks"),
         "fast_path_enqueues": ("data_plane", "fast_path_enqueues"),
         "fast_path_dispatches": ("data_plane", "fast_path_dispatches"),
         "fast_path_dispatch_failures": ("data_plane", "fast_path_dispatch_failures"),
@@ -492,10 +515,6 @@ def _scheduler_metrics(bench_dir: Path, start_ns: int, end_ns: int) -> dict[str,
         "fast_path_steal_claim_conflicts": (
             "data_plane",
             "fast_path_steal_claim_conflicts",
-        ),
-        "cpu_state_events_suppressed": (
-            "data_plane",
-            "cpu_state_events_suppressed",
         ),
         "fast_path_empty_steal_skips": (
             "data_plane",
