@@ -26,7 +26,7 @@ from test_core.benchmark.config import (
     load_performance,
 )
 from test_core.config.parser import ConfigError, load_config
-from test_core.host.check import check_host
+from test_core.host.check import check_host, check_template_integrity
 from test_core.models import CheckResult
 from test_core.vm.runner import run_one
 
@@ -36,8 +36,6 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.analyze_only and args.single_round:
         parser.error("--single-round cannot be combined with --analyze-only")
-    if args.analyze_only and args.scenario != "all":
-        parser.error("a scenario cannot be combined with --analyze-only")
     try:
         config = load_config(CONFIG_PATH, base_dir=REPO_ROOT)
         performance = load_performance(config)
@@ -59,7 +57,7 @@ def main(argv: list[str] | None = None) -> int:
 
     profile = "single-round" if args.single_round else "formal"
     repeats = 1 if args.single_round else int(performance["repeats"])
-    scenarios = list(SCENARIOS) if args.scenario == "all" else [args.scenario]
+    scenarios = [args.scenario]
     try:
         schedule = campaign_schedule(
             scenarios,
@@ -143,21 +141,21 @@ def main(argv: list[str] | None = None) -> int:
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="运行 latency、throughput、balanced、mix 的 Native/Agent 配对性能实验"
+        description="运行 dynamic_mix 的 Native/Agent 配对性能实验"
     )
     parser.add_argument(
         "scenario",
         nargs="?",
-        choices=(*SCENARIOS, "all"),
-        default="all",
-        help="只运行一种镜像内真实应用负载；默认 all",
+        choices=SCENARIOS,
+        default=SCENARIOS[0],
+        help="镜像内动态混合真实应用负载；默认 dynamic_mix",
     )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--analyze-only", type=Path)
     parser.add_argument(
         "--single-round",
         action="store_true",
-        help="run one latency/throughput/balanced/mix Native/Agent iteration round",
+        help="run one dynamic_mix Native/Agent iteration round",
     )
     return parser
 
@@ -177,6 +175,11 @@ def _build_release() -> int:
 def _preflight(specs: list[Any]) -> CheckResult:
     failures: set[str] = set()
     infos: set[str] = set()
+    integrity = check_template_integrity(
+        specs, REPO_ROOT / "scheduler" / "versions.lock"
+    )
+    failures.update(integrity.failures)
+    infos.update(integrity.infos)
     checked: set[str] = set()
     for spec in specs:
         if spec.scheduler_name in checked:

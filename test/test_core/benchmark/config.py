@@ -10,9 +10,16 @@ from test_core.config.parser import ConfigError
 from test_core.models import RunSpec
 
 
-SCENARIOS = ("latency", "throughput", "balanced", "mix")
+DYNAMIC_MIX_SCENARIO = "dynamic_mix"
+SCENARIOS = (DYNAMIC_MIX_SCENARIO,)
 VARIANTS = ("native", "agent")
 PROFILES = ("formal", "single-round")
+WORKLOAD_LAUNCHER_SOURCE = "test/image/real_workloads/aoa-real-workload"
+WORKLOAD_LAUNCHER_STAGING_TARGET = "/tmp/aoa-real-workload"
+WORKLOAD_LAUNCHER_INSTALL_TARGET = "/usr/local/sbin/aoa-real-workload"
+WORKLOAD_SUMMARIZER_SOURCE = "test/image/real_workloads/summarize_workloads.py"
+WORKLOAD_SUMMARIZER_STAGING_TARGET = "/tmp/aoa-summarize-workloads"
+WORKLOAD_SUMMARIZER_INSTALL_TARGET = "/usr/local/libexec/aoa-summarize-workloads"
 
 
 def load_performance(config: dict[str, Any]) -> dict[str, Any]:
@@ -108,6 +115,20 @@ def build_spec(
     machine_name = str(performance["machine"])
     scheduler_name = str(performance["variants"][variant])
     machine = dict(config["machines"][machine_name])
+    workload_launcher = {
+        "source": str(
+            (Path(config["__base_dir"]) / WORKLOAD_LAUNCHER_SOURCE).resolve()
+        ),
+        "target": WORKLOAD_LAUNCHER_STAGING_TARGET,
+        "executable": True,
+    }
+    workload_summarizer = {
+        "source": str(
+            (Path(config["__base_dir"]) / WORKLOAD_SUMMARIZER_SOURCE).resolve()
+        ),
+        "target": WORKLOAD_SUMMARIZER_STAGING_TARGET,
+        "executable": True,
+    }
     benchmark = {
         "schema_version": 3,
         "profile": profile,
@@ -122,7 +143,15 @@ def build_spec(
         "require_perf": bool(performance["require_perf"]),
         "perf_events": list(performance["perf_events"]),
         "collector_target": str(performance["collector"]["target"]),
-        "files": [dict(performance["collector"])],
+        "workload_launcher_target": WORKLOAD_LAUNCHER_STAGING_TARGET,
+        "workload_launcher_install_target": WORKLOAD_LAUNCHER_INSTALL_TARGET,
+        "workload_summarizer_target": WORKLOAD_SUMMARIZER_STAGING_TARGET,
+        "workload_summarizer_install_target": WORKLOAD_SUMMARIZER_INSTALL_TARGET,
+        "files": [
+            dict(performance["collector"]),
+            workload_launcher,
+            workload_summarizer,
+        ],
     }
     return RunSpec(
         case_name=f"benchmark-{scenario}-{variant}-r{repeat:02d}",

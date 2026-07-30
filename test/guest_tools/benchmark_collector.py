@@ -27,6 +27,10 @@ CPU_STAT_FIELDS = (
     "guest_nice_ticks",
 )
 
+# Keep classification projections below the Agent's 256-TGID request limit and
+# bound each response frame when a benchmark creates many short-lived workers.
+CLASSIFICATION_TGID_BATCH = 64
+
 
 def _request_stop(_signal_number: int, _frame: Any) -> None:
     global stop_requested
@@ -289,20 +293,32 @@ def _classification_snapshot(
     task_entries: dict[tuple[int, int], dict[str, Any]] = {}
     process_entries: dict[int, dict[str, Any]] = {}
     errors: list[dict[str, Any]] = []
-    try:
-        listing = client.query(
-            "workload.list",
-            {
-                "scope": "all",
-                "limit": 1000,
-                "tgids": sorted({pid for pid, _tid in snapshot_targets}),
-            },
-        )
-        task_entries, process_entries = _map_classification_entries(
-            listing.get("items", []), snapshot_targets
-        )
-    except (OSError, RuntimeError, ValueError) as exc:
-        errors.append({"scope": "list", "error": str(exc)})
+    tgids = sorted({pid for pid, _tid in snapshot_targets})
+    for offset in range(0, len(tgids), CLASSIFICATION_TGID_BATCH):
+        batch = tgids[offset : offset + CLASSIFICATION_TGID_BATCH]
+        try:
+            listing = client.query(
+                "workload.list",
+                {
+                    "scope": "all",
+                    "limit": 1000,
+                    "tgids": batch,
+                },
+            )
+            batch_tasks, batch_processes = _map_classification_entries(
+                listing.get("items", []), snapshot_targets
+            )
+            task_entries.update(batch_tasks)
+            process_entries.update(batch_processes)
+        except (OSError, RuntimeError, ValueError) as exc:
+            errors.append(
+                {
+                    "scope": "list",
+                    "batch_offset": offset,
+                    "batch_size": len(batch),
+                    "error": str(exc),
+                }
+            )
 
     processes = []
     active_processes = {pid for pid, _tid in active}
@@ -477,6 +493,7 @@ def _scheduler_pids(agent_pid: int) -> list[int]:
 def _scheduler_sample(stats: dict[str, Any], observed_ns: int) -> dict[str, Any]:
     scheduler = stats.get("scheduler") if isinstance(stats.get("scheduler"), dict) else {}
     data_plane = stats.get("data_plane") if isinstance(stats.get("data_plane"), dict) else {}
+    policy = stats.get("policy") if isinstance(stats.get("policy"), dict) else {}
     return {
         "observed_ns": observed_ns,
         "scheduler_epoch": stats.get("scheduler_epoch"),
@@ -508,10 +525,70 @@ def _scheduler_sample(stats: dict[str, Any], observed_ns: int) -> dict[str, Any]
                 "fast_path_events_suppressed",
                 "fast_path_direct_dispatches",
                 "fast_path_prev_continuations",
+                "fast_path_steal_latency_source_admissions",
+                "fast_path_steal_latency_successor_deferrals",
+                "fast_path_steal_scan_exhaustions",
+                "fast_path_remote_backlog_no_dispatches",
                 "fast_path_steal_claim_conflicts",
                 "fast_path_empty_steal_skips",
                 "fast_path_preemption_throttles",
+                "fast_path_preemption_deferrals",
                 "fast_path_latency_backlog_boosts",
+                "fast_path_latency_steal_attempts",
+                "fast_path_latency_remote_steals",
+                "fast_path_select_migrations_by_class",
+                "fast_path_remote_dispatches_by_class",
+                "fast_path_preemptions_by_class",
+                "fast_path_preemption_victims_by_class",
+                "fast_path_latency_budget_charge_events",
+                "fast_path_latency_budget_runtime_ns",
+                "fast_path_pipeline_ready_samples",
+                "fast_path_pipeline_empty_samples",
+                "fast_path_pipeline_normal_depth_sum",
+                "fast_path_pipeline_latency_depth_sum",
+                "fast_path_throughput_select_migrations_by_locality",
+                "fast_path_throughput_remote_dispatches_by_locality",
+                "fast_path_throughput_preemption_service_bins",
+                "fast_path_throughput_preemption_runtime_bins",
+                "fast_path_throughput_preemption_runtime_ns",
+                "fast_path_throughput_preemption_request_ns",
+                "fast_path_steal_idle_source_admissions",
+                "fast_path_steal_idle_throughput_deferrals",
+                "fast_path_latency_select_migrations_by_locality",
+                "fast_path_latency_remote_dispatches_by_locality",
+                "fast_path_latency_remote_steals_preserving_successor",
+                "fast_path_latency_remote_steals_fallback",
+                "fast_path_latency_idle_source_deferrals",
+                "fast_path_latency_selects_by_path",
+                "fast_path_latency_select_migrations_by_path",
+                "fast_path_immediate_preemption_kicks_by_class",
+                "fast_path_select_sync_wakeups_by_class",
+                "fast_path_select_sync_migrations_by_class",
+                "fast_path_shared_balanced_enqueues",
+                "fast_path_shared_balanced_dispatch_attempts",
+                "fast_path_shared_balanced_dispatches",
+                "fast_path_shared_balanced_dispatch_failures",
+                "fast_path_shared_latency_enqueues",
+                "fast_path_shared_latency_dispatch_attempts",
+                "fast_path_shared_latency_dispatches",
+                "fast_path_shared_latency_dispatch_failures",
+            )
+        },
+        "policy": {
+            key: policy.get(key)
+            for key in (
+                "generation",
+                "latency_budget_percent",
+                "preemption_interval_ns",
+                "preemption_interval_floor_ns",
+                "latency_successor_lease_ns",
+                "throughput_preemption_min_runtime_ns",
+                "balanced_preemption_granularity_ns",
+                "observed_latency_service_ns",
+                "last_latency_share_per_mille",
+                "last_balanced_preemption_rate_per_mille",
+                "feedback_updates",
+                "placement_updates",
             )
         },
     }
@@ -528,10 +605,22 @@ def collect(args: argparse.Namespace) -> int:
         "schedstat": JsonlWriter(output_dir / "task-schedstat.jsonl"),
         "process": JsonlWriter(output_dir / "process-stats.jsonl"),
         "cpu": JsonlWriter(output_dir / "cpu-stats.jsonl"),
+        "classification": JsonlWriter(
+            output_dir / "classification-snapshots.jsonl"
+        ),
         "errors": JsonlWriter(output_dir / "collector-errors.jsonl"),
     }
     cpu_topology = _cpu_topology()
     classification_snapshot: dict[str, Any] | None = None
+    classification_samples = 0
+    classification_timeline_errors = 0
+    classification_interval_ns = int(
+        args.classification_interval_seconds * 1_000_000_000
+    )
+    next_classification_ns = (
+        args.classification_timeline_start_ns
+        or args.classification_snapshot_at_ns
+    )
     seen_targets: dict[tuple[int, int], dict[str, Any]] = {}
     samples = 0
     tool_errors = 0
@@ -554,30 +643,53 @@ def collect(args: argparse.Namespace) -> int:
 
             if (
                 client is not None
-                and classification_snapshot is None
-                and args.classification_snapshot_at_ns
-                and observed_ns >= args.classification_snapshot_at_ns
+                and next_classification_ns
+                and observed_ns >= next_classification_ns
                 and active
             ):
-                classification_snapshot = _classification_snapshot(
+                scheduled_ns = next_classification_ns
+                timeline_snapshot = _classification_snapshot(
                     client,
                     seen_targets,
                     active,
-                    args.classification_snapshot_at_ns,
+                    scheduled_ns,
                     args.expected_workers or len(active),
                 )
-                _write_json_atomic(
-                    output_dir / "classification-snapshot.json",
-                    classification_snapshot,
-                )
-                for error in classification_snapshot["errors"]:
+                timeline_snapshot["observed_ns"] = observed_ns
+                writers["classification"].write(timeline_snapshot)
+                classification_samples += 1
+
+                if (
+                    classification_snapshot is None
+                    and args.classification_snapshot_at_ns
+                    and observed_ns >= args.classification_snapshot_at_ns
+                ):
+                    classification_snapshot = {
+                        **timeline_snapshot,
+                        "scheduled_ns": args.classification_snapshot_at_ns,
+                    }
+                    _write_json_atomic(
+                        output_dir / "classification-snapshot.json",
+                        classification_snapshot,
+                    )
+
+                for error in timeline_snapshot["errors"]:
                     writers["errors"].write(
                         {
-                            "observed_ns": classification_snapshot["started_ns"],
+                            "observed_ns": timeline_snapshot["started_ns"],
                             **error,
                         }
                     )
-                tool_errors += len(classification_snapshot["errors"])
+                tool_errors += len(timeline_snapshot["errors"])
+                classification_timeline_errors += len(timeline_snapshot["errors"])
+                next_classification_ns += classification_interval_ns
+                if next_classification_ns <= observed_ns:
+                    skipped = (
+                        (observed_ns - next_classification_ns)
+                        // classification_interval_ns
+                        + 1
+                    )
+                    next_classification_ns += skipped * classification_interval_ns
 
             for key in sorted(active):
                 target = targets[key]
@@ -650,6 +762,12 @@ def collect(args: argparse.Namespace) -> int:
             if classification_snapshot is not None
             else 0
         ),
+        "classification_timeline_samples": classification_samples,
+        "classification_timeline_errors": classification_timeline_errors,
+        "classification_timeline_start_ns": (
+            args.classification_timeline_start_ns or None
+        ),
+        "classification_interval_seconds": args.classification_interval_seconds,
         "tool_errors": tool_errors,
         "clock_ticks_per_second": os.sysconf("SC_CLK_TCK"),
         "page_size_bytes": os.sysconf("SC_PAGE_SIZE"),
@@ -670,6 +788,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--agent-pid", type=int, default=0)
     parser.add_argument("--interval-seconds", type=float, default=1.0)
     parser.add_argument("--classification-snapshot-at-ns", type=int, default=0)
+    parser.add_argument("--classification-timeline-start-ns", type=int, default=0)
+    parser.add_argument("--classification-interval-seconds", type=float, default=5.0)
     parser.add_argument("--expected-workers", type=int, default=0)
     parser.add_argument("--timeout-seconds", type=float, required=True)
     args = parser.parse_args(argv)
@@ -679,8 +799,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--timeout-seconds must be positive")
     if args.expected_workers < 0:
         parser.error("--expected-workers cannot be negative")
-    if args.classification_snapshot_at_ns and not args.tool_socket:
-        parser.error("--classification-snapshot-at-ns requires --tool-socket")
+    if args.classification_interval_seconds <= 0:
+        parser.error("--classification-interval-seconds must be positive")
+    if (
+        args.classification_snapshot_at_ns
+        or args.classification_timeline_start_ns
+    ) and not args.tool_socket:
+        parser.error("classification snapshots require --tool-socket")
     return args
 
 

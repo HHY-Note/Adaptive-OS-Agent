@@ -13,7 +13,7 @@ if str(TEST_ROOT) not in sys.path:
 
 from test_core.benchmark.config import build_spec, load_performance
 from test_core.config.parser import ConfigError, load_config
-from test_core.host.check import check_host
+from test_core.host.check import check_host, check_template_integrity
 
 
 def main() -> int:
@@ -26,14 +26,23 @@ def main() -> int:
 
     failures: set[str] = set()
     infos: set[str] = set()
+    specs = []
     for variant in ("native", "agent"):
-        spec = build_spec(
-            config,
-            performance,
-            scenario="latency",
-            variant=variant,
-            repeat=1,
+        specs.append(
+            build_spec(
+                config,
+                performance,
+                scenario="dynamic_mix",
+                variant=variant,
+                repeat=1,
+            )
         )
+    integrity = check_template_integrity(
+        specs, REPO_ROOT / "scheduler" / "versions.lock"
+    )
+    failures.update(integrity.failures)
+    infos.update(integrity.infos)
+    for spec in specs:
         result = check_host(spec)
         failures.update(result.failures)
         infos.update(result.infos)

@@ -95,9 +95,14 @@ def wrk_metrics(text: str) -> tuple[float | None, float | None]:
     if match:
         rate = number(match.group(1))
     for line in text.splitlines():
-        match = re.match(r"\s*99(?:\.\d+)?%\s+([0-9.]+\s*(?:us|ms|s))", line, re.I)
-        if match:
-            p99 = duration_ms(match.group(1))
+        match = re.match(
+            r"\s*([0-9]+(?:\.[0-9]+)?)%\s+([0-9.]+\s*(?:us|ms|s))",
+            line,
+            re.I,
+        )
+        if match and float(match.group(1)) == 99.0:
+            p99 = duration_ms(match.group(2))
+            break
     return p99, rate
 
 
@@ -151,6 +156,11 @@ def openssl_rate(text: str) -> float | None:
 def summarize(root: Path) -> None:
     for app in sorted(path for path in (root / "apps").iterdir() if path.is_dir()):
         role = (app / "role").read_text(encoding="utf-8").strip() if (app / "role").exists() else "unknown"
+        objective = (
+            (app / "objective").read_text(encoding="utf-8").strip().lower()
+            if (app / "objective").exists()
+            else "true"
+        ) == "true"
         elapsed = elapsed_seconds(app / "elapsed_seconds")
         exit_code = int((app / "exit_code").read_text(encoding="utf-8").strip()) if (app / "exit_code").exists() else None
         text = "\n".join(
@@ -179,6 +189,7 @@ def summarize(root: Path) -> None:
             "schema_version": 1,
             "name": app.name,
             "role": role,
+            "objective": objective,
             "exit_code": exit_code,
             "elapsed_seconds": elapsed,
             "p99_ms": p99,

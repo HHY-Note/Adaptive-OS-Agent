@@ -13,7 +13,7 @@ target:
   distribution: openEuler 24.03 LTS-SP4
   architecture: x86_64
   kernel: 6.6.0-scx
-  template_sha256: 32300bfd7a75deed1d5502fb8786e9374356a0de6c0f03d1f4dfa523b6944c7b
+  template_sha256: f0ce5dab2fdb5c8eb7de515295c9967e10503f178f75cadcf7d02ec1ec530896
 
 toolchain:
   clang: 17.0.6

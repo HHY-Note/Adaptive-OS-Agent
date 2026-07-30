@@ -1,107 +1,130 @@
 # scx_adaptive Scheduler
 
-`scx_adaptive` 是项目自研的单一 sched_ext scheduler。Agent 负责识别
-Latency、Balanced、Throughput 及其 generation；BPF 是普通任务唯一的调度数据面；Rust 只维护
-分类事务、稳定身份、行为观测、诊断与可恢复生命周期。
+scx_adaptive 是本项目的 sched_ext 数据面。Adaptive OS Agent 负责普通任务的准入、
+语义分类和 generation；Rust scheduler 负责身份、控制事务、拓扑和动态 policy；
+BPF 负责每一次 runnable 任务的 CPU 选择、排队、dispatch 和抢占。
 
-```text
-ordinary SCHED_OTHER task                 Agent class/stage/generation
-          │                                         │
-          ▼                                         ▼
- Agent partial admission                 Rust BPF-first transaction
-          │                                         │
-          ▼                                         ▼
- ┌────────────────────────────────────────────────────────────┐
- │ BPF: task_control lookup ─▶ select_cpu ─▶ per-CPU class DSQ│
- │      │                                    │                │
- │      └─ missing/mismatch ─▶ Balanced      └─ root EEVDF    │
- └───────────────────────────────────────────────┬────────────┘
-                                                 ▼
-                                           local DSQ / CPU
-```
+~~~text
+Agent: /proc + 语义 + 行为窗口
+              |
+              | class / stage / generation
+              v
+Rust: Hello / replay / CAS / policy lease
+              |
+              v
+BPF: select_cpu -> enqueue -> DSQ -> dispatch -> Linux CPU
+~~~
 
-Rust 不选择 CPU、不保存 runnable queue，也不产生 dispatch 命令。
+Rust 不保存 runnable 队列，也不在每次 dispatch 时等待 Agent。task_control 缺失、
+身份失配或 policy lease 过期时，BPF 立即使用有界的 Balanced/fallback 路径。
 
-完整算法、ABI、安全边界和验收规则见 [Design.md](Design.md)。
+## 当前数据面
 
-## 性能路径
+每个 possible CPU 创建两条私有 deadline 队列：
 
-- task_control 缺失或失配时默认使用 Balanced，任务不等待用户态；
-- 每个 possible CPU 各有 Latency/Balanced/Throughput 三条 DSQ，不是三条全局任务队列；
-- Balanced-only 运行时跳过三类 root 选择，直接消费本 CPU Balanced DSQ；
-- Latency 优先取得空闲 CPU，必要时按最小运行时间和速率限制抢占非 Latency；
-- Throughput 从 8 ms 开始，无竞争时有界增长到 64 ms；
-- 本 CPU 无任务时最多扫描 8 个 source CPU；
-- Inherited/Semantic 行为事件采样，Locked 任务关闭调度事件；
-- global_stats 使用 PERCPU_ARRAY，避免热路径共享统计 cache line。
+~~~text
+latency_dsq(cpu) : Latency
+task_dsq(cpu)    : Balanced + Throughput，按 virtual deadline 排序
+~~~
+
+为处理宽 affinity 的可迁移工作，另外创建：
+
+- 每个物理核心 leader 一个 shared Latency DSQ，承接 blocked Latency wakeup；
+- 每个调度 domain 一个 Balanced overflow DSQ，承接 wide-affinity 的普通 Balanced enqueue。
+
+因此不存在三条全局 class 队列；Balanced 和 Throughput 共享 normal lane，class request、
+virtual service、budget 和 locality 决定顺序。Balanced-only 时会跳过 mixed-class root
+选择，直接消费本 CPU normal lane。
 
 ## 安全边界
 
-调度器使用 `SCX_OPS_SWITCH_PARTIAL`。Agent 只把普通 `SCHED_OTHER` 任务显式切换到
-`SCHED_EXT`，以下任务保持 Linux 原生调度：
+调度器使用 SCX_OPS_SWITCH_PARTIAL。Agent 只准入普通 SCHED_OTHER 线程；以下任务保持
+Linux 原生路径：
 
-- PID 1；
-- `PF_KTHREAD`；
-- Agent；
-- scheduler；
-- RT/DL 或其他非 `SCHED_OTHER` 任务。
+- PID 1、PF_KTHREAD、Agent 和 scheduler；
+- SCHED_FIFO、SCHED_RR、SCHED_DEADLINE 及其他非 SCHED_OTHER 策略；
+- 任何身份或 affinity 校验失败的任务。
 
-BPF 在 `init_task` 和每次 enqueue 中重复检查 PID 1、内核线程、Agent 和 scheduler，作为第二道
-保护。Agent 退出、持续事件溢出、身份容量耗尽、BPF 错误或进程信号都会触发受控 detach。
+BPF 在 init_task 和 enqueue 中再次检查受保护身份，并保留 local/GLOBAL fallback。
+Agent 消失超过 2 秒、连续 3 个一秒窗口发生 ring overflow、用户态容量耗尽、BPF 报错或
+收到退出信号时，scheduler 受控 detach。
 
-## 目录
+## 命令行
 
 ~~~text
-scheduler/
-|-- Design.md
-|-- README.md
-|-- versions.lock
-`-- rust/
-    |-- .cargo/config.toml        scheduler BPF 编译器配置
-    |-- bpf/
-    |   |-- intf.h                 ABI v8
-    |   `-- scx_adaptive.bpf.c     唯一调度数据面
-    |-- src/
-    |   |-- main.rs                attach、控制事务、detach
-    |   |-- engine.rs              身份、分类缓存、行为观测
-    |   |-- bpf.rs                 skeleton、maps、stats
-    |   |-- wire.rs                event/control ABI
-    |   |-- process.rs             class stage/generation
-    |   |-- control.rs             Agent socket
-    |   |-- topology.rs            possible/online CPU
-    |   `-- stats.rs               诊断与行为窗口
-    |-- tools/bpf-clang            选择 Clang 20..16
-    `-- README.md
+scx_adaptive [--agent-pid PID] [--control-socket PATH] [--debug] [--validate-only]
 ~~~
 
-sched_ext 构建和加载兼容层使用 `Cargo.lock` 精确校验的官方
-`scx_cargo`、`scx_utils` crate；项目目录不包含上游 scheduler 源码。
+正常部署由 Agent 启动：
 
-正式目标是 openEuler 24.03 LTS-SP4 x86_64 的 `6.6.0-scx` 内核，锁定工具链为
-Clang/LLVM 17 和 Rust 1.96。完整版本与镜像哈希见 [`versions.lock`](versions.lock)。
+~~~bash
+sudo Adaptive-OS-Agent/target/release/adaptive-os-agent \
+  --config Adaptive-OS-Agent/configs/agent.example.toml \
+  --scheduler-bin scheduler/rust/target/release/scx_adaptive
+~~~
+
+直接启动 scheduler 只适合协议和内核诊断，必须显式提供 Agent PID 与控制 socket。
 
 ## 构建与检查
 
-在 `scheduler/rust` 目录执行 scheduler 检查：
+目标 Guest 是 openEuler 24.03 LTS-SP4 x86_64、6.6.0-scx。锁定的 Rust、Clang、
+libbpf 和 sched_ext crate 版本见 versions.lock；BPF/Rust 共享 ABI 版本为 v35。
 
 ~~~bash
+cd scheduler/rust
 cargo fmt --all -- --check
 cargo clippy --all-targets --locked -- -D warnings
 cargo test --all-targets --locked
 cargo build --release --locked
 target/release/scx_adaptive --validate-only
+cd ../..
 ~~~
 
-回到仓库根目录检查测试编排：
+tools/bpf-clang 优先选择 Clang 20、19、18、17，Clang 16 仅作为兼容回退；提交和
+正式实验使用锁定的 Clang/LLVM 17。
+
+## 诊断
+
+Rust 周期性读取 per-CPU global_stats、cpu_state 和 policy 状态，并通过 Agent 的
+scheduler.stats / scheduler.health Tool 暴露：
+
+- event overflow、fallback、dispatch failure；
+- 各 class dispatch、remote steal、迁移 locality；
+- Latency budget charge、抢占 throttle/defer 和 backlog boost；
+- shared Latency/Balanced 队列使用情况；
+- policy generation、lease、反馈更新和 placement 更新；
+- scheduler epoch、registry-ready、degraded 和 live task 数。
+
+统计使用 PERCPU_ARRAY，读取时由 Rust 汇总；它们用于解释实验结果，不会改变热路径决策。
+
+## 源码导航
+
+~~~text
+scheduler/
+|-- Design.md                  完整架构、算法和不变量
+|-- versions.lock              Guest/工具链/镜像基线
++-- rust/
+    |-- bpf/intf.h             Rust/BPF v35 固定 ABI
+    |-- bpf/scx_adaptive.bpf.c BPF sched_ext 数据面
+    |-- src/main.rs            attach、事件循环、detach
+    |-- src/control.rs         Unix 控制协议、replay、ACK
+    |-- src/engine.rs          identity、class cache、行为窗口
+    |-- src/policy.rs          双槽动态 policy controller
+    |-- src/bpf.rs             skeleton、maps、统计
+    |-- src/topology.rs        CPU/core/LLC/NUMA 拓扑
+    +-- src/identity.rs        ProcessKey/TaskKey/RunnableKey
+~~~
+
+## 与性能测试的关系
+
+测试入口只保留 dynamic_mix。它在同一套 6 vCPU Guest 中同时启动 Redis、Nginx、
+PostgreSQL、FFmpeg、RocksDB、zstd 和周期性 OpenSSL；Host 侧随机化 Native/Agent
+顺序，Guest 侧不设置 affinity、nice 或 cgroup。完整命令和数据口径见
+[根 README](../README.md)、[test/README.md](../test/README.md) 与
+[test/Design.md](../test/Design.md)。
 
 ~~~bash
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s test/tests -v
-python3 test/scripts/benchmark.py all --dry-run
-~~~
-
-单轮配对只用于迭代，正式结论必须使用三轮 campaign：
-
-~~~bash
-python3 test/scripts/benchmark.py balanced --single-round
-python3 test/scripts/benchmark.py balanced
+python3 test/scripts/benchmark.py dynamic_mix --dry-run
+python3 test/scripts/benchmark.py dynamic_mix --single-round
 ~~~

@@ -6,15 +6,57 @@ from __future__ import annotations
 campaign 前准备好。本模块只确认配置已经生效，确认失败时不启动 VM。
 """
 
+import hashlib
 import os
 import re
 import shutil
 import stat
 import subprocess
+from collections.abc import Sequence
 from pathlib import Path
+
+import yaml
 
 from test_core.config.parser import parse_cpu_list
 from test_core.models import CheckResult, RunSpec
+
+
+def check_template_integrity(
+    specs: Sequence[RunSpec], versions_lock: str | Path
+) -> CheckResult:
+    failures: list[str] = []
+    infos: list[str] = []
+    images = {Path(spec.libvirt["template_image"]).resolve() for spec in specs}
+    if len(images) != 1:
+        failures.append(
+            "campaign must reference exactly one template image: "
+            f"{sorted(map(str, images))}"
+        )
+        return CheckResult(tuple(failures), tuple(infos))
+
+    expected = _locked_template_sha256(Path(versions_lock), failures)
+    if expected is None:
+        return CheckResult(tuple(failures), tuple(infos))
+
+    image = next(iter(images))
+    try:
+        actual, before, after = _sha256_regular_file(image)
+    except OSError as exc:
+        failures.append(f"cannot hash template image {image}: {exc}")
+        return CheckResult(tuple(failures), tuple(infos))
+
+    if stat.S_IMODE(before.st_mode) & 0o222:
+        failures.append(f"template image must be read-only: {image}")
+    if _file_identity(before) != _file_identity(after):
+        failures.append(f"template image changed while hashing: {image}")
+    if actual != expected:
+        failures.append(
+            f"template image SHA-256 mismatch: {image} "
+            f"(expected={expected}, actual={actual})"
+        )
+    else:
+        infos.append(f"template image SHA-256 verified: {actual} ({image})")
+    return CheckResult(tuple(failures), tuple(infos))
 
 
 def check_host(spec: RunSpec) -> CheckResult:
@@ -44,6 +86,43 @@ def check_host(spec: RunSpec) -> CheckResult:
     _check_selected_payloads(spec, failures)
     infos.append(f"selected scheduler: {spec.scheduler_name}")
     return CheckResult(tuple(failures), tuple(infos))
+
+
+def _locked_template_sha256(path: Path, failures: list[str]) -> str | None:
+    try:
+        with path.open("r", encoding="utf-8") as stream:
+            data = yaml.safe_load(stream)
+    except (OSError, yaml.YAMLError) as exc:
+        failures.append(f"cannot read versions lock {path}: {exc}")
+        return None
+    target = data.get("target") if isinstance(data, dict) else None
+    expected = target.get("template_sha256") if isinstance(target, dict) else None
+    if not isinstance(expected, str) or not re.fullmatch(r"[0-9a-f]{64}", expected):
+        failures.append(f"invalid target.template_sha256 in versions lock: {path}")
+        return None
+    return expected
+
+
+def _sha256_regular_file(path: Path) -> tuple[str, os.stat_result, os.stat_result]:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        before = os.fstat(stream.fileno())
+        if not stat.S_ISREG(before.st_mode):
+            raise OSError("not a regular file")
+        for block in iter(lambda: stream.read(8 * 1024 * 1024), b""):
+            digest.update(block)
+        after = os.fstat(stream.fileno())
+    return digest.hexdigest(), before, after
+
+
+def _file_identity(value: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
 
 
 def _check_path(path: Path, label: str, failures: list[str]) -> None:

@@ -62,6 +62,10 @@ READY_FILE={shlex.quote(str(workload['ready_file']))}
 WINDOW_FILE={shlex.quote(str(workload['window_file']))}
 TARGETS_FILE={shlex.quote(str(workload['targets_file']))}
 WORKLOAD_SERVICE={shlex.quote(str(workload['service']))}
+WORKLOAD_LAUNCHER={shlex.quote(str(benchmark['workload_launcher_target']))}
+WORKLOAD_EXECUTABLE={shlex.quote(str(benchmark['workload_launcher_install_target']))}
+WORKLOAD_SUMMARIZER={shlex.quote(str(benchmark['workload_summarizer_target']))}
+WORKLOAD_SUMMARIZER_EXECUTABLE={shlex.quote(str(benchmark['workload_summarizer_install_target']))}
 COLLECTOR={shlex.quote(str(benchmark['collector_target']))}
 SCHEDULER_KIND={shlex.quote(kind)}
 EXPECTED_OPS={shlex.quote(expected_ops)}
@@ -98,6 +102,8 @@ collector_rc=0
 artifact_rc=0
 MEASUREMENT_START_NS=0
 MEASUREMENT_END_NS=0
+CLASSIFICATION_SNAPSHOT_NS=0
+CLASSIFICATION_TIMELINE_START_NS=0
 
 mkdir -p "$BENCH" "$OBSERVATIONS"
 : >"$OUT/scheduler.stdout"
@@ -178,9 +184,26 @@ wait_for_file() {{
     [ -f "$path" ]
 }}
 
-[ "$VM_WARMUP_SECONDS" -eq 0 ] || sleep "$VM_WARMUP_SECONDS"
-wait_for_file "$REAL/SERVERS_READY" 120
+systemctl stop "$WORKLOAD_SERVICE"
 workload_ready_rc="$?"
+if [ "$workload_ready_rc" -eq 0 ]; then
+    rm -f "$REAL/SERVERS_READY" "$REAL/MEASUREMENT_STARTED" "$REAL/COMPLETE"
+    install -m 0755 "$WORKLOAD_LAUNCHER" "$WORKLOAD_EXECUTABLE"
+    workload_ready_rc="$?"
+fi
+if [ "$workload_ready_rc" -eq 0 ]; then
+    install -m 0755 "$WORKLOAD_SUMMARIZER" "$WORKLOAD_SUMMARIZER_EXECUTABLE"
+    workload_ready_rc="$?"
+fi
+if [ "$workload_ready_rc" -eq 0 ]; then
+    systemctl start --no-block "$WORKLOAD_SERVICE"
+    workload_ready_rc="$?"
+fi
+[ "$VM_WARMUP_SECONDS" -eq 0 ] || sleep "$VM_WARMUP_SECONDS"
+if [ "$workload_ready_rc" -eq 0 ]; then
+    wait_for_file "$REAL/SERVERS_READY" 120
+    workload_ready_rc="$?"
+fi
 if [ "$workload_ready_rc" -eq 0 ]; then
     [ "$(cat "$REAL/profile" 2>/dev/null)" = "$SCENARIO" ] || workload_ready_rc=1
 fi
@@ -293,6 +316,7 @@ if [ "$environment_rc" -eq 0 ] && [ "$workload_ready_rc" -eq 0 ] && [ "$schedule
     if wait_for_file "$REAL/MEASUREMENT_STARTED" $((WARMUP_SECONDS + 60)); then
         MEASUREMENT_START_NS="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["start_ns"])' "$REAL/measurement-window.json")"
         CLASSIFICATION_SNAPSHOT_NS=$((MEASUREMENT_START_NS + 5000000000))
+        CLASSIFICATION_TIMELINE_START_NS="$MEASUREMENT_START_NS"
         {collector_command} >"$BENCH/collector.stdout" 2>"$BENCH/collector.stderr" &
         collector_pid=$!
         (
@@ -413,34 +437,16 @@ for directory in directories:
             errors.append(f"invalid elapsed time: {directory.name}")
 
 role_counts = Counter(str(metric.get("role")) for metric in metrics)
-minimums = {
-    "latency": {"latency": 4, "throughput": 1},
-    "throughput": {"latency": 1, "throughput": 5},
-    "balanced": {"balanced": 4},
-    "mix": {"latency": 3, "throughput": 4, "balanced": 2},
-}[scenario]
+minimums = {"latency": 3, "throughput": 4}
 for role, minimum in minimums.items():
     if role_counts[role] < minimum:
         errors.append(f"expected at least {minimum} {role} apps, found {role_counts[role]}")
-latency_metrics = [metric for metric in metrics if metric.get("role") == "latency" and isinstance(metric.get("p99_ms"), (int, float))]
-throughput_metrics = [metric for metric in metrics if metric.get("role") == "throughput" and isinstance(metric.get("throughput_per_second"), (int, float))]
-balanced_metrics = [
-    metric
-    for metric in metrics
-    if metric.get("role") == "balanced"
-    and isinstance(metric.get("throughput_per_second"), (int, float))
-]
-if scenario in {"latency", "mix"} and len(latency_metrics) < 2:
+latency_metrics = [metric for metric in metrics if metric.get("role") == "latency" and metric.get("objective", True) is True and isinstance(metric.get("p99_ms"), (int, float))]
+throughput_metrics = [metric for metric in metrics if metric.get("role") == "throughput" and metric.get("objective", True) is True and isinstance(metric.get("throughput_per_second"), (int, float))]
+if len(latency_metrics) < 2:
     errors.append("fewer than two latency applications produced P99 metrics")
-if scenario in {"throughput", "mix"} and len(throughput_metrics) < 2:
+if len(throughput_metrics) < 2:
     errors.append("fewer than two throughput applications produced rate metrics")
-required_balanced_rates = (
-    4 if scenario == "balanced" else 1 if scenario == "mix" else 0
-)
-if len(balanced_metrics) < required_balanced_rates:
-    errors.append(
-        f"fewer than {required_balanced_rates} balanced applications produced rate metrics"
-    )
 
 pressure = load_json(real / "pressure-plan.json")
 if pressure.get("online_vcpus") != expected_vcpus:
@@ -449,6 +455,15 @@ if pressure.get("pressure_cpu_budget") != max(1, expected_vcpus - 1):
     errors.append("pressure plan CPU budget mismatch")
 if expected_vcpus > 1 and pressure.get("reserved_latency_cpu") != 1:
     errors.append("pressure plan did not reserve latency capacity")
+
+load_contract = load_json(real / "load-contract.json")
+burst_timeline = load_jsonl(real / "burst-timeline.jsonl")
+if load_contract.get("schema_version") != 1 or load_contract.get("scenario") != scenario:
+    errors.append("dynamic_mix load contract is missing or invalid")
+starts = {row.get("burst") for row in burst_timeline if row.get("event") == "start"}
+ends = {row.get("burst") for row in burst_timeline if row.get("event") == "end"}
+if len(starts & ends) < 5:
+    errors.append("dynamic_mix timeline has fewer than five completed bursts")
 
 target_rows = load_jsonl(real / "targets.jsonl")
 target_apps = {str(row.get("name")) for row in target_rows}
@@ -482,6 +497,16 @@ if agent_required:
         classification = load_json(bench / "observations" / "classification-snapshot.json")
         if classification.get("schema_version") not in {1, 2} or not isinstance(classification.get("processes"), list) or not isinstance(classification.get("threads"), list):
             errors.append("classification snapshot structure is invalid")
+    timeline = load_jsonl(bench / "observations" / "classification-snapshots.jsonl")
+    if collector.get("classification_timeline_samples", 0) < 2 or len(timeline) < 2:
+        errors.append("classification timeline has fewer than two samples")
+    elif any(
+        row.get("schema_version") not in {1, 2}
+        or not isinstance(row.get("processes"), list)
+        or not isinstance(row.get("threads"), list)
+        for row in timeline
+    ):
+        errors.append("classification timeline structure is invalid")
     scheduler_rows = [row for row in load_jsonl(bench / "observations" / "scheduler-stats.jsonl") if start_ns <= int(row.get("observed_ns", 0)) <= end_ns]
     epochs = {row.get("scheduler_epoch") for row in scheduler_rows if row.get("scheduler_epoch") is not None}
     if len(epochs) != 1:
@@ -497,7 +522,8 @@ validation = {
     "roles": dict(sorted(role_counts.items())),
     "latency_p99_applications": len(latency_metrics),
     "throughput_rate_applications": len(throughput_metrics),
-    "balanced_rate_applications": len(balanced_metrics),
+    "load_contract_present": bool(load_contract),
+    "completed_bursts": len(starts & ends),
 }
 (bench / "validation.json").write_text(json.dumps(validation, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 raise SystemExit(1 if errors else 0)
@@ -590,6 +616,8 @@ def _collector_command(
         command += (
             ' --tool-socket "$TOOL_SOCKET" --agent-pid "$scheduler_pid"'
             ' --classification-snapshot-at-ns "$CLASSIFICATION_SNAPSHOT_NS"'
+            ' --classification-timeline-start-ns "$CLASSIFICATION_TIMELINE_START_NS"'
+            " --classification-interval-seconds 5"
         )
     return command
 

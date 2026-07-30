@@ -1,387 +1,439 @@
-# Adaptive OS Agent 跨组件设计
+# Adaptive OS Agent 总体设计
 
-本文从全局说明语义分类如何变成一次安全的 Linux 调度决策。组件内部细节见：
+本文描述当前代码实际实现的端到端架构。它回答四个问题：
 
-- [`Adaptive-OS-Agent/Design.md`](Adaptive-OS-Agent/Design.md)：发现、LLM、Registry 和控制一致性；
-- [`scheduler/Design.md`](scheduler/Design.md)：partial admission、三类 BPF 调度和 Rust 控制面；
-- [`test/Design.md`](test/Design.md)：VM 实验、负载、采集、有效性和统计。
+1. 系统怎样认识一个新工作负载；
+2. 分类结果怎样可靠地进入内核；
+3. eBPF 怎样在每次唤醒和调度时使用这些结果；
+4. 任一组件失效时，系统怎样继续运行或安全退出。
 
-## 1. 系统总图
+组件内部实现分别见：
 
-```text
-                         低频语义平面：秒级
+- [Adaptive-OS-Agent/Design.md](Adaptive-OS-Agent/Design.md)：发现、分类、Registry 与控制事务；
+- [scheduler/Design.md](scheduler/Design.md)：Rust 控制面、动态 policy 与 eBPF 数据面；
+- [test/Design.md](test/Design.md)：Host、VM、真实负载、采集和配对分析。
 
-  ┌──────────────┐    ┌──────────────────┐     ┌──────────────────┐
-  │ Linux /proc  │───▶│ 发现、限长、脱敏    │───▶ │                  │
-  └──────────────┘    └──────────────────┘     │ Classification   │
-                                               │ Registry         │
-  ┌──────────────┐    bounded batch/proposal   │                  │
-  │ DeepSeek     │◀───────────────────────────▶│ process + task   │
-  │ v4-flash     │                             │ class state      │
-  └──────────────┘                             └────────┬─────────┘
-                                                        │ class action
-                                                        │ identity + generation
-                                                        ▼
-                         高频策略平面：微秒～毫秒级
+## 1. 问题与核心思路
 
-  ┌──────────────────┐   lifecycle / behavior   ┌──────────────────────┐
-  │                  │─────────────────────────▶│ Rust control plane   │
-  │ eBPF data plane  │                          │ identity + class tx  │
-  │                  │◀─────────────────────────│ observation + detach │
-  └────────┬─────────┘      task_control map    └──────────────────────┘
-           │ CPU / EEVDF / DSQ
-           ▼
-  ┌──────────────────┐          ┌────────────────────────────────────┐
-  │ local / fallback │─────────▶│ Linux runnable tasks               │
-  │ DSQ              │          │ Latency / Balanced / Throughput    │
-  └──────────────────┘          └────────────────────────────────────┘
+Linux 调度热路径需要微秒级、确定性和有界执行；工作负载语义识别却需要读取进程上下文，
+甚至调用远端模型。项目没有把这两件事塞进同一条路径，而是把系统拆成两个时间尺度：
 
-                         只读实验与观测平面
+~~~text
++---------------------- 慢闭环：20 ms 至秒级 ----------------------+
+| /proc / lifecycle                                                |
+|          |                                                       |
+|          v                                                       |
+| 本地规则 + DeepSeek + 行为窗口 -> ClassificationRegistry         |
+|                                      |                           |
+|                                      v                           |
+|                           class / stage / generation              |
++--------------------------------------+---------------------------+
+                                       |
+                                       v
+                              +------------------+
+                              | task_control map |
+                              +--------+---------+
+                                       |
+                                       v
++------------------------- 快闭环：每次唤醒与 dispatch ------------+
+| select_cpu -> enqueue -> BPF DSQ -> dispatch -> CPU              |
+|                               |                                   |
+|                               +-> 运行/排队/抢占/压力 -> 慢闭环   |
++-------------------------------------------------------------------+
+~~~
 
-  ┌──────────────────────────────────────────────────────────────────┐
-  │ test harness ── Tool / proc / perf ──▶ raw data ──▶ paired report│
-  └──────────────────────────────────────────────────────────────────┘
-```
+这形成项目最重要的实现原则：
 
-核心思路是把两个时间尺度拆开：
+- LLM 只给出建议，永不参与 enqueue 或 dispatch；
+- Agent 只拥有语义状态，不拥有 runnable queue；
+- Rust scheduler 负责可靠控制和动态策略，不逐任务决定下一次运行；
+- eBPF 独占可运行任务的数据面，因此用户态抖动不会堵住 CPU 调度；
+- 任何缺失、过期或冲突的信息都收敛到 Balanced 或内核 fallback。
 
-```text
-“这个任务是什么？”                               “现在应该怎样运行它？”
-        │                                             │
-        ▼                                             ▼
-┌──────────────────┐                         ┌────────────────────┐
-│ Agent + LLM      │                         │ Rust + eBPF        │
-│ 秒级、可失败       │─── class / generation ─▶│ 本地、有界、可校验    │
-└──────────────────┘                         └────────────────────┘
-        │                                             │
-        └── 失败时保持 Balanced ──────────────────────┘
-```
+## 2. 整体架构
 
-LLM 不进入 dispatch 热路径。新 task 不等待分类，立即使用 `Balanced` 或已知 process default。
+~~~text
++------------------------- Adaptive-OS-Agent -----------------------+
+| 进程发现/安全准入 ----+                                          |
+| 语义/行为 Skills -----+--> ClassificationRegistry (唯一写者)    |
+|                                  |                 |              |
+|                                  v                 +-> Tool 只读  |
+|                           SchedulerClient                         |
++----------------------------------+--------------------------------+
+                                   | 长度前缀 JSON / 协议 v1
++----------------------------------v--------------------------------+
+|                    scx_adaptive Rust 控制面                       |
+| Unix control -> identity + generation CAS -> 健康/受控 detach    |
+| lifecycle/behavior Engine -> topology + PolicyController          |
++---------------------+--------------------------+------------------+
+                      |                          |
+       先写 BPF map， |                          | 双槽原子发布
+       后写 Rust cache|                          |
++---------------------v--------------------------v------------------+
+|                     sched_ext eBPF 数据面                         |
+| task/process identity      task_control       cpu_policy[2]       |
+|             \                  |                  /                |
+|              +-------> select_cpu / enqueue <---+                 |
+|                           |                                       |
+|                  private/shared DSQ                               |
+|                           |                                       |
+|             dispatch / running / stopping                         |
++---------------------+--------------------------+------------------+
+                      |                          |
+              2 MiB lifecycle ring       runtime/pressure counters
+                      +-------------> Rust Engine
+                                        |
+                                        +-- 1 s BehaviorWindow --> Agent
+~~~
 
-## 2. 模块边界
+### 2.1 每层拥有的状态
 
-```text
-┌──────────────────────┐
-│ Adaptive-OS-Agent    │  拥有准入、语义和分类状态
-│                      │
-│ discovery/admission  │  不选择 runnable task
-│ LLM / Registry / Tool│  不选择 CPU 和 slice
-└──────────┬───────────┘
-           │ control socket
-           ▼
-┌──────────────────────┐
-│ Rust scheduler       │  拥有控制与观测状态
-│                      │
-│ identity / class tx  │  不保存 runnable queue
-│ behavior / recovery  │  不选择 CPU 或 dispatch
-└──────────┬───────────┘
-           │ fixed ABI queues + maps
-           ▼
-┌──────────────────────┐
-│ eBPF data plane      │  拥有实时调度状态
-│                      │
-│ CPU / virtual time   │  不扫描 /proc
-│ DSQ / steal / preempt│  不执行远端 I/O
-└──────────────────────┘
-```
-
-| 组件 | 权威状态 | 主要输出 |
+| 层 | 权威状态 | 明确不做的事情 |
 | --- | --- | --- |
-| Agent | 普通任务准入、process/task 语义、stage、desired/applied generation | `sched_setscheduler(SCHED_EXT)`、分类 action、Registry snapshot |
-| Rust scheduler | task 生命周期、分类镜像、generation、行为窗口 | `task_control` 更新、生命周期 replay、健康快照 |
-| eBPF | cookie、enqueue sequence、CPU/affinity、virtual time、DSQ | 调度决策、生命周期与采样行为事件 |
-| test | `RunSpec`、VM 生命周期、原始数据、有效性 | Native/Agent 配对报告 |
+| Agent | 进程元数据、语义证据、desired/applied generation | 不选 CPU，不操作 DSQ |
+| Rust scheduler | BPF 身份镜像、控制事务、拓扑、policy、健康状态 | 不保存 runnable queue |
+| eBPF | task/process cookie、虚拟时间、CPU 状态、DSQ、热路径统计 | 不读取 /proc，不访问网络 |
+| test | VM 生命周期、原始证据、有效性、Native/Agent 配对 | 不向被测进程设置调度提示 |
 
-### 2.1 哪些任务进入 scx_adaptive
+这种所有权划分避免“双写”：Registry 只有 Agent 主线程写，runnable queue 只有 BPF 写，
+动态 policy 只有 Rust 发布。
 
-```text
-Linux task
-   │
-   ├─ PID 1 / kernel thread / Agent / scheduler ────▶ Linux 原生
-   ├─ RT / DL / 其他非 SCHED_OTHER 策略 ───▶ Linux 原生
-   └─ ordinary SCHED_OTHER
-             │ Agent 核对 process+task lifetime
-             ▼
-          SCHED_EXT ─▶ scx_adaptive
-```
+## 3. 一条任务怎样从出现到被调度
 
-Agent 不需要用户为每个线程手工写名单：它通过 `/proc` 周期 reconciliation 和 scheduler
-INIT/EXEC 生命周期通知发现普通任务，动态新线程在后续扫描/事件中补齐。
+下面的时序图把最常见路径串起来。新任务不会等待识别完成，它先按 Balanced 运行。
 
-每份状态只有一个 writer。Agent 收到匹配 ACK 后才推进 `applied_generation`；scheduler
-把 generation 写入 BPF 成功后才提交 Rust class cache。
+~~~text
+Linux/sched_ext       eBPF              Rust             Agent          DeepSeek
+      |                 |                 |                 |               |
+      |-- init_task --->|                 |                 |               |
+      |                 | 分配 task/process cookie         |               |
+      |                 |-- INIT event -->|                 |               |
+      |                 |                 |-- discovered -->|               |
+      |                 |                 |                 | 读 /proc       |
+      |<----------------------------------------------- SCHED_OTHER 准入    |
+      |                 |                 |                 |               |
+      |  先按 Balanced 运行；分类不阻塞任务               |               |
+      |                 |                 |                 |-- batch ------>|
+      |                 |                 |                 |<-- strict JSON-|
+      |                 |-- run samples ->|-- 1 s window -->|               |
+      |                 |                 |                 | 融合证据       |
+      |                 |                 |<-- CAS action ---|               |
+      |                 |<-- task_control-| 校验 epoch/身份 |               |
+      |                 |                 | 更新 Rust cache |               |
+      |                 |                 |-- ACK ---------->|               |
+      |                 |                 |                 | desired=applied
+      |                 |                 |                 |               |
+      |-- select/enqueue>| 匹配 cookie，算 request/deadline/DSQ             |
+      |<-- dispatch -----|                 |                 |               |
+~~~
 
-## 3. 核心身份与数据结构
+### 3.1 为什么新任务不会卡住
 
-### 3.1 身份逐层收紧
+首次出现时，BPF task context 和 Rust cache 都使用 Balanced。Agent 的本地规则、
+DeepSeek 或行为投票可以晚到，但只会改变后续 runnable incarnation。远端请求超时、
+JSON 错误、低置信或队列满都不会阻塞当前任务。
 
-```text
-┌──────────────────────────────┐
-│ ProcessInstanceKey           │  /proc 扫描阶段
-│ tgid + start_time_ticks      │  防 PID 复用
-└──────────────┬───────────────┘
-               │ scheduler 生命周期事件完成绑定
-               ▼
-┌──────────────────────────────┐
-│ ProcessKey                   │  一个进程镜像
-│ tgid + process_cookie        │
-│      + exec_generation       │  防 PID 复用和 exec
-└──────────────┬───────────────┘
-               │ 1 process : N tasks
-               ▼
-┌──────────────────────────────┐
-│ TaskKey                      │  一个线程生命周期
-│ tid + task_cookie            │  防 TID 复用
-└──────────────┬───────────────┘
-               │ 每次 ENQUEUE 递增
-               ▼
-┌──────────────────────────────┐
-│ RunnableKey                  │  一次 runnable 实例
-│ TaskKey + enqueue_sequence   │  关联一组采样行为事件
-└──────────────────────────────┘
-```
+### 3.2 为什么 PID/TID 复用不会误分类
 
-两个额外版本号保护跨组件状态：
+系统使用逐层增强的身份，而不是只相信数值 PID：
 
-```text
-scheduler_epoch    = scheduler 进程实例版本；重启后旧请求/ACK 全部失效
-class_generation   = 精确 process/task 的分类版本；new 必须等于 expected + 1
-```
+~~~text
+Agent 初始发现:
+  ProcessInstanceKey = tgid + /proc start_time_ticks
 
-### 3.2 数据从 Agent 走到内核
+BPF/Rust 稳定进程:
+  ProcessKey = tgid + process_cookie + exec_generation
 
-```text
-┌─────────────────────┐
-│ ProcessRecord       │
-│ TaskRecord          │  Agent 权威分类
-└──────────┬──────────┘
-           │ RegistryAction
-           │ identity + class + stage + generation
-           ▼
-┌─────────────────────┐
-│ ProcessDefaultCache │
-│ TaskClassCache      │  scheduler 分类镜像
-└──────────┬──────────┘
-           │ 原子分类事务
-           ▼
-┌─────────────────────┐
-│ task_control map    │  identity + class + stage
-│                     │  generation + observe flags
-└──────────┬──────────┘
-           │ enqueue 时校验；失配即 Balanced
-           ▼
-┌─────────────────────┐
-│ BPF task context    │  vruntime + request + deadline
-│ per-CPU class DSQ   │  CPU-owned EEVDF queues
-└─────────────────────┘
-```
+BPF/Rust 稳定线程:
+  TaskKey = tid + task_cookie
 
-这条链路中不存在“只凭 PID/TID 修改调度状态”的操作。
+单次可运行实例:
+  RunnableKey = TaskKey + enqueue_sequence
 
-## 4. 启动到首次 dispatch
+跨实例与跨版本:
+  scheduler_epoch + class_generation
+~~~
 
-```text
- Agent                     Rust scheduler             eBPF                 Linux task
-   │                              │                      │                       │
-   │── spawn scx_adaptive ───────▶│                      │                       │
-   │                              │── load + attach ────▶│                       │
-   │                              │   new epoch          │                       │
-   │── Hello ────────────────────▶│                      │                       │
-   │── /proc scan + ordinary admission ─────────────────────────────────────────────▶│
-   │◀── process/task replay ──────│◀── live identities ─ │                       │
-   │◀── replay complete ──────────│                      │                       │
-   │── Registry snapshot 0..N ───▶│── mirror generation▶ │                       │
-   │◀── final snapshot ACK ───────│                      │                       │
-   │                              │                      │◀── INIT / ENQUEUE ────│
-   │                              │◀── event + cookie ───│                       │
-   │                              │                      │   select CPU/class    │
-   │                              │                      │   EEVDF + local DSQ ─▶│
-   │                              │◀── RUNNING / STOP ───│                       │
-```
+Agent 在准入系统调用前后读取 starttime；BPF 在 task_control 命中后再次比较
+task_cookie、process_cookie 和 exec_generation。exec 会增加 image generation 并清空旧的
+虚拟时间与分类快路径状态。由此，迟到的模型响应、控制 ACK 或生命周期事件都不能落到
+复用后的任务上。
 
-snapshot 未完成前，scheduler 拒绝增量分类更新；task 仍可按 `Balanced` 调度。首次
-dispatch 与 LLM 是否完成无关。
+## 4. 工作负载感知闭环
 
-## 5. 分类如何改变调度
+分类不是“看进程名猜类别”，而是三类证据的保守融合：
 
-### 5.1 三类策略映射
+~~~text
+                        +------------------+
+                        | 新进程: Balanced |
+                        +--------+---------+
+                                 |
+             +-------------------+-------------------+
+             |                   |                   |
+             v                   v                   v
+     +---------------+   +---------------+   +----------------+
+     | 本地明确目标  |   | DeepSeek 语义 |   | scheduler 行为 |
+     +-------+-------+   +-------+-------+   +--------+-------+
+             \                   |                    /
+              +------------------+-------------------+
+                                 v
+                        +------------------+
+                        | Registry 保守融合|
+                        +----+---------+---+
+                             |         |
+              同向强证据     |         | 歧义/低置信/冲突
+                             v         v
+                    Latency/Throughput Balanced
+                             \         /
+                              v       v
+                         连续 good window
+                                |
+                                v
+                              Locked
+~~~
 
-```text
-                      Agent 输出 class
-                             │
-          ┌──────────────────┼──────────────────┐
-          ▼                  ▼                  ▼
-┌─────────────────┐ ┌─────────────────┐ ┌─────────────────┐
-│ Latency         │ │ Balanced        │ │ Throughput      │
-│ short response  │ │ safe default    │ │ sustained CPU   │
-└────────┬────────┘ └────────┬────────┘ └────────┬────────┘
-         ▼                   ▼                   ▼
-  EEVDF 250 us         EEVDF 4 ms          EEVDF 8 ms
-  short deadline       medium deadline      long deadline
-  delay-sensitive CPU  balanced CPU         locality-first CPU
-```
+### 4.1 三类证据的用途
 
-每个 possible CPU 都有三个 class virtual-time DSQ。Balanced-only 时直接移动本 CPU 的
-Balanced DSQ；出现专用类后，per-CPU Root EEVDF 在活跃 class 之间选择：
+| 证据 | 实现输入 | 能解决的问题 |
+| --- | --- | --- |
+| 本地显式目标 | 有界 argv、comm、executable、cgroup | 快速识别 deadline、SLO、固定速率+尾延迟、明确本机批处理 |
+| DeepSeek | 脱敏后的进程批次或线程 comm + 进程上下文 | 识别命令语义和父子/线程角色 |
+| 行为窗口 | runtime、wait、sleep、wakeup、burst、slice exhaustion、migration | 验证任务实际是短唤醒、混合运行或持续占用 |
 
-```text
-CPU 0: [Latency DSQ] [Balanced DSQ] [Throughput DSQ] ─┐
-CPU 1: [Latency DSQ] [Balanced DSQ] [Throughput DSQ] ─┤─▶ 各 CPU 本地 dispatch
- ...                                                    ─┘
+行为证据不能凭“频繁唤醒”独立创造 Latency 目标；专用类冲突时退回 Balanced。协议支持
+Inherited、Semantic、Locked 三个 stage，当前正常线上路径为 Inherited 到 Locked；
+Semantic 仍保留给兼容控制协议和状态校验。
 
-global class_state[3]       = task-level virtual-time 基准，不存放 runnable task
-per-CPU cpu_state[cpu]      = root virtual time / idle / steal / preempt
-global Latency overflow DSQ = 一条有界的共享溢出通道
-```
+### 4.2 分类提交不是普通赋值
 
-因此当前实现不是“三条全局任务队列”；只有 class virtual-time 基准、队列计数和
-Latency overflow 是全局共享状态。
+Registry 同时保存 desired generation 与 scheduler 已确认的 applied generation。一次更新
+必须满足：
 
-```text
-eligible class = class_vruntime <= root_virtual_time
-deadline       = class_vruntime + class_request
-selection      = earliest eligible deadline
-```
+~~~text
+current_generation == expected_generation
+new_generation     == expected_generation + 1
+~~~
 
-空 class 自动借出容量，重新活跃时最多保留一个 request 的 credit。task 内部使用带 Linux weight
-换算的 virtual service；Throughput request 可在无竞争时从 8 ms 有界增长到 64 ms。
+Rust 先把新值写入 BPF task_control，再更新自身 cache。第二步失败时恢复原 map value；
+进程默认值影响多个 inherited task 时，任一 task 写失败会回滚此前所有写入。Agent 只有
+收到匹配 request_id、identity 和 applied_generation 的 ACK 后才推进 applied 状态。
 
-### 5.2 语义状态与 Task 提交阶段
+## 5. 调度数据面
 
-```text
-LLM 请求状态（Agent 内部）
+### 5.1 类别与基础 request
 
-Pending ─▶ Requested ─┬─▶ Classified(class, confidence)
-                      ├─▶ Unknown
-                      └─▶ Failed
+| 类别 | 初始 request | 热路径目标 |
+| --- | ---: | --- |
+| Latency | 250 us | 短服务、阻塞唤醒救援、受预算抢占 |
+| Balanced | 4 ms | 通用公平与 EEVDF 式虚拟截止时间 |
+| Throughput | 8 ms | 保持 CPU/cache locality，空闲竞争时最长增长到 64 ms |
 
-Task 已提交阶段（Agent → scheduler → BPF）
+虚拟服务先按 Linux task weight 做反比缩放；Latency 再获得 2 倍虚拟权重。任务因睡眠或
+换 CPU 获得的 credit 最多为一个 request，避免睡眠任务积累无界优势。
 
-Inherited ── 连续 good behavior window / timeout ──▶ Locked
-    │                                                   │
-    └─ 跟随 process default，仍可调度                    └─ 停止行为采样
-```
+### 5.2 队列不是三条全局队列
 
-当前 Agent 的正常 task 路径是 `Inherited -> Locked`。线程 LLM 只提供语义上下文，
-不会单独把 task 提交为 `Semantic`；该阶段仍保留在协议和 scheduler 状态机中。
-Locked 任务不再采样，但晚到的高置信专用语义与已锁定的另一专用类直接冲突时，
-允许一次保守收敛到 `Balanced`。
+当前 ABI v35 的真实队列结构如下：
 
-模型 `Unknown`、低置信度或请求失败只影响语义覆盖率，不会阻塞调度。
+~~~text
+每个 CPU                         每个物理 core         每个 topology domain
++--------------------------+    +------------------+  +----------------------+
+| latency_dsq(cpu)         |    | shared_latency   |  | balanced_overflow    |
+|   Latency                |    | _dsq(core leader)|  | _dsq(domain)         |
+|                          |    | 宽 affinity 的   |  | 宽 affinity 的       |
+| task_dsq(cpu)            |    | blocked Latency  |  | ordinary Balanced    |
+|   Balanced + Throughput  |    +--------+---------+  +----------+-----------+
+|                          |             |                       |
+| SCX_DSQ_LOCAL            |             |                       |
+|   空闲 CPU 直接投递      |             |                       |
++------------+-------------+             |                       |
+             +---------------------------+-----------------------+
+                                         |
+                                         v
+                                  +---------------+
+                                  | dispatch(cpu) |
+                                  +---------------+
+~~~
 
-### 5.3 Action 与 ACK
+Balanced 与 Throughput 共享 normal lane，但 request、virtual deadline、CPU 复用和
+Throughput epoch 不同。共享队列只处理适合迁移的宽 affinity 任务，受限 affinity 或
+migration-disabled 任务始终留在合法的私有路径。
 
-```text
-┌───────────────────────────────────────────────────────────────┐
-│ RegistryAction                                                │
-│ stable identity | class | stage | request_id                  │
-│ expected_generation | new_generation (= expected + 1)         │
-└──────────────────────────────┬────────────────────────────────┘
-                               ▼
-           ┌──────────────────────────────────────┐
-           │ scheduler 校验 epoch / identity / CAS│
-           └───────────────────┬──────────────────┘
-                               ▼
-           ┌──────────────────────────────────────┐
-           │ 先写 BPF task_control，再写 Rust cache│
-           └──────────────┬───────────────┬───────┘
-                          │ success       │ failure
-                          ▼               ▼
-                 ACK(new_generation)   rollback + reject
-                          │               │
-                          ▼               ▼
-                 Agent 标记 applied     保留 desired，重新同步
-```
+### 5.3 一次 dispatch 的优先顺序
 
-## 6. BPF 热路径的有界决策
+~~~text
+1. 有 Latency credit、无 normal 竞争或已消费 urgent marker:
+     private/shared Latency
+2. 本 CPU normal lane:
+     Balanced + Throughput
+3. 处理队列竞争后仍存在的 Latency
+4. 有 credit 时救援远端 Latency
+5. domain Balanced overflow
+6. 有界 normal remote steal
+7. CPU 真正空闲时最后救援 Latency
+~~~
 
-```text
-┌──────────────────────────────────────────────────────────────┐
-│ select_cpu                                                   │
-│ 1. 从 Balanced 默认值开始，匹配 task_control 后覆盖 class        │
-│ 2. 只在实时 p->cpus_ptr 内选择 previous / idle / victim CPU    │
-│ 3. Latency 直接 local dispatch 和抢占均受预算限制                │
-└──────────────────────────────┬───────────────────────────────┘
-                               ▼
-┌──────────────────────────────────────────────────────────────┐
-│ enqueue / dispatch                                           │
-│ 1. 更新 task 和 class virtual service                         │
-│ 2. 插入目标 CPU 的 class vtime DSQ                             │
-│ 3. Balanced fast path 或 per-CPU Root EEVDF 选择 class        │
-│ 4. 本地为空时至多扫描 8 个 CPU，一次至多 steal 一个 task           │
-└──────────────────────────────┬───────────────────────────────┘
-                               ▼
-                         CPU local DSQ
-```
+这个顺序同时满足两条要求：有可运行任务时不让 CPU 空转；存在普通任务竞争时，Latency
+只能使用 credit/debt 预算和 cadence，而不是无限抢占。
 
-CPU online、实时 affinity 和 migration 状态都在 BPF 决策点读取；所有扫描和 map 都有静态上界。
-每次 runnable 决策不跨用户态，因此控制面延迟不会形成调度闭环。
+## 6. 动态 topology policy
 
-## 7. 故障与恢复
+Rust 从 sysfs 发现 CPU online、core/SMT、LLC、NUMA、package、capacity 和 core type。
+每个 CPU 的 policy 保存两个 Latency candidate 和两个 Normal candidate，以及预算、
+抢占周期、successor lease、Balanced granularity 和跨 domain 成本。
 
-```text
-LLM 失败 ───────────────────────▶ 保持 Balanced / 当前 class
-control 断开 ───────────────────▶ 丢弃旧 epoch 响应，重连后 replay + snapshot
-scheduler 退出 ─────────────────▶ Agent 在 60 s 窗口内最多重启 3 次
-BPF event 短时溢出 ─────────────▶ 调度继续，行为窗口标记 Bad
-连续溢出 / 容量不可恢复 ────────▶ scheduler degraded，受控 detach
-Agent 身份消失超过 grace ───────▶ scheduler 受控 detach
-```
+~~~text
++------------------------- 闭环反馈 -------------------------------+
+| BPF per-CPU pressure/counters                                    |
+|              |                                                    |
+|              v                                                    |
+|       1 s observation delta -> PolicyController                  |
+|                                  |                                |
+|                                  v                                |
+|                     写完整 inactive policy slot                   |
+|                                  |                                |
+|                                  v                                |
+|                         原子切换 generation                        |
++----------------------------------+--------------------------------+
+                                   |
+                                   v
+                         BPF active_policy 校验
+                          /                  \
+          generation 匹配且 lease 有效       过期/不完整
+                     |                         |
+                     v                         v
+                使用新 policy           immutable fallback
+                     |
+                     +------> 新的 pressure/counters
+~~~
 
-```text
-新 scheduler epoch
-       │
-       ▼
-生命周期回放 ──▶ replay complete ──▶ Registry snapshot ──▶ 恢复增量 action
-```
+policy 有两个完整 slot，Rust 每 500 ms 续租，lease 为 2 s。发布顺序是“先写完 inactive
+slot 的所有 CPU，再切 generation”，因此 BPF 不会看到半张拓扑。反馈只调慢路径参数，
+不会把用户态重新放进逐任务 dispatch。
 
-Agent 与 userspace scheduler 自身不准入 `SCHED_EXT`，始终由 Linux 原生调度器运行。
+## 7. 启动、重连与退出
 
-## 8. 控制、观测与安全
+### 7.1 正常启动
 
-```text
-┌────────────────────────────────────┐
-│ Agent <-> scheduler control        │
-│ 4-byte length + JSON envelope      │
-│ version / type / request / epoch   │
-│ payload_length / bounded payload   │
-└────────────────────────────────────┘
+~~~text
+Agent                          scheduler                         BPF
+  |                                |                              |
+  |-- spawn(child, Agent PID) ---->|                              |
+  |                                |-- load maps/rodata ---------->|
+  |                                |-- attach struct_ops --------->|
+  |<-- Hello(scheduler_epoch) -----|                              |
+  |<-- lifecycle replay -----------|<----- current identities -----|
+  |<-- ReplayComplete -------------|                              |
+  |-- RegistrySnapshotBatch 0 ---->|-- rebuild task_control ------>|
+  |-- RegistrySnapshotBatch ... -->|-- rebuild task_control ------>|
+  |-- final batch ---------------->|-- rebuild task_control ------>|
+  |<-- ACK(snapshot_complete) ------|                              |
+  |                                |                              |
+  |      registry_ready=true；此后才接受增量分类                    |
+~~~
 
-┌────────────────────────────────────┐
-│ Test -> Agent Tool                 │
-│ workload / classification / health │
-│ stats；只读，不改变运行状态            │
-└────────────────────────────────────┘
-```
+在 snapshot 完成前，BPF 仍按默认 Balanced 调度；scheduler 明确拒绝增量更新，避免旧
+Agent 状态和新 scheduler epoch 混合。
 
-- 密钥只来自环境变量或 `0600` 文件，不进入 prompt、日志或 snapshot；
-- `/proc` 数据先限长和脱敏；
-- LLM 只看到 batch 内短 ID，响应必须满足严格 JSON schema；
-- Registry、task、queue、frame、snapshot 和 retry 都有固定上限。
+### 7.2 故障恢复
 
-## 9. 验证路径
+| 故障 | 具体实现 |
+| --- | --- |
+| DeepSeek timeout、HTTP 或 schema 错误 | 有界重试；失败/Unknown 保留当前类 |
+| worker 或控制队列满 | 不阻塞主循环，任务保持当前类，稍后再收敛 |
+| 控制 socket 断开 | BPF 数据面继续；重连后 replay + 全量 snapshot |
+| scheduler child 退出 | Agent 在 60 s 滑动窗口内最多重启 3 次 |
+| Agent PID 消失或复用 | scheduler 每 100 ms 核对 PID+starttime，宽限 2 s 后 detach |
+| policy lease 过期 | BPF 使用加载时的不可变默认值 |
+| event overflow 连续 3 个窗口 | 行为窗口标坏并受控 detach |
+| task capacity 或 Engine degraded | scheduler 受控 detach |
+| SIGINT/SIGTERM | 停止新工作，关闭 socket，释放 struct_ops，确认 sched_ext disabled |
 
-```text
-┌─────────────────┐    ┌──────────────────┐    ┌──────────────────────┐
-│ Agent unit tests│───▶│ scheduler tests  │───▶│ 6 vCPU VM campaign   │
-│ schema/state/ACK│    │ BPF/control/ABI  │    │ Native vs Agent pair │
-└─────────────────┘    └──────────────────┘    └──────────────────────┘
-```
+所有关键资源都有固定上界，包括 Registry、BPF map、ring buffer、frame、队列、event
+batch、snapshot batch、response cache、remote steal 扫描和 dispatch batch。
 
-正式性能结论只使用同一 `scenario/repeat` 的有效 Native/Agent 配对。分类快照报告覆盖率、
-正确率和 generation 应用率，但分类内容本身不作为性能 run 有效性门禁。
+## 8. 为什么这套架构能形成性能优势
 
-## 10. 当前完成度与性能边界
+~~~text
+                  +----------------------------+
+                  | 语义区分谁怕等待、谁怕切换 |
+                  +-------------+--------------+
+                                |
+              +-----------------v------------------+
+双槽反馈 ---->| 类别化 request、placement 与预算    |
+              +-----+---------------+--------------+
+                    |               |
+        +-----------+               +-----------------+
+        |                                               |
+        v                                               v
++---------------------+                         +----------------------+
+| Latency 短 request  |                         | Throughput 长 epoch  |
+| + 有界唤醒救援      |                         | + CPU/cache locality |
++----------+----------+                         +----------+-----------+
+           |                                               |
+           v                                               v
+      降低交互 P99                                    控制吞吐损失
 
-```text
-任务发现/准入       已实现 + 单元/虚拟机验证
-LLM + 行为分类       已实现；已有场景分类里程碑
-三类 BPF 调度         已实现
-Balanced 性能           当前有效单轮仍比 Native 低 7.18%
-Latency/Throughput/Mix   需在当前 scheduler 上重新执行三轮正式配对
-```
+              +--------------------------------------+
+              | Balanced EEVDF 式公平路径            |
+              +------------------+-------------------+
+                                 v
+                          维持通用任务公平
+~~~
 
-因此当前文档中的调度策略是已实现事实，但“整体性能显著优于 Linux”仍是待验收目标，
-不是已证明结论。具体原始基线和候选保留规则见
-[`scheduler/Design.md`](scheduler/Design.md)。
+优势不是来自某个固定进程名或某次随机参数，而来自架构上的组合：
+
+1. 语义把尾延迟任务与持续任务分开；
+2. BPF 在本地完成 hot path，Agent 和网络延迟不会进入调度成本；
+3. Latency 只在竞争发生时消耗预算，空闲容量可以直接利用；
+4. Throughput 在无竞争 epoch 增长并优先保留前一 CPU；
+5. private lane 保持 locality，共享 lane 只接收可安全迁移的任务；
+6. policy 用实际运行反馈调整 cadence、granularity 和候选 CPU，但有 lease/fallback 约束。
+
+## 9. 实验怎样证明闭环有效
+
+测试只运行 dynamic_mix：Redis、Nginx、PostgreSQL 提供 P99，FFmpeg、RocksDB、zstd
+提供持续吞吐，OpenSSL 提供周期压力。Host 为 Native 和 Agent 分别创建同一模板的独立
+VM overlay，固定 6 vCPU、3 GB、1 socket × 3 cores × 2 threads、CPU pin 和 3.3 GHz。
+
+冻结版本在 campaign `20260730-144717-822781` 中的一轮完整配对结果：
+
+| 指标 | Native | Agent | Agent 相对结果 |
+| --- | ---: | ---: | ---: |
+| 聚合 P99 | 3,706.5 us | 1,851.0 us | 降低 50.06% |
+| 综合吞吐 | 51.211 units/s | 53.694 units/s | 提升 4.85% |
+| 平均 CPU | 80.91% | 80.63% | -0.28 pp |
+
+该轮同时验证六个目标应用、周期峰值、分类 generation、policy feedback/placement、
+dispatch 健康、控制面 CPU/RSS、perf 事件和清理状态。单轮只表达这一对 VM 的观测，
+不估计跨 repeat 置信区间；完整数据由每次测试生成到
+test/output/performance/<timestamp>/report.md。
+
+## 10. 跨组件不变量
+
+1. LLM 永不进入 BPF 调度热路径。
+2. PID 1、内核线程、Agent、scheduler 和非 SCHED_OTHER 任务不进入自定义数据面。
+3. 新任务、缺失分类和模型失败都能立即按 Balanced 运行。
+4. 分类更新必须绑定 scheduler epoch、完整身份和连续 generation。
+5. task_control 事务必须先写 BPF，后写 cache；后续失败必须回滚。
+6. runnable queue 只由 BPF 拥有，Rust 不发逐任务 dispatch 命令。
+7. CPU 选择必须服从 online、cpus_ptr 和 migration 状态。
+8. 动态 policy 必须完整双槽发布，并带 lease 与不可变 fallback。
+9. 所有循环、扫描、队列、frame、map 和 cache 都有静态上界。
+10. 性能结论只来自同 repeat、同配置且两侧都有效的 Native/Agent 配对。
+
+## 11. 实现索引
+
+| 主题 | 主要实现 |
+| --- | --- |
+| Agent 启动与主循环 | Adaptive-OS-Agent/src/main.rs |
+| /proc 身份、脱敏、准入 | metadata.rs、discovery.rs、task_admission.rs |
+| 语义与行为分类 | deepseek.rs、process_classifier.rs、thread_classifier.rs、behavior.rs |
+| 分类状态和 generation | registry.rs |
+| Agent/scheduler 协议 | scheduler_client.rs、scheduler/rust/src/control.rs |
+| Rust identity 与事务 | engine.rs、process.rs、scheduler/rust/src/main.rs |
+| topology 与动态 policy | topology.rs、policy.rs |
+| BPF ABI、maps 与调度热路径 | bpf/intf.h、bpf/scx_adaptive.bpf.c |
+| Host/VM/Guest 实验 | test/test_core/vm、test/test_core/benchmark |
+| 真实负载 | test/image/real_workloads/aoa-real-workload |
+| 离线验收与报告 | test/test_core/benchmark/analysis.py |

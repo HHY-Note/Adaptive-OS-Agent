@@ -1,220 +1,166 @@
-# 真实应用性能测试
+# 动态混合真实应用性能测试
 
-`test/` 在相同的 6 vCPU 虚拟机环境中比较 Linux 原生调度器和 Adaptive OS Agent。测试负载不是 Host 临时生成的程序，而是预先固化到 qcow2 模板中的真实应用。测试时只需传入 `latency`、`throughput`、`balanced` 或 `mix`。
-
-详细协议和实现边界见 [`Design.md`](Design.md)。
-
-```text
-benchmark.py ─▶ read-only template + temporary overlay ─▶ VM
-     │                                                    │
-     ├─ Native/Agent paired schedule                      ├─ image workload service
-     ├─ upload control payloads                           ├─ collector + perf
-     └─ download + validate + analyze ◀───────────────────└─ application metrics
-```
-
-## 目录
+`test/` 在同一套 openEuler 虚拟机环境中，对 Linux Native 调度器和
+Adaptive OS Agent 做 repeat 配对比较。性能入口只保留一个：
 
 ```text
-test/
-├── config.yaml
-├── configs/agent.performance.toml
-├── image/
-│   ├── build_workload_image.py       仅模板维护，正常测试不调用
-│   └── real_workloads/
-│       ├── install.sh
-│       ├── versions.env
-│       ├── aoa-real-workload
-│       ├── aoa-real-workload-autostart.service
-│       ├── summarize_workloads.py
-│       └── redis/nginx 配置与静态数据
-├── scripts/
-│   ├── benchmark.py
-│   ├── check_env.py
-│   ├── cpu_isolation.sh
-│   ├── set_cpu_frequency.sh
-│   └── restore_cpu_frequency.sh
-├── guest_tools/benchmark_collector.py
-├── test_core/
-└── tests/test_benchmark.py
+dynamic_mix
 ```
 
-## 固化应用
-
-模板路径由 `config.yaml` 唯一指定，当前为：
+该场景同时包含交互服务、持续计算任务和周期性压力，直接观察 Agent 是否能降低
+P99，并把吞吐代价控制在可接受范围。每次测试完成后自动生成
+output/performance/<timestamp>/report.md；完整实验约束见 Design.md。
 
 ```text
-/var/lib/libvirt/images/aoa-lab/template.qcow2
+benchmark.py -> read-only template + per-run overlay -> openEuler VM
+      |                                                |
+      |-- randomized Native/Agent pair                 |-- real applications
+      |-- environment and image preflight              |-- collector + perf
+      `-- validation and paired analysis <-------------'-- native metrics
 ```
 
-正常 `benchmark.py` 只读该模板并自动生成每 run overlay，不构建、压缩或刷新镜像。
-`image/build_workload_image.py` 只在负载版本变更时用于生成新 candidate，普通测试用户无需执行。
+## 负载组成
 
-镜像包含以下应用和工具：
+应用集合只在 `image/real_workloads/aoa-real-workload` 中定义。Host 不根据场景
+重复拼装负载，也不把应用真值提供给 Agent。
 
-- Redis 7.2、Memcached 1.6、Nginx 1.24、PostgreSQL/pgbench 15；
-- FFmpeg、RocksDB `db_bench` 8.5.4、zstd、OpenSSL、ImageMagick；
-- etcd 3.4、NATS server 2.14.3、NATS CLI 0.4.0；
-- memtier_benchmark 2.5.1 和固定提交的 wrk2。
-
-第三方源码版本和 SHA-256 全部固定在 `image/real_workloads/versions.env`。正式模板不保留下载缓存、包缓存和中间目标，因此磁盘压力来自运行数据，不来自无关构建垃圾。
-
-PostgreSQL 的 pgbench scale 4 数据库已固化。Redis、Memcached 的 20,000 个键以及 RocksDB 的 200,000 条 256-byte 数据在每次 run 的临时 overlay 中准备，不污染只读模板。
-
-## 四种场景
-
-应用集合写死在 `image/real_workloads/aoa-real-workload`，不在 Host 配置中重复维护。
-
-表中的角色描述带显式目标的 client/job。没有进程级 SLO 或本机批处理目标的 server 组件统一按 `balanced` 观测，不从场景名称推导生产分类。
-角色只写入 collector 使用的 `targets.jsonl` 作为验收真值；Agent 不读该文件、场景名称或应用
-`metrics.json`。
-
-| 场景 | latency 角色 | throughput 角色 | balanced 角色 |
-| --- | --- | --- | --- |
-| `latency` | Redis、Memcached、Nginx、PostgreSQL | zstd-background | 无 |
-| `throughput` | Redis sentinel | FFmpeg、RocksDB、zstd、OpenSSL、ImageMagick | 无 |
-| `balanced` | 无 | 无 | Redis、Memcached、PostgreSQL、NATS |
-| `mix` | Redis、Nginx、PostgreSQL | FFmpeg、RocksDB、zstd、ImageMagick | etcd、NATS |
-
-在 6 vCPU Guest 中，压力预算为 `vcpus - 1 = 5`，客户端线程数为 `ceil(5 / 2) = 3`。这里的“预留一个 latency CPU”只是并发需求预算，不设置 affinity，也不把任何 CPU 从内核或 scheduler 手中隔离。正式 Host 的物理核隔离由独立的 Host 准备脚本完成。
-
-## 安全约束
-
-负载启动器只创建普通用户态进程，明确不执行以下操作：
-
-- 不设置 affinity、nice、实时调度策略或 cgroup；
-- 不修改 sched_ext、sysctl、IRQ 或 CPU online 状态；
-- 不枚举并操作 Agent、scheduler 或内核线程；
-- 不在正式模板上保存运行结果。
-
-Agent/scheduler 仍由现有测试协议启动和停止。collector 只读目标进程及其动态后代的 `/proc` 数据和 Agent Tool socket。每个 Agent run 结束必须确认 sched_ext 为 `disabled`。
-
-## CPU 准备
-
-Host 的完整物理核分配为：
-
-| 用途 | Host 物理核 | Host 逻辑 CPU |
+| 组成 | 应用 | 业务指标 |
 | --- | --- | --- |
-| Linux、QEMU emulator、IRQ | 0、1、2 | `0-5` |
-| Guest vCPU | 3、4、5 | `6-11` |
+| 交互延迟 | Redis、Nginx、PostgreSQL | P99 latency |
+| 持续吞吐 | FFmpeg、RocksDB、zstd | iterations/s 或 ops/s |
+| 周期压力 | OpenSSL AES-256-GCM，3 workers | 2 s active / 10 s period |
 
-正式 Guest 是 openEuler 24.03 LTS-SP4 x86_64，内核为 `6.6.0-scx`。这是当前性能
-可比基线；通用 collector 可在其他 Linux 上运行，但完整 Agent campaign 要求兼容的
-sched_ext/BTF/BPF 环境。
+在 6 vCPU Guest 中，请求率和并发按 `vcpus - 1` 的压力预算缩放。该预算只决定
+工作量，不设置 affinity、cpuset、nice 或实时调度策略。CPU 选择始终由被测内核
+调度器完成。
 
-Guest 拓扑固定为 `1 socket x 3 cores x 2 threads`。首次启用隔离并重启：
+每个 run 都写出并验证负载合同：
 
-```bash
-sudo test/scripts/cpu_isolation.sh enable
-sudo reboot
-```
+- 平均 CPU 必须在 70% 到 90%；
+- 测量窗口必须包含至少 4 个 `>=95%` CPU 采样；
+- 必须完成至少 5 次周期压力；
+- FFmpeg、RocksDB、zstd 必须覆盖至少 90% 的测量窗口；
+- 三项延迟应用和三项持续吞吐应用都必须产出有效原生指标。
 
-每次 campaign 前固定频率，结束后恢复：
+## 固定实验环境
 
-```bash
-sudo test/scripts/set_cpu_frequency.sh
-sudo test/scripts/restore_cpu_frequency.sh
-```
+| 项目 | 配置 |
+| --- | --- |
+| Guest OS | openEuler 24.03 LTS-SP4 x86_64 |
+| Guest kernel | 6.6.0-scx |
+| Guest CPU | 1 socket x 3 cores x 2 SMT threads |
+| Guest vCPU pin | Host CPU 6-11 |
+| QEMU emulator pin | Host CPU 0-5 |
+| CPU governor | performance |
+| workload warmup | 20 s |
+| measurement | 60 s |
+| current submission | 1 Native/Agent pair |
+| optional repeat profile | 3 pairs |
 
-环境预检会验证 KVM、libvirt network、模板、密钥、构建产物、完整物理核分区、隔离参数和 CPU frequency policy：
+模板镜像路径由 `config.yaml` 唯一指定。正常测试只读模板，并为每个 run 创建临时
+qcow2 overlay；测试结束后删除 overlay，不修改模板。
+
+## 运行
+
+先执行只读环境检查：
 
 ```bash
 python3 test/scripts/check_env.py
 ```
 
-## 运行
-
-查看一种场景的确定性计划：
+查看当前单轮的确定性执行计划：
 
 ```bash
-python3 test/scripts/benchmark.py latency --dry-run
-python3 test/scripts/benchmark.py throughput --dry-run
-python3 test/scripts/benchmark.py balanced --dry-run
-python3 test/scripts/benchmark.py mix --dry-run
+python3 test/scripts/benchmark.py dynamic_mix --single-round --dry-run
 ```
 
-执行时只需传入测试类型：
+当前提交运行一组完整配对：
 
 ```bash
-python3 test/scripts/benchmark.py latency
-python3 test/scripts/benchmark.py throughput
-python3 test/scripts/benchmark.py balanced
-python3 test/scripts/benchmark.py mix
+python3 test/scripts/benchmark.py dynamic_mix --single-round
 ```
 
-省略参数或使用 `all` 会运行全部场景。正式模式每个场景运行 `2 variants x 3 repeats`；`all` 共 24 个独立 VM run。调度方案迭代可用一次 Native/Agent 配对：
+需要补充跨 repeat 离散程度时，可选运行 config.yaml 保留的 3-pair profile：
 
 ```bash
-python3 test/scripts/benchmark.py mix --single-round
+python3 test/scripts/benchmark.py dynamic_mix --dry-run
+python3 test/scripts/benchmark.py dynamic_mix
 ```
 
-单轮结果只用于实现验证，不能替代三轮正式统计。
+单轮包含一个 Native run 和一个 Agent run。两侧都通过环境、负载合同、应用指标、
+perf、Agent 健康与清理门禁后，才生成对比结论；CLI 不接受其他性能场景。
 
-## 测量协议
+重新分析已有 campaign，不启动虚拟机：
 
-libvirt 用 SMBIOS serial `aoa-profile-{scenario}` 选择镜像内场景。service 开机后启动对应 server、准备数据并发布 `SERVERS_READY`，然后等待 Host/Guest 测试脚本写入统一时间窗。
+```bash
+python3 test/scripts/benchmark.py \
+  --analyze-only test/output/performance/<timestamp>
+```
 
-正式配置为 20 秒预热、60 秒测量、3 秒冷却。测量阶段重新创建所有 client 进程并记录根 PID 与 start ticks；collector 动态发现后代进程和线程。Native 和 Agent 使用同一套镜像、数据、应用参数和测量边界。
+## 测量与配对
 
-P99 指标来自 memtier、wrk2 和 pgbench。吞吐来自应用原生结果或有明确定义的 work-units/elapsed。不同应用量纲不直接相加：场景汇总采用各应用正值指标的几何平均。
+Native 和 Agent 使用相同只读模板、应用参数、vCPU 拓扑和测量时长，但运行在各自
+独立的 overlay 中。每个 repeat 内两种变体相邻执行，顺序由固定 seed 随机化。
 
-| 数据层 | 来源 | 应用间是否不同 |
-| --- | --- | --- |
-| 通用调度观测 | `/proc/stat`、`/proc/<pid>/...`、CPU 拓扑 | 否，统一跟踪根 PID、后代和线程 |
-| Agent/scheduler 观测 | 只读 Tool socket | 否，仅 Agent 变体存在 |
-| 应用业务指标 | memtier/wrk2/pgbench/其他原生输出 | 是，在指标归一化层分别解析 |
-| 全 Guest 硬件计数 | `perf stat -a` | 否 |
+指标口径：
 
-collector 脚本每 run 通过 SCP 上传；结果优先用 SSH tar stream 回收，失败时回退到
-`scp -r`。
+- 聚合 P99：Redis、Nginx、PostgreSQL P99 微秒值的几何平均，越低越好；
+- 综合吞吐：FFmpeg、RocksDB、zstd 原生速率的几何平均，越高越好；
+- 配对改善：只比较相同 repeat 的 Native 与 Agent；
+- 单轮报告：直接给出同一配对改善，不伪造跨 repeat 置信区间；
+- 多 repeat 报告：给出配对改善中位数及 bootstrap 95% CI；
+- 应用级报告：逐项保留应用自身单位，不直接相加。
+
+Agent run 还会记录分类时间线、策略更新、fast-path 调度计数、异常计数、控制面 CPU
+和 RSS。分类准确率按时间线对应的 schedstat 运行时间加权，避免用单个瞬时快照代表
+整个测量窗口。
 
 ## 有效性门槛
 
-以下任一条件失败，run 都保留证据但不进入配对结论：
+以下任一条件失败，该 run 保留原始证据，但不进入性能结论：
 
-- live domain 的 vCPU pin、emulator pin、拓扑、SMBIOS profile 或 discard 配置不匹配；
-- Guest 不是 6 个在线 CPU、3 个 core、每 core 2 threads；
-- service 未启用、场景不匹配、应用退出失败或耗时无效；
-- 场景角色数量、P99 数量、吞吐数量或压力预算不满足约束；
-- collector 未覆盖全部应用、未观察到线程或发生超时；
-- `perf stat` 缺少要求事件；
-- Native 测量期间 sched_ext 不是 `disabled`；
-- Agent 缺少分类快照、scheduler epoch 改变、event overflow、capacity hit、registry 未就绪或 degraded；
-- 普通负载未进入 sched_ext，或 PID 1、内核任务、Agent、scheduler 错误进入 sched_ext；
-- Agent 结束后 sched_ext 没有恢复为 `disabled`；
-- domain 或临时 overlay 清理失败。
+- KVM、libvirt、模板 SHA-256、CPU 分区或频率预检失败；
+- live domain 的 pin、拓扑、SMBIOS profile 或磁盘参数不匹配；
+- Guest CPU 拓扑、workload service 或测量窗口不正确；
+- 应用退出异常、缺少 P99/吞吐指标或负载合同未通过；
+- collector 未覆盖目标应用，或 perf 必需事件缺失；
+- Native 测量期间 sched_ext 不是 disabled；
+- Agent 缺少 scheduler 数据，或出现 event overflow、capacity hit、degraded；
+- Agent/scheduler 误调度受保护任务，或结束后 sched_ext 未恢复；
+- domain、overlay 或临时资源清理失败。
 
 ## 输出
 
 ```text
 test/output/performance/<timestamp>/
-├── campaign.json
-├── preflight.json
-├── comparison.json
-├── summary.csv
-├── report.md
-└── runs/<sequence>__r<repeat>__<scenario>__<variant>/
-    ├── result.json
-    ├── benchmark-summary.json
-    ├── domain.xml
-    ├── run_guest.sh
-    ├── scheduler.stdout
-    ├── scheduler.stderr
-    └── benchmark/
-        ├── environment.json
-        ├── perf-stat.csv
-        ├── validation.json
-        ├── real-workloads/
-        │   ├── pressure-plan.json
-        │   ├── targets.jsonl
-        │   └── apps/<name>/metrics.json
-        └── observations/
+|-- campaign.json
+|-- preflight.json
+|-- comparison.json
+|-- summary.csv
+|-- report.md
+`-- runs/<sequence>__r<repeat>__dynamic_mix__<variant>/
+    |-- result.json
+    |-- benchmark-summary.json
+    |-- domain.xml
+    |-- run_guest.sh
+    `-- benchmark/
+        |-- environment.json
+        |-- validation.json
+        |-- perf-stat.csv
+        |-- real-workloads/
+        `-- observations/
 ```
 
-`report.md` 比较同一场景、同一 repeat 的有效 Native/Agent 配对。延迟改善按数值下降计算，吞吐改善按数值上升计算，并给出中位数和 bootstrap 95% 区间。
+`report.md` 包含总体性能、六个应用逐项结果、实测 CPU/突发证据、分类闭环、
+调度健康、控制面开销和复现环境。`comparison.json` 保存同一信息的结构化版本。
 
-不启动虚拟机的本地回归与计划校验：
+## 本地回归
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s test/tests -v
-python3 test/scripts/benchmark.py all --dry-run
+bash -n test/image/real_workloads/aoa-real-workload
+python3 test/scripts/benchmark.py dynamic_mix --single-round --dry-run
 ```
+
+测试启动器不设置 Guest 内任务 affinity、nice、实时策略或 cgroup，也不修改
+sched_ext、sysctl、IRQ 或 CPU online 状态。

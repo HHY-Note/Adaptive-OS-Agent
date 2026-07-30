@@ -12,6 +12,7 @@ pub mod config;
 pub mod control;
 pub mod engine;
 pub mod identity;
+pub mod policy;
 pub mod process;
 pub mod stats;
 pub mod topology;

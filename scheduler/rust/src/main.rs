@@ -21,6 +21,7 @@ use scx_adaptive::control::{
 };
 use scx_adaptive::engine::{EngineNotice, SchedulerEngine};
 use scx_adaptive::identity::{ClassStage, ProcessKey, TaskKey};
+use scx_adaptive::policy::{aggregate_runtime_ns, PolicyController, PolicyObservation};
 use scx_adaptive::process::{
     ProcessClassUpdate, ProcessDefaultCache, TaskClassCache, TaskClassUpdate,
 };
@@ -383,6 +384,7 @@ fn apply_control_request(
     sync: &mut RegistrySyncState,
     engine: &mut SchedulerEngine,
     bpf: &BpfRuntime<'_>,
+    policy: &PolicyController,
     control: &ControlHandle,
 ) -> SchedulerMessage {
     let request_id = envelope.request_id;
@@ -471,6 +473,7 @@ fn apply_control_request(
                 control_messages_dropped: control.dropped_messages(),
                 scheduler: engine.stats().clone(),
                 data_plane,
+                policy: policy.status(),
                 cpu_count: engine.cpu_count(),
                 tasks: engine.task_count(),
             });
@@ -744,12 +747,15 @@ fn run_scheduler(
     let shutdown = Arc::new(AtomicBool::new(false));
     install_shutdown_handler(shutdown.clone())?;
     let mut agent_watch = AgentWatch::new(cli.agent_pid)?;
+    let mut policy = PolicyController::new(&config, &topology, monotonic_now_ns()?)
+        .context("build initial topology policy")?;
 
     let mut open_object = MaybeUninit::<OpenObject>::uninit();
     let mut bpf = BpfRuntime::load(
         &mut open_object,
         &config,
         &topology,
+        policy.snapshot(),
         cli.agent_pid,
         cli.debug,
     )
@@ -779,6 +785,12 @@ fn run_scheduler(
         if agent_watch.expired(config.agent_exit_grace) {
             warn!("Agent exited; detaching sched_ext after configured grace period");
             break;
+        }
+
+        let policy_now_ns = monotonic_now_ns()?;
+        if policy.lease_refresh_due(policy_now_ns) {
+            policy.renew_lease(policy_now_ns);
+            bpf.renew_policy_lease(policy.snapshot())?;
         }
 
         let mut did_work = false;
@@ -824,6 +836,7 @@ fn run_scheduler(
                 &mut sync,
                 &mut engine,
                 &bpf,
+                &policy,
                 &control,
             );
             response_cache.insert(&envelope, &response);
@@ -863,6 +876,33 @@ fn run_scheduler(
                     last_event_overflows = stats.event_overflows;
                 } else {
                     overflow_windows = 0;
+                }
+                if let Ok(cpu_pressure) = bpf.cpu_pressure(engine.cpu_count()) {
+                    let observation = PolicyObservation {
+                        runtime_ns_by_class: aggregate_runtime_ns(&cpu_pressure),
+                        dispatches_by_class: stats.fast_path_dispatches_by_class,
+                        preemptions_by_class: stats.fast_path_preemptions_by_class,
+                        preemption_throttles: stats.fast_path_preemption_throttles,
+                        latency_backlog_boosts: stats.fast_path_latency_backlog_boosts,
+                        latency_budget_charge_events: stats.fast_path_latency_budget_charge_events,
+                        latency_budget_runtime_ns: stats.fast_path_latency_budget_runtime_ns,
+                    };
+                    if policy.observe(now_ns, observation, &cpu_pressure) {
+                        bpf.publish_policy(policy.snapshot())
+                            .context("publish runtime-adapted scheduler policy")?;
+                        debug!(
+                            "policy generation={} latency_share_per_mille={} budget={}pct service={}ns successor_lease={}ns preemption_floor={}ns preemption_interval={}ns balanced_granularity={}ns balanced_preemption_rate={}permille",
+                            policy.status().generation,
+                            policy.status().last_latency_share_per_mille,
+                            policy.status().latency_budget_percent,
+                            policy.status().observed_latency_service_ns,
+                            policy.status().latency_successor_lease_ns,
+                            policy.status().preemption_interval_floor_ns,
+                            policy.status().preemption_interval_ns,
+                            policy.status().balanced_preemption_granularity_ns,
+                            policy.status().last_balanced_preemption_rate_per_mille,
+                        );
+                    }
                 }
             }
             if overflow_windows >= MAX_CONSECUTIVE_OVERFLOW_WINDOWS {
@@ -918,8 +958,9 @@ fn main() -> Result<()> {
 
     if cli.validate_only {
         info!(
-            "configuration valid: cpus={} slices={}/{}/{} ns tasks={} frame={}",
+            "configuration valid: cpus={} domains={} slices={}/{}/{} ns tasks={} frame={}",
             topology.cpu_count(),
+            topology.domain_count(),
             config.latency_slice_ns,
             config.balanced_slice_ns,
             config.throughput_slice_ns,

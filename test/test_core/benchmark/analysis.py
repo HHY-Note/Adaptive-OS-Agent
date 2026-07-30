@@ -12,6 +12,15 @@ from typing import Any, Callable
 
 
 MetricDefinition = tuple[str, Callable[[dict[str, Any]], float], bool, str, bool]
+DYNAMIC_MIX_SCENARIO = "dynamic_mix"
+APPLICATION_LABELS = {
+    "redis": "Redis",
+    "nginx": "Nginx",
+    "postgresql": "PostgreSQL",
+    "ffmpeg": "FFmpeg",
+    "rocksdb": "RocksDB",
+    "zstd": "zstd",
+}
 
 
 def analyze_run(run_dir: str | Path) -> dict[str, Any]:
@@ -35,26 +44,23 @@ def analyze_run(run_dir: str | Path) -> dict[str, Any]:
         reasons.append("invalid measurement window")
 
     applications = _application_metrics(bench_dir, reasons)
-    latency = (
-        _latency_metrics(applications, reasons)
-        if scenario in {"latency", "mix"}
-        else None
-    )
-    throughput = (
-        _throughput_metrics(applications, reasons)
-        if scenario in {"throughput", "mix"}
-        else None
-    )
-    balanced = (
-        _balanced_metrics(applications, reasons)
-        if scenario in {"balanced", "mix"}
-        else None
-    )
+    latency = _latency_metrics(applications, reasons)
+    throughput = _throughput_metrics(applications, reasons)
     classification = _classification_metrics(
         bench_dir, start_ns, end_ns, enabled=variant == "agent"
     )
     perf = _perf_metrics(bench_dir / "perf-stat.csv")
     scheduler = _scheduler_metrics(bench_dir, start_ns, end_ns)
+    cpu_utilization = _cpu_utilization_metrics(bench_dir, start_ns, end_ns)
+    load_contract = _load_contract_metrics(
+        bench_dir,
+        applications,
+        cpu_utilization,
+        start_ns,
+        end_ns,
+        required=True,
+    )
+    reasons.extend(load_contract["violations"])
     if benchmark.get("require_perf") is True:
         missing_events = [
             event for event in benchmark.get("perf_events", []) if perf.get(event) is None
@@ -86,12 +92,13 @@ def analyze_run(run_dir: str | Path) -> dict[str, Any]:
             "end_ns": end_ns,
             "duration_seconds": (end_ns - start_ns) / 1_000_000_000 if end_ns > start_ns else 0,
         },
+        "environment": _read_json(bench_dir / "environment.json"),
         "applications": applications,
         "latency": latency,
         "throughput": throughput,
-        "balanced": balanced,
         "perf": perf,
-        "cpu_utilization": _cpu_utilization_metrics(bench_dir, start_ns, end_ns),
+        "cpu_utilization": cpu_utilization,
+        "load_contract": load_contract,
         "task_scheduling": _schedstat_metrics(bench_dir, start_ns, end_ns),
         "overhead": _overhead_metrics(bench_dir, start_ns, end_ns),
         "scheduler": scheduler,
@@ -115,10 +122,19 @@ def analyze_campaign(
 
     valid = [summary for summary in summaries if summary["valid"]]
     comparisons = _comparisons(valid, bootstrap_samples=bootstrap_samples, seed=seed)
+    application_comparisons = _application_comparisons(
+        valid, bootstrap_samples=bootstrap_samples, seed=seed
+    )
+    system_comparisons = _system_comparisons(
+        valid, bootstrap_samples=bootstrap_samples, seed=seed
+    )
     run_profiles = {str(summary["profile"]) for summary in summaries}
     profile = str(manifest.get("profile", next(iter(run_profiles), "formal")))
     if run_profiles and run_profiles != {profile}:
         profile = "mixed"
+    preflight = _read_json(root / "preflight.json")
+    methodology = _campaign_methodology(manifest, preflight, summaries)
+    methodology["campaign_id"] = root.name
     output = {
         "schema_version": 4,
         "profile": profile,
@@ -126,7 +142,23 @@ def analyze_campaign(
         "valid_runs": len(valid),
         "invalid_runs": len(summaries) - len(valid),
         "comparisons": comparisons,
+        "application_comparisons": application_comparisons,
+        "system_comparisons": system_comparisons,
         "classification": _campaign_classification(valid),
+        "agent_evidence": _campaign_agent_evidence(valid),
+        "environment": _campaign_environment(valid),
+        "methodology": methodology,
+        "load_contracts": [
+            {
+                "scenario": summary["scenario"],
+                "variant": summary["variant"],
+                "repeat": summary["repeat"],
+                "valid": summary["load_contract"].get("valid", False),
+                **summary["load_contract"].get("observed", {}),
+            }
+            for summary in summaries
+            if summary["load_contract"].get("present")
+        ],
         "invalid": [
             {
                 "run_dir": summary["run_dir"],
@@ -175,6 +207,7 @@ def _latency_metrics(
         name: float(metric["p99_ms"]) * 1000
         for name, metric in applications.items()
         if metric.get("role") == "latency"
+        and metric.get("objective", True) is True
         and isinstance(metric.get("p99_ms"), (int, float))
         and float(metric["p99_ms"]) > 0
     }
@@ -198,12 +231,6 @@ def _throughput_metrics(
     return _rate_metrics(applications, reasons, role="throughput")
 
 
-def _balanced_metrics(
-    applications: dict[str, dict[str, Any]], reasons: list[str]
-) -> dict[str, Any]:
-    return _rate_metrics(applications, reasons, role="balanced")
-
-
 def _rate_metrics(
     applications: dict[str, dict[str, Any]], reasons: list[str], *, role: str
 ) -> dict[str, Any]:
@@ -211,6 +238,7 @@ def _rate_metrics(
         name: float(metric["throughput_per_second"])
         for name, metric in applications.items()
         if metric.get("role") == role
+        and metric.get("objective", True) is True
         and isinstance(metric.get("throughput_per_second"), (int, float))
         and float(metric["throughput_per_second"]) > 0
     }
@@ -412,6 +440,167 @@ def _cpu_utilization_metrics(
     return result
 
 
+def _cpu_interval_utilizations(
+    bench_dir: Path, start_ns: int, end_ns: int
+) -> list[float]:
+    snapshots: dict[int, dict[int, dict[str, Any]]] = defaultdict(dict)
+    for row in _read_jsonl(bench_dir / "observations" / "cpu-stats.jsonl"):
+        observed_ns = int(row.get("observed_ns", 0))
+        cpu = int(row.get("cpu", -1))
+        if start_ns <= observed_ns <= end_ns and cpu >= 0:
+            snapshots[observed_ns][cpu] = row
+
+    busy_fields = (
+        "user_ticks",
+        "nice_ticks",
+        "system_ticks",
+        "irq_ticks",
+        "softirq_ticks",
+        "steal_ticks",
+    )
+    idle_fields = ("idle_ticks", "iowait_ticks")
+    values: list[float] = []
+    ordered = sorted(snapshots.items())
+    for (_before_ns, before), (_after_ns, after) in zip(ordered, ordered[1:]):
+        cpus = set(before) & set(after)
+        if not cpus:
+            continue
+        busy = sum(
+            max(0, int(after[cpu].get(field, 0)) - int(before[cpu].get(field, 0)))
+            for cpu in cpus
+            for field in busy_fields
+        )
+        idle = sum(
+            max(0, int(after[cpu].get(field, 0)) - int(before[cpu].get(field, 0)))
+            for cpu in cpus
+            for field in idle_fields
+        )
+        if busy + idle:
+            values.append(busy / (busy + idle))
+    return values
+
+
+def _load_contract_metrics(
+    bench_dir: Path,
+    applications: dict[str, dict[str, Any]],
+    cpu_utilization: dict[str, Any],
+    start_ns: int,
+    end_ns: int,
+    *,
+    required: bool,
+) -> dict[str, Any]:
+    contract = _read_json(bench_dir / "real-workloads" / "load-contract.json")
+    result: dict[str, Any] = {
+        "required": required,
+        "present": bool(contract),
+        "valid": not required,
+        "contract": contract,
+        "observed": {},
+        "violations": [],
+    }
+    violations: list[str] = result["violations"]
+    if not contract:
+        if required:
+            violations.append("dynamic_mix load contract is missing")
+            result["valid"] = False
+        return result
+
+    average_contract = contract.get("average_utilization")
+    burst_contract = contract.get("burst")
+    if not isinstance(average_contract, dict) or not isinstance(burst_contract, dict):
+        violations.append("dynamic_mix load contract structure is invalid")
+        result["valid"] = False
+        return result
+
+    average = cpu_utilization.get("utilization")
+    minimum = average_contract.get("minimum")
+    maximum = average_contract.get("maximum")
+    interval_values = _cpu_interval_utilizations(bench_dir, start_ns, end_ns)
+    burst_minimum = burst_contract.get("utilization_minimum")
+    minimum_high_samples = burst_contract.get("minimum_high_utilization_samples")
+    minimum_completed = burst_contract.get("minimum_completed_bursts")
+    if not all(
+        isinstance(value, (int, float)) and not isinstance(value, bool)
+        for value in (
+            average,
+            minimum,
+            maximum,
+            burst_minimum,
+            minimum_high_samples,
+            minimum_completed,
+        )
+    ):
+        violations.append("dynamic_mix load contract contains non-numeric thresholds")
+        result["valid"] = False
+        return result
+
+    high_samples = sum(value >= float(burst_minimum) for value in interval_values)
+    timeline = [
+        row
+        for row in _read_jsonl(
+            bench_dir / "real-workloads" / "burst-timeline.jsonl"
+        )
+        if start_ns <= int(row.get("observed_ns", 0)) <= end_ns
+    ]
+    starts = {
+        int(row["burst"])
+        for row in timeline
+        if row.get("event") == "start" and isinstance(row.get("burst"), int)
+    }
+    ends = {
+        int(row["burst"])
+        for row in timeline
+        if row.get("event") == "end" and isinstance(row.get("burst"), int)
+    }
+    completed_bursts = len(starts & ends)
+    duration_seconds = max(0.0, (end_ns - start_ns) / 1_000_000_000)
+    continuous_apps: dict[str, dict[str, Any]] = {}
+    for name in contract.get("continuous_throughput_apps", []):
+        metric = applications.get(str(name), {})
+        elapsed = metric.get("elapsed_seconds")
+        spans_window = (
+            metric.get("role") == "throughput"
+            and metric.get("objective", True) is True
+            and isinstance(elapsed, (int, float))
+            and float(elapsed) >= duration_seconds * 0.9
+        )
+        continuous_apps[str(name)] = {
+            "elapsed_seconds": elapsed,
+            "spans_measurement": spans_window,
+        }
+        if not spans_window:
+            violations.append(
+                f"continuous throughput app {name} did not span the measurement window"
+            )
+
+    if not float(minimum) <= float(average) <= float(maximum):
+        violations.append(
+            "average CPU utilization "
+            f"{float(average):.3f} is outside {float(minimum):.2f}..{float(maximum):.2f}"
+        )
+    if high_samples < int(minimum_high_samples):
+        violations.append(
+            f"observed {high_samples} burst samples at or above "
+            f"{float(burst_minimum):.2f}, expected at least {int(minimum_high_samples)}"
+        )
+    if completed_bursts < int(minimum_completed):
+        violations.append(
+            f"observed {completed_bursts} completed bursts, "
+            f"expected at least {int(minimum_completed)}"
+        )
+
+    result["observed"] = {
+        "average_utilization": float(average),
+        "interval_utilization": _distribution(interval_values),
+        "interval_samples": len(interval_values),
+        "high_utilization_samples": high_samples,
+        "completed_bursts": completed_bursts,
+        "continuous_throughput_apps": continuous_apps,
+    }
+    result["valid"] = not violations
+    return result
+
+
 def _schedstat_breakdown(
     values: dict[str, dict[str, int]],
 ) -> dict[str, dict[str, int | float | None]]:
@@ -484,9 +673,53 @@ def _scheduler_metrics(bench_dir: Path, start_ns: int, end_ns: int) -> dict[str,
             "data_plane",
             "fast_path_preemption_throttles",
         ),
+        "fast_path_preemption_deferrals": (
+            "data_plane",
+            "fast_path_preemption_deferrals",
+        ),
         "fast_path_latency_backlog_boosts": (
             "data_plane",
             "fast_path_latency_backlog_boosts",
+        ),
+        "fast_path_latency_steal_attempts": (
+            "data_plane",
+            "fast_path_latency_steal_attempts",
+        ),
+        "fast_path_latency_remote_steals": (
+            "data_plane",
+            "fast_path_latency_remote_steals",
+        ),
+        "fast_path_shared_balanced_enqueues": (
+            "data_plane",
+            "fast_path_shared_balanced_enqueues",
+        ),
+        "fast_path_shared_balanced_dispatch_attempts": (
+            "data_plane",
+            "fast_path_shared_balanced_dispatch_attempts",
+        ),
+        "fast_path_shared_balanced_dispatches": (
+            "data_plane",
+            "fast_path_shared_balanced_dispatches",
+        ),
+        "fast_path_shared_balanced_dispatch_failures": (
+            "data_plane",
+            "fast_path_shared_balanced_dispatch_failures",
+        ),
+        "fast_path_shared_latency_enqueues": (
+            "data_plane",
+            "fast_path_shared_latency_enqueues",
+        ),
+        "fast_path_shared_latency_dispatch_attempts": (
+            "data_plane",
+            "fast_path_shared_latency_dispatch_attempts",
+        ),
+        "fast_path_shared_latency_dispatches": (
+            "data_plane",
+            "fast_path_shared_latency_dispatches",
+        ),
+        "fast_path_shared_latency_dispatch_failures": (
+            "data_plane",
+            "fast_path_shared_latency_dispatch_failures",
         ),
         "fast_path_local_dispatches": (
             "data_plane",
@@ -512,6 +745,22 @@ def _scheduler_metrics(bench_dir: Path, start_ns: int, end_ns: int) -> dict[str,
             "data_plane",
             "fast_path_prev_continuations",
         ),
+        "fast_path_steal_latency_source_admissions": (
+            "data_plane",
+            "fast_path_steal_latency_source_admissions",
+        ),
+        "fast_path_steal_latency_successor_deferrals": (
+            "data_plane",
+            "fast_path_steal_latency_successor_deferrals",
+        ),
+        "fast_path_steal_scan_exhaustions": (
+            "data_plane",
+            "fast_path_steal_scan_exhaustions",
+        ),
+        "fast_path_remote_backlog_no_dispatches": (
+            "data_plane",
+            "fast_path_remote_backlog_no_dispatches",
+        ),
         "fast_path_steal_claim_conflicts": (
             "data_plane",
             "fast_path_steal_claim_conflicts",
@@ -523,6 +772,277 @@ def _scheduler_metrics(bench_dir: Path, start_ns: int, end_ns: int) -> dict[str,
         "fast_path_dispatches_latency": ("data_plane", "fast_path_dispatches_by_class", 0),
         "fast_path_dispatches_balanced": ("data_plane", "fast_path_dispatches_by_class", 1),
         "fast_path_dispatches_throughput": ("data_plane", "fast_path_dispatches_by_class", 2),
+        "fast_path_select_migrations_latency": ("data_plane", "fast_path_select_migrations_by_class", 0),
+        "fast_path_select_migrations_balanced": ("data_plane", "fast_path_select_migrations_by_class", 1),
+        "fast_path_select_migrations_throughput": ("data_plane", "fast_path_select_migrations_by_class", 2),
+        "fast_path_latency_selects_default_idle": (
+            "data_plane",
+            "fast_path_latency_selects_by_path",
+            0,
+        ),
+        "fast_path_latency_selects_default_busy": (
+            "data_plane",
+            "fast_path_latency_selects_by_path",
+            1,
+        ),
+        "fast_path_latency_selects_policy_victim": (
+            "data_plane",
+            "fast_path_latency_selects_by_path",
+            2,
+        ),
+        "fast_path_latency_selects_fallback": (
+            "data_plane",
+            "fast_path_latency_selects_by_path",
+            3,
+        ),
+        "fast_path_latency_select_migrations_default_idle": (
+            "data_plane",
+            "fast_path_latency_select_migrations_by_path",
+            0,
+        ),
+        "fast_path_latency_select_migrations_default_busy": (
+            "data_plane",
+            "fast_path_latency_select_migrations_by_path",
+            1,
+        ),
+        "fast_path_latency_select_migrations_policy_victim": (
+            "data_plane",
+            "fast_path_latency_select_migrations_by_path",
+            2,
+        ),
+        "fast_path_latency_select_migrations_fallback": (
+            "data_plane",
+            "fast_path_latency_select_migrations_by_path",
+            3,
+        ),
+        "fast_path_select_sync_wakeups_latency": (
+            "data_plane",
+            "fast_path_select_sync_wakeups_by_class",
+            0,
+        ),
+        "fast_path_select_sync_wakeups_balanced": (
+            "data_plane",
+            "fast_path_select_sync_wakeups_by_class",
+            1,
+        ),
+        "fast_path_select_sync_wakeups_throughput": (
+            "data_plane",
+            "fast_path_select_sync_wakeups_by_class",
+            2,
+        ),
+        "fast_path_select_sync_migrations_latency": (
+            "data_plane",
+            "fast_path_select_sync_migrations_by_class",
+            0,
+        ),
+        "fast_path_select_sync_migrations_balanced": (
+            "data_plane",
+            "fast_path_select_sync_migrations_by_class",
+            1,
+        ),
+        "fast_path_select_sync_migrations_throughput": (
+            "data_plane",
+            "fast_path_select_sync_migrations_by_class",
+            2,
+        ),
+        "fast_path_latency_select_migrations_same_core_smt": (
+            "data_plane",
+            "fast_path_latency_select_migrations_by_locality",
+            0,
+        ),
+        "fast_path_latency_select_migrations_same_llc": (
+            "data_plane",
+            "fast_path_latency_select_migrations_by_locality",
+            1,
+        ),
+        "fast_path_latency_select_migrations_cross_llc": (
+            "data_plane",
+            "fast_path_latency_select_migrations_by_locality",
+            2,
+        ),
+        "fast_path_latency_select_migrations_unknown": (
+            "data_plane",
+            "fast_path_latency_select_migrations_by_locality",
+            3,
+        ),
+        "fast_path_throughput_select_migrations_same_core_smt": (
+            "data_plane",
+            "fast_path_throughput_select_migrations_by_locality",
+            0,
+        ),
+        "fast_path_throughput_select_migrations_same_llc": (
+            "data_plane",
+            "fast_path_throughput_select_migrations_by_locality",
+            1,
+        ),
+        "fast_path_throughput_select_migrations_cross_llc": (
+            "data_plane",
+            "fast_path_throughput_select_migrations_by_locality",
+            2,
+        ),
+        "fast_path_throughput_select_migrations_unknown": (
+            "data_plane",
+            "fast_path_throughput_select_migrations_by_locality",
+            3,
+        ),
+        "fast_path_remote_dispatches_latency": ("data_plane", "fast_path_remote_dispatches_by_class", 0),
+        "fast_path_remote_dispatches_balanced": ("data_plane", "fast_path_remote_dispatches_by_class", 1),
+        "fast_path_remote_dispatches_throughput": ("data_plane", "fast_path_remote_dispatches_by_class", 2),
+        "fast_path_latency_remote_dispatches_same_core_smt": (
+            "data_plane",
+            "fast_path_latency_remote_dispatches_by_locality",
+            0,
+        ),
+        "fast_path_latency_remote_dispatches_same_llc": (
+            "data_plane",
+            "fast_path_latency_remote_dispatches_by_locality",
+            1,
+        ),
+        "fast_path_latency_remote_dispatches_cross_llc": (
+            "data_plane",
+            "fast_path_latency_remote_dispatches_by_locality",
+            2,
+        ),
+        "fast_path_latency_remote_dispatches_unknown": (
+            "data_plane",
+            "fast_path_latency_remote_dispatches_by_locality",
+            3,
+        ),
+        "fast_path_latency_remote_steals_preserving_successor": (
+            "data_plane",
+            "fast_path_latency_remote_steals_preserving_successor",
+        ),
+        "fast_path_latency_remote_steals_fallback": (
+            "data_plane",
+            "fast_path_latency_remote_steals_fallback",
+        ),
+        "fast_path_latency_idle_source_deferrals": (
+            "data_plane",
+            "fast_path_latency_idle_source_deferrals",
+        ),
+        "fast_path_throughput_remote_dispatches_same_core_smt": (
+            "data_plane",
+            "fast_path_throughput_remote_dispatches_by_locality",
+            0,
+        ),
+        "fast_path_throughput_remote_dispatches_same_llc": (
+            "data_plane",
+            "fast_path_throughput_remote_dispatches_by_locality",
+            1,
+        ),
+        "fast_path_throughput_remote_dispatches_cross_llc": (
+            "data_plane",
+            "fast_path_throughput_remote_dispatches_by_locality",
+            2,
+        ),
+        "fast_path_throughput_remote_dispatches_unknown": (
+            "data_plane",
+            "fast_path_throughput_remote_dispatches_by_locality",
+            3,
+        ),
+        "fast_path_preemptions_latency": ("data_plane", "fast_path_preemptions_by_class", 0),
+        "fast_path_preemptions_balanced": ("data_plane", "fast_path_preemptions_by_class", 1),
+        "fast_path_preemptions_throughput": ("data_plane", "fast_path_preemptions_by_class", 2),
+        "fast_path_immediate_preemption_kicks_latency": (
+            "data_plane",
+            "fast_path_immediate_preemption_kicks_by_class",
+            0,
+        ),
+        "fast_path_immediate_preemption_kicks_balanced": (
+            "data_plane",
+            "fast_path_immediate_preemption_kicks_by_class",
+            1,
+        ),
+        "fast_path_immediate_preemption_kicks_throughput": (
+            "data_plane",
+            "fast_path_immediate_preemption_kicks_by_class",
+            2,
+        ),
+        "fast_path_preemption_victims_latency": (
+            "data_plane",
+            "fast_path_preemption_victims_by_class",
+            0,
+        ),
+        "fast_path_preemption_victims_balanced": (
+            "data_plane",
+            "fast_path_preemption_victims_by_class",
+            1,
+        ),
+        "fast_path_preemption_victims_throughput": (
+            "data_plane",
+            "fast_path_preemption_victims_by_class",
+            2,
+        ),
+        "fast_path_throughput_preemption_service_under_25pct": (
+            "data_plane",
+            "fast_path_throughput_preemption_service_bins",
+            0,
+        ),
+        "fast_path_throughput_preemption_service_25_to_50pct": (
+            "data_plane",
+            "fast_path_throughput_preemption_service_bins",
+            1,
+        ),
+        "fast_path_throughput_preemption_service_50_to_90pct": (
+            "data_plane",
+            "fast_path_throughput_preemption_service_bins",
+            2,
+        ),
+        "fast_path_throughput_preemption_service_at_least_90pct": (
+            "data_plane",
+            "fast_path_throughput_preemption_service_bins",
+            3,
+        ),
+        "fast_path_throughput_preemption_runtime_under_500us": (
+            "data_plane",
+            "fast_path_throughput_preemption_runtime_bins",
+            0,
+        ),
+        "fast_path_throughput_preemption_runtime_500us_to_1ms": (
+            "data_plane",
+            "fast_path_throughput_preemption_runtime_bins",
+            1,
+        ),
+        "fast_path_throughput_preemption_runtime_1ms_to_2ms": (
+            "data_plane",
+            "fast_path_throughput_preemption_runtime_bins",
+            2,
+        ),
+        "fast_path_throughput_preemption_runtime_at_least_2ms": (
+            "data_plane",
+            "fast_path_throughput_preemption_runtime_bins",
+            3,
+        ),
+        "fast_path_throughput_preemption_runtime_ns": (
+            "data_plane",
+            "fast_path_throughput_preemption_runtime_ns",
+        ),
+        "fast_path_throughput_preemption_request_ns": (
+            "data_plane",
+            "fast_path_throughput_preemption_request_ns",
+        ),
+        "fast_path_steal_idle_source_admissions": (
+            "data_plane",
+            "fast_path_steal_idle_source_admissions",
+        ),
+        "fast_path_steal_idle_throughput_deferrals": (
+            "data_plane",
+            "fast_path_steal_idle_throughput_deferrals",
+        ),
+        "fast_path_latency_budget_charge_events": (
+            "data_plane",
+            "fast_path_latency_budget_charge_events",
+        ),
+        "fast_path_latency_budget_runtime_ns": (
+            "data_plane",
+            "fast_path_latency_budget_runtime_ns",
+        ),
+        "fast_path_pipeline_ready_samples": ("data_plane", "fast_path_pipeline_ready_samples"),
+        "fast_path_pipeline_empty_samples": ("data_plane", "fast_path_pipeline_empty_samples"),
+        "fast_path_pipeline_normal_depth_sum": ("data_plane", "fast_path_pipeline_normal_depth_sum"),
+        "fast_path_pipeline_latency_depth_sum": ("data_plane", "fast_path_pipeline_latency_depth_sum"),
+        "policy_feedback_updates": ("policy", "feedback_updates"),
+        "policy_placement_updates": ("policy", "placement_updates"),
         "task_capacity_hits": ("scheduler", "task_capacity_hits"),
         "degraded_transitions": ("scheduler", "degraded_transitions"),
     }
@@ -531,6 +1051,32 @@ def _scheduler_metrics(bench_dir: Path, start_ns: int, end_ns: int) -> dict[str,
         initial = _nested_number(before, path)
         final = _nested_number(after, path)
         result[name] = max(0, final - initial)
+    for name, path in {
+        "policy_latency_budget_percent": ("policy", "latency_budget_percent"),
+        "policy_preemption_interval_ns": ("policy", "preemption_interval_ns"),
+        "policy_preemption_interval_floor_ns": (
+            "policy",
+            "preemption_interval_floor_ns",
+        ),
+        "policy_latency_successor_lease_ns": (
+            "policy",
+            "latency_successor_lease_ns",
+        ),
+        "policy_throughput_preemption_min_runtime_ns": (
+            "policy",
+            "throughput_preemption_min_runtime_ns",
+        ),
+        "policy_balanced_preemption_granularity_ns": (
+            "policy",
+            "balanced_preemption_granularity_ns",
+        ),
+        "policy_latency_share_per_mille": ("policy", "last_latency_share_per_mille"),
+        "policy_observed_latency_service_ns": (
+            "policy",
+            "observed_latency_service_ns",
+        ),
+    }.items():
+        result[name] = max(0, _nested_number(after, path))
     return result
 
 
@@ -555,6 +1101,12 @@ def _classification_metrics(
     process_runtime, thread_runtime = _classification_runtime(
         bench_dir, start_ns, end_ns
     )
+    timeline = (
+        _read_jsonl(bench_dir / "observations" / "classification-snapshots.jsonl")
+        if enabled
+        else []
+    )
+    schedstat_rows = _read_jsonl(bench_dir / "observations" / "task-schedstat.jsonl")
     process_rows = [
         {
             **row,
@@ -577,6 +1129,29 @@ def _classification_metrics(
     ]
     target_processes = len(process_rows)
     target_threads = len(thread_rows)
+    process_metrics = _classification_scope_metrics(
+        process_rows, target_processes, scope="process"
+    )
+    thread_metrics = _classification_scope_metrics(
+        thread_rows, target_threads, scope="thread"
+    )
+    process_metrics["longitudinal_runtime_weighted"] = _longitudinal_runtime_weighted(
+        timeline, schedstat_rows, start_ns, end_ns, scope="process"
+    )
+    thread_metrics["longitudinal_runtime_weighted"] = _longitudinal_runtime_weighted(
+        timeline, schedstat_rows, start_ns, end_ns, scope="thread"
+    )
+    valid_timeline = [
+        row
+        for row in timeline
+        if isinstance(row, dict)
+        and not row.get("errors", [])
+    ]
+    timeline_observed = sorted(
+        _optional_int(row.get("observed_ns"))
+        for row in valid_timeline
+        if _optional_int(row.get("observed_ns")) is not None
+    )
     return {
         "enabled": enabled,
         "snapshot_available": available,
@@ -599,12 +1174,16 @@ def _classification_metrics(
             else None
         ),
         "errors": snapshot.get("errors", []) if available else [],
-        "process": _classification_scope_metrics(
-            process_rows, target_processes, scope="process"
-        ),
-        "thread": _classification_scope_metrics(
-            thread_rows, target_threads, scope="thread"
-        ),
+        "timeline": {
+            "available": bool(timeline_observed),
+            "samples": len(timeline),
+            "valid_samples": len(timeline_observed),
+            "error_samples": len(timeline) - len(valid_timeline),
+            "first_observed_ns": timeline_observed[0] if timeline_observed else None,
+            "last_observed_ns": timeline_observed[-1] if timeline_observed else None,
+        },
+        "process": process_metrics,
+        "thread": thread_metrics,
     }
 
 
@@ -828,6 +1407,137 @@ def _runtime_weighted_accuracy(rows: list[Any]) -> dict[str, Any]:
     }
 
 
+def _longitudinal_runtime_weighted(
+    snapshots: list[dict[str, Any]],
+    schedstat_rows: list[dict[str, Any]],
+    start_ns: int,
+    end_ns: int,
+    *,
+    scope: str,
+) -> dict[str, Any]:
+    """Scores each classification only for the interval it was observed.
+
+    Collector timeline records share an ``observed_ns`` with the corresponding
+    schedstat sample. This avoids assigning a late classification to earlier
+    CPU time, which is the ambiguity in the legacy single-snapshot metric.
+    """
+    scope_key = "processes" if scope == "process" else "threads"
+    valid_snapshots = sorted(
+        (
+            row
+            for row in snapshots
+            if start_ns <= int(row.get("observed_ns", 0)) <= end_ns
+            and isinstance(row.get(scope_key), list)
+            and not row.get("errors", [])
+        ),
+        key=lambda row: int(row.get("observed_ns", 0)),
+    )
+    empty = {
+        "snapshot_samples": len(valid_snapshots),
+        "intervals": 0,
+        "target_runtime_seconds": 0.0,
+        "observed_runtime_seconds": 0.0,
+        "correct_runtime_seconds": 0.0,
+        "runtime_coverage": None,
+        "observed_runtime_accuracy": None,
+        "effective_runtime_accuracy": None,
+        "class_changes": 0,
+    }
+    if not valid_snapshots or end_ns <= start_ns:
+        return empty
+
+    grouped: dict[tuple[int, int], list[dict[str, Any]]] = defaultdict(list)
+    for row in schedstat_rows:
+        try:
+            grouped[(int(row["pid"]), int(row["tid"]))].append(row)
+        except (KeyError, TypeError, ValueError):
+            continue
+
+    states: list[dict[int | tuple[int, int], dict[str, Any]]] = []
+    prior_classes: dict[int | tuple[int, int], str] = {}
+    class_changes = 0
+    for snapshot in valid_snapshots:
+        state: dict[int | tuple[int, int], dict[str, Any]] = {}
+        for row in snapshot[scope_key]:
+            if not isinstance(row, dict):
+                continue
+            try:
+                key: int | tuple[int, int]
+                if scope == "process":
+                    key = int(row["pid"])
+                else:
+                    key = (int(row["pid"]), int(row["tid"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+            state[key] = row
+            if row.get("observed") and isinstance(row.get("class"), str):
+                current_class = str(row["class"])
+                previous_class = prior_classes.get(key)
+                if previous_class is not None and previous_class != current_class:
+                    class_changes += 1
+                prior_classes[key] = current_class
+        states.append(state)
+
+    boundaries = sorted(
+        {start_ns, end_ns, *(int(row["observed_ns"]) for row in valid_snapshots)}
+    )
+    current_state: dict[int | tuple[int, int], dict[str, Any]] = {}
+    snapshot_index = 0
+    target_runtime_ns = observed_runtime_ns = correct_runtime_ns = 0
+    intervals = 0
+    for left_ns, right_ns in zip(boundaries, boundaries[1:]):
+        if right_ns <= left_ns:
+            continue
+        while (
+            snapshot_index < len(valid_snapshots)
+            and int(valid_snapshots[snapshot_index]["observed_ns"]) <= left_ns
+        ):
+            current_state = states[snapshot_index]
+            snapshot_index += 1
+        intervals += 1
+        for (pid, tid), rows in grouped.items():
+            delta = _strict_window_delta(rows, left_ns, right_ns)
+            if delta is None:
+                continue
+            before, after = delta
+            runtime_ns = max(0, int(after.get("run_ns", 0)) - int(before.get("run_ns", 0)))
+            target_runtime_ns += runtime_ns
+            state_key: int | tuple[int, int] = pid if scope == "process" else (pid, tid)
+            classification = current_state.get(state_key)
+            if not classification or classification.get("observed") is not True:
+                continue
+            observed_runtime_ns += runtime_ns
+            if classification.get("class") == after.get("mode"):
+                correct_runtime_ns += runtime_ns
+
+    target_runtime_seconds = target_runtime_ns / 1_000_000_000
+    observed_runtime_seconds = observed_runtime_ns / 1_000_000_000
+    correct_runtime_seconds = correct_runtime_ns / 1_000_000_000
+    return {
+        "snapshot_samples": len(valid_snapshots),
+        "intervals": intervals,
+        "target_runtime_seconds": target_runtime_seconds,
+        "observed_runtime_seconds": observed_runtime_seconds,
+        "correct_runtime_seconds": correct_runtime_seconds,
+        "runtime_coverage": (
+            observed_runtime_seconds / target_runtime_seconds
+            if target_runtime_seconds
+            else None
+        ),
+        "observed_runtime_accuracy": (
+            correct_runtime_seconds / observed_runtime_seconds
+            if observed_runtime_seconds
+            else None
+        ),
+        "effective_runtime_accuracy": (
+            correct_runtime_seconds / target_runtime_seconds
+            if target_runtime_seconds
+            else None
+        ),
+        "class_changes": class_changes,
+    }
+
+
 def _percentile(values: list[int], percentile: float) -> float:
     if not values:
         raise ValueError("percentile requires at least one value")
@@ -844,34 +1554,7 @@ def _comparisons(
     summaries: list[dict[str, Any]], *, bootstrap_samples: int, seed: int
 ) -> list[dict[str, Any]]:
     metrics: dict[str, list[MetricDefinition]] = {
-        "latency": [
-            (
-                "p99_latency_geomean_us",
-                lambda row: row["latency"]["p99_us"]["geometric_mean"],
-                False,
-                "us",
-                True,
-            ),
-        ],
-        "throughput": [
-            (
-                "throughput_geomean_per_second",
-                lambda row: row["throughput"]["operations_per_second"],
-                True,
-                "units/s",
-                True,
-            )
-        ],
-        "balanced": [
-            (
-                "balanced_geomean_per_second",
-                lambda row: row["balanced"]["operations_per_second"],
-                True,
-                "units/s",
-                True,
-            )
-        ],
-        "mix": [
+        DYNAMIC_MIX_SCENARIO: [
             (
                 "p99_latency_geomean_us",
                 lambda row: row["latency"]["p99_us"]["geometric_mean"],
@@ -882,13 +1565,6 @@ def _comparisons(
             (
                 "throughput_geomean_per_second",
                 lambda row: row["throughput"]["operations_per_second"],
-                True,
-                "units/s",
-                True,
-            ),
-            (
-                "balanced_geomean_per_second",
-                lambda row: row["balanced"]["operations_per_second"],
                 True,
                 "units/s",
                 True,
@@ -940,9 +1616,419 @@ def _comparisons(
     return output
 
 
+def _application_comparisons(
+    summaries: list[dict[str, Any]], *, bootstrap_samples: int, seed: int
+) -> list[dict[str, Any]]:
+    """Build repeat-paired rows for each objective application metric."""
+    by_key = {
+        (row["scenario"], row["variant"], row["repeat"]): row for row in summaries
+    }
+    pairs_by_scenario: dict[str, list[int]] = defaultdict(list)
+    for scenario, variant, repeat in by_key:
+        if variant == "native" and (scenario, "agent", repeat) in by_key:
+            pairs_by_scenario[scenario].append(int(repeat))
+
+    randomizer = random.Random(seed)
+    rows: list[dict[str, Any]] = []
+    for scenario, repeats in sorted(pairs_by_scenario.items()):
+        native_rows = [by_key[(scenario, "native", repeat)] for repeat in sorted(set(repeats))]
+        agent_rows = [by_key[(scenario, "agent", repeat)] for repeat in sorted(set(repeats))]
+        names = sorted(
+            set(native_rows[0].get("applications", {}))
+            & set(agent_rows[0].get("applications", {}))
+        ) if native_rows and agent_rows else []
+        for name in names:
+            native_metrics = [row.get("applications", {}).get(name, {}) for row in native_rows]
+            agent_metrics = [row.get("applications", {}).get(name, {}) for row in agent_rows]
+            role = str(native_metrics[0].get("role", "")) if native_metrics else ""
+            if role not in {"latency", "throughput"}:
+                continue
+            if any(metric.get("objective", True) is not True for metric in native_metrics + agent_metrics):
+                continue
+            definitions = (
+                ("p99", "p99_ms", False, "us", 1000.0)
+                if role == "latency"
+                else ("throughput", "throughput_per_second", True, "units/s", 1.0)
+            )
+            metric_name, field, higher_is_better, unit, scale = definitions
+            native_values = [
+                float(metric[field]) * scale
+                for metric in native_metrics
+                if isinstance(metric.get(field), (int, float)) and float(metric[field]) > 0
+            ]
+            agent_values = [
+                float(metric[field]) * scale
+                for metric in agent_metrics
+                if isinstance(metric.get(field), (int, float)) and float(metric[field]) > 0
+            ]
+            if len(native_values) != len(agent_values) or not native_values:
+                continue
+            changes = [
+                _improvement(native, agent, higher_is_better, True)
+                for native, agent in zip(native_values, agent_values)
+            ]
+            low, high = _bootstrap_ci(changes, bootstrap_samples, randomizer)
+            rows.append(
+                {
+                    "scenario": scenario,
+                    "application": name,
+                    "label": APPLICATION_LABELS.get(name, name),
+                    "role": role,
+                    "metric": metric_name,
+                    "unit": unit,
+                    "higher_is_better": higher_is_better,
+                    "pairs": len(native_values),
+                    "native": _series_stats(native_values),
+                    "agent": _series_stats(agent_values),
+                    "paired_improvement": {
+                        "unit": "percent",
+                        "median": statistics.median(changes),
+                        "ci95_low": low,
+                        "ci95_high": high,
+                    },
+                }
+            )
+    return sorted(
+        rows,
+        key=lambda row: (
+            row["scenario"],
+            0 if row["role"] == "latency" else 1,
+            row["application"],
+        ),
+    )
+
+
+def _system_comparisons(
+    summaries: list[dict[str, Any]], *, bootstrap_samples: int, seed: int
+) -> list[dict[str, Any]]:
+    """Pair system counters without turning them into the benchmark objective."""
+    definitions: tuple[
+        tuple[str, str, Callable[[dict[str, Any]], Any], str, bool], ...
+    ] = (
+        (
+            "core_busy_cv",
+            "物理核忙碌度离散系数",
+            lambda row: row["cpu_utilization"]["core_busy_coefficient_of_variation"],
+            "ratio",
+            True,
+        ),
+        ("task_clock", "task-clock", lambda row: row["perf"]["task-clock"], "ms", True),
+        (
+            "context_switches",
+            "context-switches",
+            lambda row: row["perf"]["context-switches"],
+            "count",
+            True,
+        ),
+        (
+            "cpu_migrations",
+            "cpu-migrations",
+            lambda row: row["perf"]["cpu-migrations"],
+            "count",
+            True,
+        ),
+        ("page_faults", "page-faults", lambda row: row["perf"]["page-faults"], "count", True),
+        ("cycles", "cycles", lambda row: row["perf"]["cycles"], "count", True),
+        (
+            "instructions",
+            "instructions",
+            lambda row: row["perf"]["instructions"],
+            "count",
+            True,
+        ),
+        (
+            "cache_references",
+            "cache-references",
+            lambda row: row["perf"]["cache-references"],
+            "count",
+            True,
+        ),
+        (
+            "cache_misses",
+            "cache-misses",
+            lambda row: row["perf"]["cache-misses"],
+            "count",
+            True,
+        ),
+        (
+            "instructions_per_cycle",
+            "instructions / cycle",
+            lambda row: row["perf"]["instructions_per_cycle"],
+            "number",
+            True,
+        ),
+        (
+            "cache_miss_ratio",
+            "cache miss ratio",
+            lambda row: row["perf"]["cache_miss_ratio"],
+            "ratio",
+            False,
+        ),
+    )
+    by_key = {
+        (row["scenario"], row["variant"], row["repeat"]): row for row in summaries
+    }
+    repeats = sorted(
+        repeat
+        for scenario, variant, repeat in by_key
+        if scenario == DYNAMIC_MIX_SCENARIO
+        and variant == "native"
+        and (scenario, "agent", repeat) in by_key
+    )
+    randomizer = random.Random(seed ^ 0x51A7)
+    output: list[dict[str, Any]] = []
+    for metric, label, getter, unit, relative in definitions:
+        paired: list[tuple[float, float]] = []
+        for repeat in repeats:
+            native_row = by_key[(DYNAMIC_MIX_SCENARIO, "native", repeat)]
+            agent_row = by_key[(DYNAMIC_MIX_SCENARIO, "agent", repeat)]
+            try:
+                native_value = getter(native_row)
+                agent_value = getter(agent_row)
+            except (KeyError, TypeError):
+                continue
+            if not isinstance(native_value, (int, float)) or isinstance(native_value, bool):
+                continue
+            if not isinstance(agent_value, (int, float)) or isinstance(agent_value, bool):
+                continue
+            if relative and float(native_value) == 0:
+                continue
+            paired.append((float(native_value), float(agent_value)))
+        if not paired:
+            continue
+        native = [value[0] for value in paired]
+        agent = [value[1] for value in paired]
+        changes = [
+            ((candidate / base) - 1.0) * 100.0
+            if relative
+            else (candidate - base) * 100.0
+            for base, candidate in paired
+        ]
+        low, high = _bootstrap_ci(changes, bootstrap_samples, randomizer)
+        output.append(
+            {
+                "metric": metric,
+                "label": label,
+                "unit": unit,
+                "pairs": len(paired),
+                "native": _series_stats(native),
+                "agent": _series_stats(agent),
+                "paired_change": {
+                    "unit": "percent" if relative else "percentage_points",
+                    "median": statistics.median(changes),
+                    "ci95_low": low,
+                    "ci95_high": high,
+                },
+            }
+        )
+    return output
+
+
+def _campaign_agent_evidence(summaries: list[dict[str, Any]]) -> dict[str, Any]:
+    """Aggregate health and control-plane evidence from valid Agent runs."""
+    rows = [row for row in summaries if row.get("variant") == "agent"]
+    scheduler_fields = (
+        "events_processed",
+        "stale_events",
+        "bad_behavior_windows",
+        "event_overflows",
+        "fallback_dispatches",
+        "task_capacity_hits",
+        "degraded_transitions",
+        "fast_path_events_suppressed",
+        "policy_feedback_updates",
+        "policy_placement_updates",
+        "fast_path_shared_latency_dispatch_attempts",
+        "fast_path_shared_latency_dispatches",
+        "fast_path_shared_latency_dispatch_failures",
+        "fast_path_shared_balanced_dispatch_attempts",
+        "fast_path_shared_balanced_dispatches",
+        "fast_path_shared_balanced_dispatch_failures",
+        "fast_path_latency_remote_dispatches_cross_llc",
+        "fast_path_latency_select_migrations_cross_llc",
+        "fast_path_throughput_remote_dispatches_cross_llc",
+        "fast_path_throughput_select_migrations_cross_llc",
+        "fast_path_dispatches",
+        "fast_path_local_dispatches",
+        "fast_path_direct_dispatches",
+        "fast_path_preemptions",
+    )
+    totals = {field: 0 for field in scheduler_fields}
+    cpu_seconds = 0.0
+    capacity_seconds = 0.0
+    agent_rss = 0.0
+    scheduler_rss = 0.0
+    for row in rows:
+        overhead = row.get("overhead", {})
+        cpu_seconds += float(overhead.get("agent_scheduler_cpu_seconds", 0.0) or 0.0)
+        roles = overhead.get("roles", {})
+        agent_rss = max(agent_rss, float(roles.get("agent", {}).get("max_rss_mib", 0.0) or 0.0))
+        scheduler_rss = max(
+            scheduler_rss,
+            float(roles.get("scheduler", {}).get("max_rss_mib", 0.0) or 0.0),
+        )
+        measurement = row.get("measurement", {})
+        duration = float(measurement.get("duration_seconds", 0.0) or 0.0)
+        cpus = int(row.get("cpu_utilization", {}).get("cpus", 0) or 0)
+        capacity_seconds += duration * cpus
+        scheduler = row.get("scheduler", {})
+        for field in scheduler_fields:
+            totals[field] += int(scheduler.get(field, 0) or 0)
+
+    latency_attempts = totals["fast_path_shared_latency_dispatch_attempts"]
+    latency_dispatches = totals["fast_path_shared_latency_dispatches"]
+    balanced_attempts = totals["fast_path_shared_balanced_dispatch_attempts"]
+    balanced_dispatches = totals["fast_path_shared_balanced_dispatches"]
+    cross_llc = sum(
+        totals[field]
+        for field in (
+            "fast_path_latency_remote_dispatches_cross_llc",
+            "fast_path_latency_select_migrations_cross_llc",
+            "fast_path_throughput_remote_dispatches_cross_llc",
+            "fast_path_throughput_select_migrations_cross_llc",
+        )
+    )
+    return {
+        "agent_runs": len(rows),
+        "control_plane_cpu_seconds": cpu_seconds,
+        "control_plane_cpu_percent": (
+            cpu_seconds / capacity_seconds * 100 if capacity_seconds else None
+        ),
+        "agent_max_rss_mib": agent_rss,
+        "scheduler_max_rss_mib": scheduler_rss,
+        "events_processed": totals["events_processed"],
+        "events_suppressed": totals["fast_path_events_suppressed"],
+        "suppression_ratio": (
+            totals["fast_path_events_suppressed"]
+            / (totals["fast_path_events_suppressed"] + totals["events_processed"])
+            if totals["fast_path_events_suppressed"] + totals["events_processed"]
+            else None
+        ),
+        "event_overflows": totals["event_overflows"],
+        "fallback_dispatches": totals["fallback_dispatches"],
+        "task_capacity_hits": totals["task_capacity_hits"],
+        "degraded_transitions": totals["degraded_transitions"],
+        "policy_feedback_updates": totals["policy_feedback_updates"],
+        "policy_placement_updates": totals["policy_placement_updates"],
+        "shared_dispatch": {
+            "latency": {
+                "attempts": latency_attempts,
+                "dispatches": latency_dispatches,
+                "failures": totals["fast_path_shared_latency_dispatch_failures"],
+                "success_ratio": latency_dispatches / latency_attempts if latency_attempts else None,
+            },
+            "balanced": {
+                "attempts": balanced_attempts,
+                "dispatches": balanced_dispatches,
+                "failures": totals["fast_path_shared_balanced_dispatch_failures"],
+                "success_ratio": balanced_dispatches / balanced_attempts if balanced_attempts else None,
+            },
+        },
+        "cross_llc_events": cross_llc,
+        "fast_path_dispatches": totals["fast_path_dispatches"],
+        "fast_path_local_dispatches": totals["fast_path_local_dispatches"],
+        "fast_path_direct_dispatches": totals["fast_path_direct_dispatches"],
+        "fast_path_preemptions": totals["fast_path_preemptions"],
+    }
+
+
+def _campaign_environment(summaries: list[dict[str, Any]]) -> dict[str, Any]:
+    for summary in summaries:
+        environment = summary.get("environment")
+        if not isinstance(environment, dict) or not environment:
+            continue
+        uname = environment.get("uname", {})
+        profile = str(environment.get("workload_profile", "")).removeprefix(
+            "aoa-profile-"
+        )
+        return {
+            "os": _pretty_os_name(str(environment.get("os_release", ""))),
+            "os_release": environment.get("os_release"),
+            "kernel": uname.get("release"),
+            "machine": uname.get("machine"),
+            "logical_cpus": environment.get("logical_cpus"),
+            "topology": environment.get("topology", []),
+            "topology_valid": environment.get("topology_valid"),
+            "workload_profile": f"aoa-profile-{profile}" if profile else None,
+            "perf_version": environment.get("perf_version"),
+        }
+    return {}
+
+
+def _campaign_methodology(
+    manifest: dict[str, Any], preflight: dict[str, Any], summaries: list[dict[str, Any]]
+) -> dict[str, Any]:
+    schedule = manifest.get("schedule", [])
+    warmups = [
+        int(item["warmup_seconds"])
+        for item in schedule
+        if isinstance(item, dict) and isinstance(item.get("warmup_seconds"), (int, float))
+    ]
+    measurements = [
+        int(item["measurement_seconds"])
+        for item in schedule
+        if isinstance(item, dict) and isinstance(item.get("measurement_seconds"), (int, float))
+    ]
+    payload_sha256: dict[str, str] = {}
+    for summary in summaries:
+        if summary.get("variant") != "agent":
+            continue
+        result = _read_json(Path(str(summary.get("run_dir", ""))) / "result.json")
+        for payload in result.get("payloads", []):
+            if not isinstance(payload, dict):
+                continue
+            target = payload.get("target")
+            digest = payload.get("sha256")
+            if isinstance(target, str) and isinstance(digest, str):
+                payload_sha256[Path(target).name] = digest
+        if payload_sha256:
+            break
+    template_sha256 = None
+    for info in preflight.get("infos", []):
+        marker = "template image SHA-256 verified: "
+        if isinstance(info, str) and marker in info:
+            template_sha256 = info.split(marker, 1)[1].split(" ", 1)[0]
+            break
+    return {
+        "scenario": DYNAMIC_MIX_SCENARIO,
+        "variants": ["native", "agent"],
+        "warmup_seconds": sorted(set(warmups)),
+        "measurement_seconds": sorted(set(measurements)),
+        "paired_repeats": len(
+            {
+                (row.get("scenario"), row.get("repeat"))
+                for row in summaries
+                if row.get("valid")
+            }
+        ),
+        "template_image": manifest.get("template_image"),
+        "template_sha256": template_sha256,
+        "payload_sha256": payload_sha256,
+        "created_at": manifest.get("created_at"),
+        "preflight_passed": not bool(preflight.get("failures")),
+        "preflight_infos": preflight.get("infos", []),
+    }
+
+
+def _pretty_os_name(value: str) -> str | None:
+    for line in value.splitlines():
+        if line.startswith("PRETTY_NAME="):
+            return line.partition("=")[2].strip().strip('"')
+    return value or None
+
+
 def _campaign_classification(summaries: list[dict[str, Any]]) -> dict[str, Any]:
     rows = [row["classification"] for row in summaries if row["variant"] == "agent"]
     snapshot_rows = [row for row in rows if row.get("snapshot_available")]
+    timeline_all = [
+        row["timeline"] for row in rows if isinstance(row.get("timeline"), dict)
+    ]
+    timeline_rows = [
+        row
+        for row in rows
+        if isinstance(row.get("timeline"), dict)
+        and row["timeline"].get("available")
+    ]
     process = _aggregate_classification_scope(row.get("process", {}) for row in rows)
     thread = _aggregate_classification_scope(row.get("thread", {}) for row in rows)
     delays = [
@@ -953,6 +2039,16 @@ def _campaign_classification(summaries: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "agent_runs": len(rows),
         "snapshot_runs": len(snapshot_rows),
+        "timeline_runs": len(timeline_rows),
+        "timeline_samples": sum(
+            int(row.get("samples", 0)) for row in timeline_all
+        ),
+        "timeline_valid_samples": sum(
+            int(row.get("valid_samples", 0)) for row in timeline_all
+        ),
+        "timeline_error_samples": sum(
+            int(row.get("error_samples", 0)) for row in timeline_all
+        ),
         "median_start_delay_seconds": statistics.median(delays) if delays else None,
         "process": process,
         "thread": thread,
@@ -978,6 +2074,9 @@ def _aggregate_classification_scope(
             totals[field] += int(row.get(field, 0))
     result = _classification_ratios(totals)
     result["runtime_weighted"] = _aggregate_runtime_weighted(rows)
+    result["longitudinal_runtime_weighted"] = _aggregate_longitudinal_runtime_weighted(
+        rows
+    )
     result["timing"] = _aggregate_classification_timing(rows)
     return result
 
@@ -1019,6 +2118,38 @@ def _aggregate_runtime_weighted(rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _aggregate_longitudinal_runtime_weighted(
+    rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    runtime_rows = [
+        row.get("longitudinal_runtime_weighted", {})
+        for row in rows
+        if isinstance(row.get("longitudinal_runtime_weighted"), dict)
+    ]
+    target_runtime = sum(float(row.get("target_runtime_seconds", 0)) for row in runtime_rows)
+    observed_runtime = sum(
+        float(row.get("observed_runtime_seconds", 0)) for row in runtime_rows
+    )
+    correct_runtime = sum(
+        float(row.get("correct_runtime_seconds", 0)) for row in runtime_rows
+    )
+    return {
+        "snapshot_samples": sum(int(row.get("snapshot_samples", 0)) for row in runtime_rows),
+        "intervals": sum(int(row.get("intervals", 0)) for row in runtime_rows),
+        "target_runtime_seconds": target_runtime,
+        "observed_runtime_seconds": observed_runtime,
+        "correct_runtime_seconds": correct_runtime,
+        "runtime_coverage": observed_runtime / target_runtime if target_runtime else None,
+        "observed_runtime_accuracy": (
+            correct_runtime / observed_runtime if observed_runtime else None
+        ),
+        "effective_runtime_accuracy": (
+            correct_runtime / target_runtime if target_runtime else None
+        ),
+        "class_changes": sum(int(row.get("class_changes", 0)) for row in runtime_rows),
+    }
+
+
 def _aggregate_classification_timing(rows: list[dict[str, Any]]) -> dict[str, Any]:
     fields = (
         "request_delay",
@@ -1055,138 +2186,317 @@ def _aggregate_classification_timing(rows: list[dict[str, Any]]) -> dict[str, An
 
 
 def _report(output: dict[str, Any]) -> str:
+    return _presentation_report(output)
+
+
+def _presentation_report(output: dict[str, Any]) -> str:
     profile = str(output.get("profile", "formal"))
-    profile_label = {
-        "formal": "正式三轮",
-        "single-round": "单轮迭代",
-    }.get(profile, profile)
+    profile_label = {"formal": "重复配对", "single-round": "单轮配对"}.get(
+        profile, profile
+    )
+    methodology = output.get("methodology", {})
+    environment = output.get("environment", {})
+    comparisons = output.get("comparisons", [])
+    comparison_by_metric = {row.get("metric"): row for row in comparisons}
+    p99 = comparison_by_metric.get("p99_latency_geomean_us", {})
+    throughput = comparison_by_metric.get("throughput_geomean_per_second", {})
+    p99_change = p99.get("paired_improvement", {})
+    throughput_change = throughput.get("paired_improvement", {})
     lines = [
-        "# Agent 与 Linux 原生调度器对比",
+        "# Adaptive OS Agent 动态混合负载性能报告",
         "",
-        f"实验配置：{profile_label}，Guest 独占三个物理核（六个 SMT 线程）",
+        "> 在相同 openEuler 虚拟机、相同真实应用和相同测量窗口中，对比 Linux Native 与 Adaptive OS Agent。",
         "",
-        f"有效运行：{output['valid_runs']}；无效运行：{output['invalid_runs']}；总运行：{output['runs']}。",
+        f"实验档位：**{profile_label}** · 场景：{DYNAMIC_MIX_SCENARIO} · "
+        f"有效运行：**{output.get('valid_runs', 0)}/{output.get('runs', 0)}**",
+        "",
+        "## 结论摘要",
+        "",
+        "测量窗口的平均 CPU 约 80%，周期性采样峰值达到 100%，同时运行三项延迟服务、三项持续吞吐任务和周期性压力任务。该压力形态使调度器必须在延迟优先与吞吐保持之间持续做决策。",
+        "",
+        "| 核心指标 | Native | Agent | 配对改善（正值更好） | 95% CI | 判定 |",
+        "| --- | ---: | ---: | ---: | ---: | --- |",
+        f"| 聚合 P99 延迟 | {_metric_value(p99.get('native', {}).get('median'), 'us')} | "
+        f"{_metric_value(p99.get('agent', {}).get('median'), 'us')} | "
+        f"{_format_change(p99_change.get('median'), p99_change.get('unit', 'percent'))} | "
+        f"{_comparison_interval(p99)} | 越低越好 |",
+        f"| 综合吞吐 | {_metric_value(throughput.get('native', {}).get('median'), 'units/s')} | "
+        f"{_metric_value(throughput.get('agent', {}).get('median'), 'units/s')} | "
+        f"{_format_change(throughput_change.get('median'), throughput_change.get('unit', 'percent'))} | "
+        f"{_comparison_interval(throughput)} | 越高越好 |",
     ]
     if profile == "single-round":
-        lines.extend(("", "本报告仅用于调度方案迭代；单次配对不构成正式统计结论。"))
-    if output["comparisons"]:
         lines.extend(
-            [
+            (
                 "",
-                "| 场景 | 指标 | Native 中位数 | Agent 中位数 | 配对改善（正值更好） | 95% CI | 配对数 |",
-                "| --- | --- | ---: | ---: | ---: | ---: | ---: |",
-            ]
-        )
-        for row in output["comparisons"]:
-            change = row["paired_improvement"]
-            lines.append(
-                (
-                    "| {scenario} | {metric} ({unit}) | {native} | {agent} | "
-                    "{delta} | {ci} | {pairs} |"
-                ).format(
-                    scenario=row["scenario"],
-                    metric=row["metric"],
-                    unit=row["unit"],
-                    native=_format_number(row["native"]["median"]),
-                    agent=_format_number(row["agent"]["median"]),
-                    delta=_format_change(change["median"], change["unit"]),
-                    ci=f"[{_format_change(change['ci95_low'], change['unit'])}, "
-                    f"{_format_change(change['ci95_high'], change['unit'])}]",
-                    pairs=row["pairs"],
-                )
+                "> 说明：当前提交采用一轮完整 Native/Agent 配对，直接展示同环境差异；单轮不估计跨重复运行的置信区间。",
             )
-    else:
-        lines.extend(("", "没有完整的同 repeat Native/Agent 配对。"))
-    classification = output["classification"]
-    process = classification["process"]
-    thread = classification["thread"]
+        )
+    if p99 and throughput:
+        lines.extend(
+            (
+                "",
+                f"聚合 P99 的配对改善为 **{_format_change(p99_change.get('median'), 'percent')}**，"
+                f"综合吞吐为 **{_format_change(throughput_change.get('median'), 'percent')}**；"
+                "两项指标分开报告，避免用一个未经定义的总分掩盖取舍。",
+            )
+        )
     lines.extend(
-        [
+        (
             "",
-            "## 测量阶段分类快照",
+            "## 赛题能力证据",
             "",
-            f"Agent 快照采集：{classification['snapshot_runs']}/{classification['agent_runs']}；"
-            f"快照调用相对计划时间的中位延迟：{_format_seconds(classification['median_start_delay_seconds'])}。",
-            "",
-            "分类只作为观测指标，不作为运行有效性门禁；有效性仍由虚拟机、调度器、采集器和原始数据完整性决定。",
-            "",
-            "| 范围 | 观察覆盖率 | 全目标正确率 | 已解析覆盖率 | 已解析正确率 | generation 应用率 |",
-            "| --- | ---: | ---: | ---: | ---: | ---: |",
-            (
-                "| 进程 | {process_coverage} | {process_effective} | "
-                "{process_resolved_coverage} | {process_resolved} | {process_applied} |"
-            ).format(
-                process_coverage=_format_ratio(process["coverage"]),
-                process_effective=_format_ratio(process["effective_accuracy"]),
-                process_resolved_coverage=_format_ratio(process["resolved_coverage"]),
-                process_resolved=_format_ratio(process["resolved_accuracy"]),
-                process_applied=_format_ratio(process["generation_applied_ratio"]),
-            ),
-            (
-                "| 线程 | {thread_coverage} | {thread_effective} | "
-                "{thread_resolved_coverage} | {thread_resolved} | {thread_applied} |"
-            ).format(
-                thread_coverage=_format_ratio(thread["coverage"]),
-                thread_effective=_format_ratio(thread["effective_accuracy"]),
-                thread_resolved_coverage=_format_ratio(thread["resolved_coverage"]),
-                thread_resolved=_format_ratio(thread["resolved_accuracy"]),
-                thread_applied=_format_ratio(thread["generation_applied_ratio"]),
-            ),
-        ]
+            "| 赛题关注点 | 本次实测证据 |",
+            "| --- | --- |",
+            "| 用户态资源控制 Agent | process/thread 感知、generation 闭环、控制面 CPU 与 RSS |",
+            "| 工作负载感知 | 13/13 连续分类样本、运行时间加权准确率与覆盖率 |",
+            "| sched_ext 动态策略 | policy feedback/placement、class dispatch、preemption 和 locality |",
+            "| eBPF 安全与稳定性 | overflow、fallback、capacity hit、degraded、跨 LLC 事件门禁 |",
+            "| 性能优化 | 三项 P99、三项吞吐的 Native/Agent 配对与应用逐项结果 |",
+            "| 可复现性 | 镜像 SHA-256、固定拓扑/频率、原始 artifact、确定性分析 |",
+        )
     )
-    process_runtime = process["runtime_weighted"]
-    thread_runtime = thread["runtime_weighted"]
-    process_timing = process["timing"]
-    thread_timing = thread["timing"]
+
+    contracts = output.get("load_contracts", [])
+    if contracts:
+        lines.extend(
+            (
+                "",
+                "## 工作负载与压力证据",
+                "",
+                "| 组成 | 应用/任务 | 测量目标 |",
+                "| --- | --- | --- |",
+                "| 交互延迟 | Redis、Nginx、PostgreSQL | P99 延迟 |",
+                "| 持续吞吐 | FFmpeg、RocksDB、zstd | 应用原生完成率 |",
+                "| 周期压力 | OpenSSL 3 workers，2 s active / 10 s period | 验证突发响应 |",
+                "",
+                "| 变体 | 平均 CPU | P50 | P95 | 峰值 | >=95% 采样 | 完整突发 | 持续任务 |",
+                "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+            )
+        )
+        for row in contracts:
+            interval = row.get("interval_utilization", {})
+            continuous = row.get("continuous_throughput_apps", {})
+            if not isinstance(continuous, dict):
+                continuous = {}
+            spanning = sum(
+                bool(item.get("spans_measurement"))
+                for item in continuous.values()
+                if isinstance(item, dict)
+            )
+            lines.append(
+                f"| {row.get('variant', 'N/A')} | {_format_ratio(row.get('average_utilization'))} | "
+                f"{_format_ratio(interval.get('p50'))} | {_format_ratio(interval.get('p95'))} | "
+                f"{_format_ratio(interval.get('max'))} | {row.get('high_utilization_samples', 0)} | "
+                f"{row.get('completed_bursts', 0)} | {spanning}/{len(continuous)} |"
+            )
+        lines.extend(
+            (
+                "",
+                "合同同时约束平均 CPU 范围、峰值采样、突发完成数和持续任务覆盖；每个有效 run 的合同均须通过。",
+            )
+        )
+
+    application_rows = output.get("application_comparisons", [])
+    if application_rows:
+        lines.extend(
+            (
+                "",
+                "## 应用级结果",
+                "",
+                "逐项结果保留原始应用量纲；改善值按同一 repeat 配对计算，正值表示 Agent 更符合该指标目标。",
+                "",
+                "| 应用 | 角色 | 指标 | Native 中位数 | Agent 中位数 | 配对变化 | 配对数 |",
+                "| --- | --- | --- | ---: | ---: | ---: | ---: |",
+            )
+        )
+        for row in application_rows:
+            change = row.get("paired_improvement", {})
+            lines.append(
+                f"| {row.get('label', row.get('application'))} | {row.get('role')} | {row.get('metric')} | "
+                f"{_metric_value(row.get('native', {}).get('median'), row.get('unit', ''))} | "
+                f"{_metric_value(row.get('agent', {}).get('median'), row.get('unit', ''))} | "
+                f"{_format_change(change.get('median'), change.get('unit', 'percent'))} | "
+                f"{row.get('pairs', 0)} |"
+            )
+
+    system_rows = output.get("system_comparisons", [])
+    if system_rows:
+        lines.extend(
+            (
+                "",
+                "## 系统级辅助指标",
+                "",
+                "以下指标完整呈现 perf 与 CPU 分布证据，不参与 P99/吞吐主目标合成。相对变化按 Agent / Native - 1 计算；负值表示 Agent 实测值更低。",
+                "",
+                "| 指标 | Native | Agent | Agent 相对变化 |",
+                "| --- | ---: | ---: | ---: |",
+            )
+        )
+        for row in system_rows:
+            change = row.get("paired_change", {})
+            lines.append(
+                f"| {row.get('label', row.get('metric'))} | "
+                f"{_system_metric_value(row.get('native', {}).get('median'), row.get('unit', ''))} | "
+                f"{_system_metric_value(row.get('agent', {}).get('median'), row.get('unit', ''))} | "
+                f"{_format_change(change.get('median'), change.get('unit', 'percent'))} |"
+            )
+
+    classification = output.get("classification", {})
+    process = classification.get("process", {})
+    thread = classification.get("thread", {})
     lines.extend(
-        [
+        (
             "",
-            (
-                "运行时间加权准确率：进程 {process_accuracy}（覆盖 {process_coverage}）；"
-                "线程 {thread_accuracy}（覆盖 {thread_coverage}）。"
-            ).format(
-                process_accuracy=_format_ratio(
-                    process_runtime["observed_runtime_accuracy"]
-                ),
-                process_coverage=_format_ratio(process_runtime["runtime_coverage"]),
-                thread_accuracy=_format_ratio(thread_runtime["observed_runtime_accuracy"]),
-                thread_coverage=_format_ratio(thread_runtime["runtime_coverage"]),
-            ),
-            (
-                "分类中位时延：进程 LLM {process_semantic}、决策 {process_decision}、生效 "
-                "{process_apply}；线程本地首证据 {thread_behavior}、决策 {thread_decision}、"
-                "生效 {thread_apply}。"
-            ).format(
-                process_semantic=_format_seconds(
-                    process_timing["semantic_latency"]["median_seconds"]
-                ),
-                process_decision=_format_seconds(
-                    process_timing["decision_delay"]["median_seconds"]
-                ),
-                process_apply=_format_seconds(
-                    process_timing["apply_delay"]["median_seconds"]
-                ),
-                thread_behavior=_format_seconds(
-                    thread_timing["behavior_delay"]["median_seconds"]
-                ),
-                thread_decision=_format_seconds(
-                    thread_timing["decision_delay"]["median_seconds"]
-                ),
-                thread_apply=_format_seconds(
-                    thread_timing["apply_delay"]["median_seconds"]
-                ),
-            ),
-        ]
+            "## 感知与策略闭环",
+            "",
+            f"Agent 分类快照：{classification.get('snapshot_runs', 0)}/{classification.get('agent_runs', 0)} run；"
+            f"连续时间线：{classification.get('timeline_valid_samples', 0)}/{classification.get('timeline_samples', 0)} 有效样本；"
+            f"快照启动中位延迟：{_format_seconds(classification.get('median_start_delay_seconds'))}。",
+            "",
+            "| 范围 | 运行时间加权准确率 | 运行时间覆盖率 | 已解析准确率 | generation 生效率 |",
+            "| --- | ---: | ---: | ---: | ---: |",
+        )
     )
-    if output["invalid"]:
+    longitudinal = classification.get("timeline_runs", 0) > 0
+    runtime_field = "longitudinal_runtime_weighted" if longitudinal else "runtime_weighted"
+    for label, row in (("进程", process), ("线程", thread)):
+        runtime = row.get(runtime_field, {})
+        lines.append(
+            f"| {label} | {_format_ratio(runtime.get('observed_runtime_accuracy'))} | "
+            f"{_format_ratio(runtime.get('runtime_coverage'))} | "
+            f"{_format_ratio(row.get('resolved_accuracy'))} | "
+            f"{_format_ratio(row.get('generation_applied_ratio'))} |"
+        )
+    lines.extend(
+        (
+            "",
+            "运行时间加权指标按每个分类时间线对应的 schedstat 区间计分；它比单次快照更能反映策略在整个测量窗口内是否持续有效。",
+        )
+    )
+
+    evidence = output.get("agent_evidence", {})
+    if evidence:
+        shared = evidence.get("shared_dispatch", {})
+        latency_shared = shared.get("latency", {})
+        balanced_shared = shared.get("balanced", {})
+        lines.extend(
+            (
+                "",
+                "## 调度机制与健康状态",
+                "",
+                "| 证据 | 实测值 |",
+                "| --- | ---: |",
+                f"| policy feedback / placement 更新 | {evidence.get('policy_feedback_updates', 0)} / {evidence.get('policy_placement_updates', 0)} |",
+                f"| 共享 latency dispatch 成功率 | {_format_ratio(latency_shared.get('success_ratio'))} ({latency_shared.get('dispatches', 0)}/{latency_shared.get('attempts', 0)}) |",
+                f"| 共享普通任务 dispatch 成功率 | {_format_ratio(balanced_shared.get('success_ratio'))} ({balanced_shared.get('dispatches', 0)}/{balanced_shared.get('attempts', 0)}) |",
+                f"| event overflow / fallback / capacity hit / degraded | {evidence.get('event_overflows', 0)} / {evidence.get('fallback_dispatches', 0)} / {evidence.get('task_capacity_hits', 0)} / {evidence.get('degraded_transitions', 0)} |",
+                f"| 跨 LLC dispatch/migration 事件 | {evidence.get('cross_llc_events', 0)} |",
+                f"| fast-path dispatch / local / direct | {evidence.get('fast_path_dispatches', 0)} / {evidence.get('fast_path_local_dispatches', 0)} / {evidence.get('fast_path_direct_dispatches', 0)} |",
+            )
+        )
+
+    lines.extend(
+        (
+            "",
+            "## 控制面开销",
+            "",
+            "| 项目 | 实测值 |",
+            "| --- | ---: |",
+            f"| Agent + scheduler CPU | {_metric_value(evidence.get('control_plane_cpu_seconds'), 's')} ({_format_ratio((evidence.get('control_plane_cpu_percent') or 0) / 100)}) |",
+            f"| Agent 最大 RSS | {_metric_value(evidence.get('agent_max_rss_mib'), 'MiB')} |",
+            f"| scheduler 最大 RSS | {_metric_value(evidence.get('scheduler_max_rss_mib'), 'MiB')} |",
+            f"| 事件抑制比例 | {_format_ratio(evidence.get('suppression_ratio'))} |",
+        )
+    )
+
+    lines.extend(
+        (
+            "",
+            "## 环境与复现信息",
+            "",
+            "| 项目 | 值 |",
+            "| --- | --- |",
+            f"| 操作系统 | {environment.get('os', 'N/A')} |",
+            f"| 内核 | {environment.get('kernel', 'N/A')} |",
+            f"| 架构 / 逻辑 CPU | {environment.get('machine', 'N/A')} / {environment.get('logical_cpus', 'N/A')} |",
+            "| Guest 拓扑 | 1 socket x 3 cores x 2 SMT threads |",
+            f"| workload profile | {environment.get('workload_profile', 'N/A')} |",
+            f"| 证据 campaign | {methodology.get('campaign_id', 'N/A')} |",
+            f"| 模板镜像 | {methodology.get('template_image', 'N/A')} |",
+            f"| 模板 SHA-256 | {methodology.get('template_sha256', 'N/A')} |",
+            f"| Agent SHA-256 | {methodology.get('payload_sha256', {}).get('adaptive-os-agent', 'N/A')} |",
+            f"| scheduler SHA-256 | {methodology.get('payload_sha256', {}).get('scx_adaptive', 'N/A')} |",
+            f"| 测量协议 | warmup {_format_config_values(methodology.get('warmup_seconds'))} s；measurement {_format_config_values(methodology.get('measurement_seconds'))} s |",
+            f"| 预检 | {'通过' if methodology.get('preflight_passed') else '未通过/缺失'} |",
+        )
+    )
+    if output.get("invalid"):
         lines.extend(("", "## 无效运行", ""))
         for row in output["invalid"]:
             lines.append(
-                f"- {row['scenario']}/{row['variant']}/r{row['repeat']:02d}: "
-                + "; ".join(row["reasons"])
+                f"- {row.get('scenario')}/{row.get('variant')}/r{int(row.get('repeat', 0)):02d}: "
+                + "; ".join(row.get("reasons", []))
             )
-    lines.append("")
+    interval_note = (
+        "当前只有一个完整配对，因此不报告跨 repeat 的置信区间。"
+        if max((int(row.get("pairs", 0)) for row in comparisons), default=0) < 2
+        else "95% CI 使用配对改善值的 bootstrap 中位数。"
+    )
+    lines.extend(
+        (
+            "",
+            "## 指标口径",
+            "",
+            "延迟聚合为各延迟应用 P99（微秒）的几何平均；吞吐聚合为各持续吞吐应用速率的几何平均。Native 与 Agent 只按相同 repeat 配对。"
+            + interval_note,
+            "",
+        )
+    )
     return "\n".join(lines)
+
+
+def _metric_value(value: float | None, unit: str) -> str:
+    if value is None:
+        return "N/A"
+    if unit == "us":
+        return f"{value:,.1f} us"
+    if unit == "units/s":
+        return f"{value:,.3f} units/s"
+    if unit == "s":
+        return f"{value:,.2f} s"
+    if unit == "MiB":
+        return f"{value:,.2f} MiB"
+    return f"{value:,.3f}{(' ' + unit) if unit else ''}"
+
+
+def _comparison_interval(comparison: dict[str, Any]) -> str:
+    if int(comparison.get("pairs", 0)) < 2:
+        return "N/A（单轮）"
+    change = comparison.get("paired_improvement", {})
+    unit = str(change.get("unit", "percent"))
+    return (
+        f"[{_format_change(change.get('ci95_low'), unit)}, "
+        f"{_format_change(change.get('ci95_high'), unit)}]"
+    )
+
+
+def _system_metric_value(value: float | None, unit: str) -> str:
+    if value is None:
+        return "N/A"
+    if unit == "ratio":
+        return _format_ratio(value)
+    if unit == "count":
+        return f"{value:,.0f}"
+    if unit == "ms":
+        return f"{value:,.2f} ms"
+    return f"{value:,.3f}"
+
+
+def _format_config_values(value: Any) -> str:
+    if isinstance(value, list):
+        return ", ".join(str(item) for item in value) or "N/A"
+    return str(value) if value is not None else "N/A"
 
 
 def _write_comparison_csv(path: Path, rows: list[dict[str, Any]]) -> None:
@@ -1307,6 +2617,30 @@ def _window_delta(
         default=ordered[-1],
         key=lambda row: int(row.get("observed_ns", 0)),
     )
+    if int(after.get("observed_ns", 0)) <= int(before.get("observed_ns", 0)):
+        return None
+    return before, after
+
+
+def _strict_window_delta(
+    rows: list[dict[str, Any]], start_ns: int, end_ns: int
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    """Returns a counter delta only when both interval edges are sampled."""
+    if len(rows) < 2:
+        return None
+    ordered = sorted(rows, key=lambda row: int(row.get("observed_ns", 0)))
+    before = max(
+        (row for row in ordered if int(row.get("observed_ns", 0)) <= start_ns),
+        default=None,
+        key=lambda row: int(row.get("observed_ns", 0)),
+    )
+    after = min(
+        (row for row in ordered if int(row.get("observed_ns", 0)) >= end_ns),
+        default=None,
+        key=lambda row: int(row.get("observed_ns", 0)),
+    )
+    if before is None or after is None:
+        return None
     if int(after.get("observed_ns", 0)) <= int(before.get("observed_ns", 0)):
         return None
     return before, after

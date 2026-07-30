@@ -6,6 +6,7 @@ use thiserror::Error;
 
 /// Nanoseconds in one millisecond, used for readable default construction.
 pub const NSEC_PER_MSEC: u64 = 1_000_000;
+const THROUGHPUT_PREEMPTION_LOCALITY_CAP_NS: u64 = NSEC_PER_MSEC;
 
 /// Validated scheduler policy and data-plane limits.
 ///
@@ -25,12 +26,8 @@ pub struct SchedulerConfig {
     pub min_slice_ns: u64,
     /// Largest time slice BPF may accept.
     pub max_slice_ns: u64,
-    /// Minimum victim runtime before an SLO dispatch may preempt it.
-    pub preemption_min_runtime_ns: u64,
-    /// Maximum CPU-time share available to latency selections ahead of root EEVDF.
-    pub latency_guarantee_percent: u32,
-    /// CPU-time share available to compensate the disruption of urgent preemption.
-    pub preemption_budget_percent: u32,
+    /// CPU-time share reserved for latency service while other work is queued.
+    pub latency_budget_percent: u32,
     /// Maximum sleep between scheduler event-queue polls.
     pub poll_interval: Duration,
     /// Maximum live task identities retained by the userspace engine.
@@ -56,10 +53,8 @@ impl Default for SchedulerConfig {
             throughput_slice_ns: 8 * NSEC_PER_MSEC,
             min_slice_ns: 250_000,
             max_slice_ns: 64 * NSEC_PER_MSEC,
-            preemption_min_runtime_ns: 250_000,
-            latency_guarantee_percent: 10,
-            preemption_budget_percent: 10,
-            poll_interval: Duration::from_millis(1),
+            latency_budget_percent: 20,
+            poll_interval: Duration::from_millis(4),
             max_tasks: 65_536,
             control_queue_capacity: 1_024,
             max_control_frame_bytes: 1024 * 1024,
@@ -87,10 +82,7 @@ impl SchedulerConfig {
             }
         }
 
-        if self.preemption_min_runtime_ns == 0
-            || !(1..=100).contains(&self.latency_guarantee_percent)
-            || !(1..=100).contains(&self.preemption_budget_percent)
-        {
+        if !(1..=100).contains(&self.latency_budget_percent) {
             return Err(ConfigError::LatencyAdmission);
         }
         if self.poll_interval.is_zero() {
@@ -113,6 +105,36 @@ impl SchedulerConfig {
         Ok(())
     }
 
+    /// Returns the shortest preemption cadence that can admit one full
+    /// Latency request without exceeding the configured CPU share.
+    ///
+    /// This is deliberately derived from immutable loader configuration so
+    /// the BPF lease fallback and the userspace policy use the same bound.
+    pub fn latency_preemption_interval_ns(&self) -> u64 {
+        let budget = u128::from(self.latency_budget_percent.max(1));
+        let numerator = u128::from(self.latency_slice_ns).saturating_mul(100);
+        let interval = numerator.saturating_add(budget - 1) / budget;
+
+        interval.min(u128::from(u64::MAX)) as u64
+    }
+
+    /// Returns the minimum uninterrupted service given to a Throughput victim.
+    ///
+    /// Gives a Throughput victim one eighth of its base request, capped at
+    /// one millisecond, before Latency may interrupt it. Credit/debt and the
+    /// separate cadence still bound how often Latency can displace work; this
+    /// floor protects cache locality from repeated 1-2 ms fragmentation.
+    pub fn throughput_preemption_min_runtime_ns(&self) -> u64 {
+        let locality_cap = THROUGHPUT_PREEMPTION_LOCALITY_CAP_NS
+            .max(self.latency_slice_ns)
+            .min(self.throughput_slice_ns);
+
+        self.throughput_slice_ns
+            .saturating_div(8)
+            .max(self.latency_slice_ns)
+            .min(locality_cap)
+    }
+
     /// Returns the configured initial and maximum request for a class.
     pub const fn slice_for(&self, class: crate::identity::TaskClass) -> u64 {
         match class {
@@ -120,20 +142,6 @@ impl SchedulerConfig {
             crate::identity::TaskClass::Balanced => self.balanced_slice_ns,
             crate::identity::TaskClass::Throughput => self.throughput_slice_ns,
         }
-    }
-
-    /// Minimum wall-clock spacing that keeps urgent disruption within budget.
-    pub fn fast_preemption_interval_ns(&self) -> u64 {
-        self.preemption_min_runtime_ns
-            .saturating_mul(100)
-            .div_ceil(u64::from(self.preemption_budget_percent))
-    }
-
-    /// Root request used only while more than one latency task is queued.
-    pub fn latency_backlog_request_ns(&self) -> u64 {
-        self.latency_slice_ns
-            .saturating_mul(100)
-            .div_ceil(100 + u64::from(self.latency_guarantee_percent))
     }
 }
 
@@ -193,9 +201,44 @@ mod tests {
     }
 
     #[test]
-    fn bpf_derived_intervals_are_bounded() {
+    fn latency_budget_is_explicit_and_bounded() {
         let config = SchedulerConfig::default();
-        assert_eq!(config.fast_preemption_interval_ns(), 2_500_000);
-        assert_eq!(config.latency_backlog_request_ns(), 227_273);
+        assert_eq!(config.latency_budget_percent, 20);
+        assert_eq!(config.validate(), Ok(()));
+    }
+
+    #[test]
+    fn latency_preemption_interval_rounds_up_without_overflowing_u64() {
+        let mut config = SchedulerConfig {
+            latency_budget_percent: 33,
+            ..SchedulerConfig::default()
+        };
+        assert_eq!(config.latency_preemption_interval_ns(), 757_576);
+
+        config.latency_budget_percent = 1;
+        assert_eq!(config.latency_preemption_interval_ns(), 25_000_000);
+
+        config.latency_budget_percent = 100;
+        assert_eq!(config.latency_preemption_interval_ns(), 250_000);
+    }
+
+    #[test]
+    fn throughput_preemption_runtime_is_bounded_by_epoch_and_locality_cap() {
+        let mut config = SchedulerConfig::default();
+        assert_eq!(config.throughput_preemption_min_runtime_ns(), 1_000_000);
+
+        config.latency_budget_percent = 100;
+        assert_eq!(config.throughput_preemption_min_runtime_ns(), 1_000_000);
+
+        config.latency_budget_percent = 1;
+        assert_eq!(config.throughput_preemption_min_runtime_ns(), 1_000_000);
+
+        config.throughput_slice_ns = 16_000_000;
+        config.latency_budget_percent = 20;
+        assert_eq!(config.throughput_preemption_min_runtime_ns(), 1_000_000);
+
+        config.throughput_slice_ns = 250_000;
+        config.latency_slice_ns = 1_000_000;
+        assert_eq!(config.throughput_preemption_min_runtime_ns(), 250_000);
     }
 }

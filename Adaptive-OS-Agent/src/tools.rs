@@ -393,6 +393,7 @@ fn scheduler_stats(snapshot: Option<&Value>) -> Result<Value, String> {
         "tasks": snapshot.get("tasks"),
         "scheduler": snapshot.get("scheduler"),
         "data_plane": snapshot.get("data_plane"),
+        "policy": snapshot.get("policy"),
     }))
 }
 

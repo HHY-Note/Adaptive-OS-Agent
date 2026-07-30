@@ -1,129 +1,152 @@
 # Adaptive OS Agent
 
-`Adaptive-OS-Agent` 是项目的普通任务准入、语义分类和调度控制层。它从
-Linux `/proc` 和 `scx_adaptive` 生命周期事件中建立稳定的进程/线程身份，只将
-普通 `SCHED_OTHER` 线程准入 partial sched_ext，再融合显式启动目标、LLM 语义和
-scheduler 运行时行为，最后通过带 generation 的事务把分类提交给 scheduler。
+Adaptive-OS-Agent 是项目唯一的服务入口。它启动并监管 scx_adaptive，发现普通进程，
+执行安全准入，融合本地目标、DeepSeek 语义和 scheduler 行为窗口，再把带稳定身份与
+generation 的分类事务提交给 scheduler。
 
-```text
- /proc 普通任务              DeepSeek 批量语义          scheduler 行为窗口
-        │                         │                         │
-        ├─ 安全准入 SCHED_EXT      │                         │
-        │                         ▼                         ▼
-        └─ 有界元数据 ─────▶ ClassificationRegistry ◀─连续 good window
-                                      │
-                                      └─ class + generation ─▶ scx_adaptive
-```
+~~~text
+/proc discovery -> SCHED_OTHER admission -> ClassificationRegistry
+                          ^                       ^
+                          |                       |
+                 scheduler lifecycle      local / LLM / behavior
+                                                  |
+                                                  v
+                           generation action -> scx_adaptive
+~~~
 
-Agent 不参与每次 dispatch，LLM 也不在调度热路径上。新任务立即以
-`Balanced` 或已知进程默认类运行；远端请求失败时保留当前类，未分类任务继续
-使用 `Balanced`。
+Agent 不选择 CPU、不保存 runnable queue，也不参与每次 dispatch。新任务立即使用
+Balanced 或精确 process default；远端请求失败时保留当前类，不会暂停调度。
 
-- 跨组件数据流：[`../Design.md`](../Design.md)
-- Agent 内部设计：[`Design.md`](Design.md)
-- scheduler 设计：[`../scheduler/Design.md`](../scheduler/Design.md)
+完整内部状态机见 [Design.md](Design.md)，跨组件设计见 [根 Design.md](../Design.md)。
 
-## 构建与检查
+## 构建与测试
 
-```bash
+~~~bash
 cargo build --manifest-path Adaptive-OS-Agent/Cargo.toml --release --locked
 cargo test --manifest-path Adaptive-OS-Agent/Cargo.toml --locked
 cargo clippy --manifest-path Adaptive-OS-Agent/Cargo.toml \
   --all-targets --locked -- -D warnings
-```
+~~~
 
-只校验配置，不读取密钥、不启动 scheduler：
+只验证 TOML，不读取密钥、不启动 scheduler：
 
-```bash
+~~~bash
 Adaptive-OS-Agent/target/release/adaptive-os-agent \
   --config Adaptive-OS-Agent/configs/agent.example.toml \
   --validate-only
-```
+~~~
 
-## 配置与密钥
+## 配置
 
-最小配置见 [`configs/agent.example.toml`](configs/agent.example.toml)。未显式填写的
-字段使用经过校验的默认值：
+最小配置位于 configs/agent.example.toml。未写字段采用源码默认值：
 
-- 模型：`deepseek-v4-flash`；
-- thinking：关闭；
-- 批大小：24 个进程或线程；
-- 并发 worker：2（性能实验配置为 3）；
-- 请求超时：45 秒；
-- 最低接受置信度：0.60。
+| 项目 | 默认值 |
+| --- | --- |
+| scheduler socket | /run/scx_adaptive.sock |
+| Tool socket | /run/adaptive-os-agent-tools.sock |
+| /proc reconciliation | 10 s |
+| behavior / semantic tick | 1 s |
+| DeepSeek endpoint | https://api.deepseek.com |
+| model | deepseek-v4-flash |
+| batch / workers | 24 / 2 |
+| connect / response timeout | 5 s / 45 s |
+| retries | 2 |
+| minimum confidence | 0.60 |
 
-在线运行时优先读取环境变量 `DEEPSEEK_API_KEY`。也可在配置中指定
-`deepseek.api_key_file`，文件内容为：
+在线模式优先读取 DEEPSEEK_API_KEY 环境变量，也可由 deepseek.api_key_file 指向
+只包含 DEEPSEEK_API_KEY=... 的 0600 文件。密钥不会进入 prompt、日志、Registry、
+scheduler snapshot 或性能 artifact。
 
-```text
-DEEPSEEK_API_KEY=
-```
-
-密钥文件应保持 `0600` 权限，且不应进入版本库、日志、LLM 请求正文或
-scheduler snapshot。
+比赛性能配置位于 test/configs/agent.performance.toml：使用 3 个 worker、1 次 retry，
+密钥上传到 Guest 的 /run/aoa-secrets/deepseek.env。
 
 ## 运行
 
-正式运行由 Agent 启动并监管 scheduler：
-
-```bash
+~~~bash
 sudo Adaptive-OS-Agent/target/release/adaptive-os-agent \
   --config Adaptive-OS-Agent/configs/agent.example.toml \
   --scheduler-bin scheduler/rust/target/release/scx_adaptive
-```
+~~~
 
-常用选项：
+全部 CLI：
 
-| 选项 | 作用 |
+| 选项 | 行为 |
 | --- | --- |
-| `--offline` | 不访问远端模型；`Balanced` 默认、本地显式目标和行为修正仍然工作 |
-| `--snapshot-file PATH` | 周期性原子写入 scheduler 诊断快照 |
-| `--debug` | 开启 Agent 和 scheduler 子进程的调试日志 |
-| `--validate-only` | 只校验配置 |
+| --config PATH | 读取严格 TOML，未知字段直接拒绝 |
+| --scheduler-bin PATH | 指定由 Agent 启动的 scheduler，默认 scx_adaptive |
+| --offline | 禁用远端语义；本地目标、行为确认和 Balanced 默认仍工作 |
+| --snapshot-file PATH | 每个 behavior tick 原子更新 scheduler JSON snapshot |
+| --debug | 同时开启 Agent 和 scheduler child 的调试日志 |
+| --validate-only | 只校验配置 |
 
-Agent 收到 `SIGINT` 或 `SIGTERM` 后，先停止分类 worker 和本地 Tool，再停止
-scheduler。scheduler 会 detach sched_ext；只有在有界宽限内无法退出时才强制终止。
+启动时 Agent 等待 scheduler Hello 和 /sys/kernel/sched_ext/state，最长 15 秒。scheduler
+异常退出时，60 秒窗口内最多重启 3 次；每次新 epoch 都先完成 lifecycle replay 和完整
+Registry snapshot，再恢复增量提交。
 
-## 运行时结构
+退出顺序为停止新语义工作、最多等待 worker 2 秒、停止 Tool/控制连接、向 scheduler
+发送 SIGTERM，并给 scheduler 3 秒完成 detach；超时后才强制结束 child。
 
-```text
-                               唯一可写分类状态
-                                      │
- /proc 发现/准入 ──────────▶ Registry ◀── proposal ── LLM worker pool
- scheduler lifecycle/window ───▶    │
-                                           ├─ action/generation ─▶ SchedulerClient
- read-only Tool socket ──▶ Agent 主线程 ─┘
-```
+## 分类边界
 
-`ClassificationRegistry` 只由 Agent 主线程修改。LLM worker 只返回 proposal，
-SchedulerClient I/O 线程只负责帧和重连，Tool 线程只负责本地请求转发。
-这个单写者结构使分类状态转移、generation 和 ACK 容易校验。
+Agent 只准入普通 SCHED_OTHER 线程，并排除：
 
-## 本地 Tool
+- PID 1、内核线程；
+- Agent 与其 scheduler child；
+- RT/DL 和其他非 SCHED_OTHER 策略；
+- 无法在系统调用前后复核 tgid/tid/starttime 的生命期。
 
-Agent 在 Unix socket 上提供有界、只读的查询接口：
+分类使用 ProcessInstanceKey、ProcessKey、TaskKey、scheduler epoch 和 class generation，
+不会仅凭可复用 PID/TID 更新状态。LLM 只返回 proposal；ClassificationRegistry 主线程
+是分类状态的唯一 writer。
 
-| Tool | 用途 |
+## 有界运行时
+
+| 资源 | 固定上限 |
+| --- | ---: |
+| Registry process / task | 32,768 / 65,536 |
+| pending LLM batch | 32 |
+| scheduler control queue / frame | 1,024 / 1 MiB |
+| Registry snapshot batch | 128 |
+| Tool queue / frame | 128 / 256 KiB |
+| scheduler event / tick | 2,048 |
+| control action / tick | 256 |
+| Tool reply timeout | 4 s |
+
+Agent 主循环休眠周期为 20 ms。worker、SchedulerClient 和 ToolServer 只能通过有界队列
+返回结果，必须由主线程重新核对完整身份后才能影响 Registry。
+
+## 只读 Tool
+
+Tool socket 使用 4-byte network-order 长度前缀加 JSON frame，提供：
+
+| Tool | 返回内容 |
 | --- | --- |
-| `workload.list` | 分页列出 Registry 中的进程或线程身份 |
-| `workload.get` | 读取单个稳定身份的有界元数据 |
-| `classification.get` | 读取 class、stage、source、confidence 和 generation |
-| `scheduler.health` | 读取 scheduler 连接与退化状态 |
-| `scheduler.stats` | 读取 scheduler 和 BPF 计数器 |
+| workload.list | 分页列出 active/recently-exited process/task |
+| workload.get | 查询一个稳定身份的有界元数据 |
+| classification.get | class、stage、source、confidence、generation、timing |
+| scheduler.health | epoch、registry-ready、连接和 degraded 状态 |
+| scheduler.stats | Rust policy、scheduler 与 BPF 数据面计数 |
 
-Tool 不能改变 Registry 或调度器状态。性能测试使用它在测量开始约 5 s 后采集
-一次分类快照。
+Tool 不能修改 Registry、调用模型或下发调度控制。性能测试只通过它读取分类与健康证据。
 
-## 目录
+## 源码导航
 
-| 路径 | 职责 |
-| --- | --- |
-| `src/main.rs` | 进程入口、主循环、批调度和提交 |
-| `src/registry.rs` | 权威分类状态机、generation、ACK 和重放 |
-| `src/deepseek.rs` | 有界 HTTP 请求、严格 JSON schema 和重试 |
-| `src/discovery.rs`, `src/metadata.rs` | `/proc` 发现、身份核对、元数据有界化与脱敏 |
-| `src/task_admission.rs` | 仅把稳定的普通 `SCHED_OTHER` 线程切换为 `SCHED_EXT` |
-| `src/*_classifier.rs`, `src/behavior.rs` | 进程、线程和行为 proposal |
-| `src/scheduler_client.rs` | 控制协议、epoch、重连和响应匹配 |
-| `src/supervisor.rs` | scheduler 子进程启停、attach 验证和有界重启 |
-| `src/tools.rs` | 只读 Tool socket |
+~~~text
+src/main.rs                 服务入口、20 ms owner loop、提交
+src/config.rs               严格配置与默认值
+src/limits.rs               所有固定运行时上限
+src/discovery.rs            /proc process 扫描
+src/metadata.rs             生命期复核、元数据界限和脱敏
+src/task_admission.rs       SCHED_OTHER -> SCHED_EXT
+src/registry.rs             分类状态、generation、ACK、恢复
+src/deepseek.rs             HTTPS、严格 JSON schema、有界重试
+src/process_classifier.rs   process 特征投影
+src/thread_classifier.rs    thread 特征投影
+src/behavior.rs             确定性行为 proposal
+src/scheduler_client.rs     epoch、snapshot、action、重连
+src/supervisor.rs           scheduler child 与 attach 监管
+src/tools.rs                有界只读 Tool socket
+~~~
+
+新机器安装、CPU 隔离、频率锁定和 dynamic_mix 的完整运行命令见
+[根 README](../README.md)。

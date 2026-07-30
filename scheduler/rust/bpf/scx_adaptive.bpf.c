@@ -2,7 +2,7 @@
 /*
  * scx_adaptive sched_ext data plane.
  *
- * Ordinary tasks run through hierarchical BPF EEVDF queues, defaulting to
+ * Ordinary tasks run through per-CPU BPF EEVDF queues, defaulting to
  * observable Balanced service until Rust publishes a precise classification.
  * Rust remains a bounded classification and observation control plane.
  */
@@ -21,38 +21,72 @@ const volatile u32 agent_pid;
 
 /* Loader supplied immutable validation and iteration bounds. */
 const volatile u32 num_possible_cpus;
+const volatile u32 num_domains;
+const volatile u32 num_core_leaders;
+const volatile u32 cpu_domain_id_map[SCX_ADAPTIVE_MAX_CPUS];
+const volatile u32 cpu_core_leader_map[SCX_ADAPTIVE_MAX_CPUS];
+const volatile u32 cpu_core_peer_map[SCX_ADAPTIVE_MAX_CPUS];
+const volatile u32 core_leader_cpu_map[SCX_ADAPTIVE_MAX_CPUS];
 const volatile u64 latency_slice_ns = 250000ULL;
 const volatile u64 balanced_slice_ns = 4000000ULL;
 const volatile u64 throughput_slice_ns = 8000000ULL;
 const volatile u64 min_slice_ns = 250000ULL;
 const volatile u64 max_slice_ns = 64000000ULL;
-const volatile u64 preemption_min_runtime_ns = 250000ULL;
-const volatile u64 fast_preemption_interval_ns = 5000000ULL;
-const volatile u64 latency_backlog_request_ns = 227273ULL;
+const volatile u32 latency_budget_percent = 20U;
+/* Immutable fallback matching one full Latency request at the configured share. */
+const volatile u64 latency_preemption_interval_ns = 1250000ULL;
+/* Minimum uninterrupted service before Latency may displace Throughput. */
+const volatile u64 throughput_preemption_min_runtime_ns = 1000000ULL;
 
-#define FAST_CLASS_DSQ_BASE 0x10000ULL
-#define FAST_LATENCY_OVERFLOW_DSQ \
-	(FAST_CLASS_DSQ_BASE + \
-	 (u64)SCX_ADAPTIVE_CLASS_COUNT * SCX_ADAPTIVE_MAX_CPUS)
-#define FAST_BPF_URGENT_DISPATCH_ID (~0ULL)
+#define FAST_TASK_DSQ_BASE 0x10000ULL
+#define FAST_LATENCY_DSQ_BASE 0x20000ULL
+#define FAST_BALANCED_OVERFLOW_DSQ_BASE 0x30000ULL
+#define FAST_SHARED_LATENCY_DSQ_BASE 0x40000ULL
+#define FAST_LATENCY_RESCHED_ID (~0ULL)
+#define FAST_BALANCED_RESCHED_ID (~0ULL - 1ULL)
 #define FAST_NO_RUNNING_CLASS SCX_ADAPTIVE_CLASS_COUNT
 #define FAST_STEAL_SCAN_LIMIT 8U
-#define FAST_LATENCY_SCAN_LIMIT 8U
+#define FAST_BALANCED_THROUGHPUT_MIN_RUNTIME_SLICES 8U
+#define FAST_LATENCY_DEBT_CAP_SLICES 4U
+#define FAST_BALANCED_PLACEMENT_HYSTERESIS 6ULL
+#define FAST_CPU_LOCALITY_SMT 0U
+#define FAST_CPU_LOCALITY_SAME_LLC 1U
+#define FAST_CPU_LOCALITY_CROSS_LLC 2U
+#define FAST_CPU_LOCALITY_UNKNOWN 3U
+#define FAST_THROUGHPUT_PREEMPTION_BIN_EARLY 0U
+#define FAST_THROUGHPUT_PREEMPTION_BIN_MID 1U
+#define FAST_THROUGHPUT_PREEMPTION_BIN_LATE 2U
+#define FAST_THROUGHPUT_PREEMPTION_BIN_COMPLETE 3U
+#define FAST_THROUGHPUT_PREEMPTION_BIN_UNKNOWN \
+	SCX_ADAPTIVE_PREEMPTION_SERVICE_BIN_COUNT
+#define FAST_THROUGHPUT_PREEMPTION_RUNTIME_BIN_UNDER_500US 0U
+#define FAST_THROUGHPUT_PREEMPTION_RUNTIME_BIN_500US_TO_1MS 1U
+#define FAST_THROUGHPUT_PREEMPTION_RUNTIME_BIN_1MS_TO_2MS 2U
+#define FAST_THROUGHPUT_PREEMPTION_RUNTIME_BIN_AT_LEAST_2MS 3U
+#define FAST_THROUGHPUT_PREEMPTION_RUNTIME_BIN_UNKNOWN \
+	SCX_ADAPTIVE_PREEMPTION_RUNTIME_BIN_COUNT
 /* Inherited tasks need enough samples for one-second behavior windows. */
 #define FAST_EVENT_SAMPLE_INTERVAL_NS 4000000ULL
 #define FAST_COARSE_EVENT_SAMPLE_INTERVAL_NS 16000000ULL
+#define FAST_PIPELINE_SAMPLE_MASK 15ULL
+#define FAST_DEFAULT_STATIC_PRIO 120U
+#define FAST_QUEUE_SCOPE_NONE 0U
+#define FAST_QUEUE_SCOPE_PRIVATE 1U
+#define FAST_QUEUE_SCOPE_SHARED_BALANCED 2U
+#define FAST_QUEUE_SCOPE_SHARED_LATENCY 3U
 
 /* Non-zero monotonic source shared by task and process cookie allocation. */
 static u64 next_identity_cookie = 1;
 
-/* Number of tasks waiting in custom class DSQs (local DSQs are excluded). */
+/* Number of tasks waiting in custom task DSQs (local DSQs are excluded). */
 static volatile u64 class_queued_tasks;
-
-/* Number of live tasks whose effective policy is not Balanced. */
-static volatile u64 specialized_tasks;
-
-/* Serializes the short shared-overflow move without locking private queues. */
-static volatile u32 latency_overflow_claim;
+/* Exact lane totals prevent one class from triggering another class's scan. */
+static volatile u64 latency_queued_tasks;
+/* Private Latency backlog remains distinguishable from the movable lane. */
+static volatile u64 private_latency_queued_tasks;
+static volatile u64 normal_queued_tasks;
+static volatile u64 shared_balanced_queued_tasks;
+static volatile u64 shared_latency_queued_tasks;
 
 /*
  * Process map key combines a numeric TGID with the group leader start time.
@@ -75,6 +109,17 @@ struct process_context {
 	u32 padding;
 };
 
+/* Cache-line isolated claim and singleton locality lease for one core shard. */
+struct core_latency_state {
+	u64 singleton_release_ns;
+	u32 dispatch_claim;
+	u32 padding;
+	u64 reserved[6];
+};
+
+_Static_assert(sizeof(struct core_latency_state) == 64,
+	       "core_latency_state must remain cache-line isolated");
+
 /*
  * Task-local data needed to validate one runnable instance and report runtime.
  * Every field is written by BPF; userspace observes only the event projection.
@@ -94,6 +139,7 @@ struct task_context {
 	u64 throughput_epoch_ns;
 	s32 previous_cpu;
 	s32 target_cpu;
+	s32 vruntime_cpu;
 	u32 tgid;
 	u32 policy_class;
 	u32 fast_path;
@@ -104,14 +150,8 @@ struct task_context {
 	u32 selected_control_flags;
 	u32 selected_control_valid;
 	u32 class_queue_accounted;
-	u32 counted_specialized;
-	u32 padding;
+	u32 latency_budget_charged;
 	struct process_identity_key process_key;
-};
-
-/* Global virtual time used by each class's per-CPU task queues. */
-struct fast_class_state {
-	u64 virtual_time_ns;
 };
 
 /* Per-task lifetime state; task_struct is the storage key. */
@@ -144,13 +184,22 @@ struct {
 	__type(value, struct task_control_value);
 } task_control SEC(".maps");
 
-/* Three dense class entities; queue contents live in custom sched_ext DSQs. */
+/* One atomically replaced selector for the active userspace policy slot. */
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
-	__uint(max_entries, SCX_ADAPTIVE_CLASS_COUNT);
+	__uint(max_entries, 1);
 	__type(key, u32);
-	__type(value, struct fast_class_state);
-} class_state SEC(".maps");
+	__type(value, struct adaptive_policy_control);
+} policy_control SEC(".maps");
+
+/* Two complete topology generations; userspace writes only the inactive one. */
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries,
+	       SCX_ADAPTIVE_POLICY_SLOT_COUNT * SCX_ADAPTIVE_MAX_CPUS);
+	__type(key, u32);
+	__type(value, struct adaptive_cpu_policy);
+} cpu_policy SEC(".maps");
 
 /* Shared bounded pipeline and liveness state for every possible CPU. */
 struct {
@@ -159,6 +208,14 @@ struct {
 	__type(key, u32);
 	__type(value, struct adaptive_cpu_state);
 } cpu_state SEC(".maps");
+
+/* Separate shard state keeps cross-core claims off hot per-CPU ledgers. */
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, SCX_ADAPTIVE_MAX_CPUS);
+	__type(key, u32);
+	__type(value, struct core_latency_state);
+} core_latency_state SEC(".maps");
 
 /* Per-CPU statistics avoid cross-CPU cache-line contention on the fast path. */
 struct {
@@ -183,11 +240,86 @@ static __always_inline struct adaptive_global_stats *stats_value(void)
 		stats->field++;                                                \
 } while (0)
 
-/** Returns the virtual-deadline queue for a workload class. */
-static __always_inline u64 class_dsq(u32 class_id, u32 cpu)
+/** Returns one CPU's unified virtual-deadline task queue. */
+static __always_inline u64 task_dsq(u32 cpu)
 {
-	return FAST_CLASS_DSQ_BASE +
-	       (u64)class_id * SCX_ADAPTIVE_MAX_CPUS + cpu;
+	return FAST_TASK_DSQ_BASE + cpu;
+}
+
+/** Returns one CPU's deadline-ordered latency lane. */
+static __always_inline u64 latency_dsq(u32 cpu)
+{
+	return FAST_LATENCY_DSQ_BASE + cpu;
+}
+
+/** Returns one scheduling domain's shared Balanced overflow queue. */
+static __always_inline u64 balanced_overflow_dsq(u32 domain_id)
+{
+	return FAST_BALANCED_OVERFLOW_DSQ_BASE + domain_id;
+}
+
+/** Returns one physical core's shared blocked-wakeup Latency queue. */
+static __always_inline u64 shared_latency_dsq(u32 core_leader)
+{
+	return FAST_SHARED_LATENCY_DSQ_BASE + core_leader;
+}
+
+/** Resolves immutable scheduler-lifetime topology without a policy lease. */
+static __always_inline u32 immutable_domain_for_cpu(s32 cpu)
+{
+	const volatile u32 *domain_id;
+
+	if (cpu < 0 || cpu >= num_possible_cpus ||
+	    cpu >= SCX_ADAPTIVE_MAX_CPUS)
+		return SCX_ADAPTIVE_INVALID_CPU;
+	domain_id = MEMBER_VPTR(cpu_domain_id_map, [cpu]);
+	if (!domain_id || *domain_id >= num_domains ||
+	    *domain_id >= SCX_ADAPTIVE_MAX_CPUS)
+		return SCX_ADAPTIVE_INVALID_CPU;
+	return *domain_id;
+}
+
+/** Resolves the immutable representative used by one physical-core shard. */
+static __always_inline u32 immutable_core_leader_for_cpu(s32 cpu)
+{
+	const volatile u32 *leader;
+
+	if (cpu < 0 || cpu >= num_possible_cpus ||
+	    cpu >= SCX_ADAPTIVE_MAX_CPUS)
+		return SCX_ADAPTIVE_INVALID_CPU;
+	leader = MEMBER_VPTR(cpu_core_leader_map, [cpu]);
+	if (!leader || *leader >= num_possible_cpus ||
+	    *leader >= SCX_ADAPTIVE_MAX_CPUS)
+		return SCX_ADAPTIVE_INVALID_CPU;
+	return *leader;
+}
+
+/** Returns one representative SMT peer, or the leader on a single-thread core. */
+static __always_inline u32 immutable_core_peer_for_leader(u32 leader)
+{
+	const volatile u32 *peer;
+
+	if (leader >= num_possible_cpus || leader >= SCX_ADAPTIVE_MAX_CPUS)
+		return SCX_ADAPTIVE_INVALID_CPU;
+	peer = MEMBER_VPTR(cpu_core_peer_map, [leader]);
+	if (!peer || *peer >= num_possible_cpus ||
+	    *peer >= SCX_ADAPTIVE_MAX_CPUS)
+		return SCX_ADAPTIVE_INVALID_CPU;
+	return *peer;
+}
+
+/** Resolves one dense physical-core representative published by the loader. */
+static __always_inline u32 immutable_core_leader_at(u32 index)
+{
+	const volatile u32 *leader;
+
+	if (index >= num_core_leaders || index >= SCX_ADAPTIVE_MAX_CPUS)
+		return SCX_ADAPTIVE_INVALID_CPU;
+	leader = MEMBER_VPTR(core_leader_cpu_map, [index]);
+	if (!leader || *leader >= num_possible_cpus ||
+	    *leader >= SCX_ADAPTIVE_MAX_CPUS)
+		return SCX_ADAPTIVE_INVALID_CPU;
+	return *leader;
 }
 
 /** Returns the configured maximum request for one workload class. */
@@ -200,13 +332,17 @@ static __always_inline u64 class_slice(u32 class_id)
 	return balanced_slice_ns;
 }
 
-/** Converts real service into EEVDF virtual service using Linux task weight. */
+/** Converts service into weighted virtual time; Latency receives 2x weight. */
 static __always_inline u64 task_virtual_service(
-	const struct task_struct *p, u64 service_ns)
+	const struct task_struct *p, u32 class_id, u64 service_ns)
 {
 	u64 service = scale_by_task_weight_inverse(p, service_ns);
 
-	return service_ns && !service ? 1 : service;
+	if (service_ns && !service)
+		return 1;
+	if (class_id == SCX_ADAPTIVE_CLASS_LATENCY)
+		service = (service >> 1) + (service & 1);
+	return service;
 }
 
 /** Returns the request retained by one task's current class epoch. */
@@ -239,43 +375,46 @@ static __always_inline u64 next_throughput_epoch(
 static __always_inline void clear_class_queue_account(
 	struct task_context *taskc)
 {
+	struct adaptive_cpu_state *cpuc;
+	u32 key;
+	u32 queue_scope;
+	u64 *queued = 0;
+
 	if (!taskc || !taskc->class_queue_accounted)
 		return;
-	taskc->class_queue_accounted = 0;
+	queue_scope = taskc->class_queue_accounted;
+
+	taskc->class_queue_accounted = FAST_QUEUE_SCOPE_NONE;
 	__sync_fetch_and_sub(&class_queued_tasks, 1);
-}
-
-/** Tracks whether any live task requires the mixed-class root scheduler. */
-static __always_inline void sync_specialized_task(
-	struct task_context *taskc, u32 class_id)
-{
-	bool specialized = class_id != SCX_ADAPTIVE_CLASS_BALANCED;
-
-	if (specialized == !!taskc->counted_specialized)
-		return;
-	taskc->counted_specialized = specialized;
-	if (specialized)
-		__sync_fetch_and_add(&specialized_tasks, 1);
+	if (taskc->policy_class == SCX_ADAPTIVE_CLASS_LATENCY) {
+		__sync_fetch_and_sub(&latency_queued_tasks, 1);
+		if (queue_scope == FAST_QUEUE_SCOPE_SHARED_LATENCY)
+			__sync_fetch_and_sub(&shared_latency_queued_tasks, 1);
+		else
+			__sync_fetch_and_sub(&private_latency_queued_tasks, 1);
+	} else if (queue_scope == FAST_QUEUE_SCOPE_SHARED_BALANCED)
+		__sync_fetch_and_sub(&shared_balanced_queued_tasks, 1);
 	else
-		__sync_fetch_and_sub(&specialized_tasks, 1);
-}
-
-/** Drops a task's mixed-class membership during exec or exit. */
-static __always_inline void clear_specialized_task(
-	struct task_context *taskc)
-{
-	if (!taskc || !taskc->counted_specialized)
+		__sync_fetch_and_sub(&normal_queued_tasks, 1);
+	if (queue_scope == FAST_QUEUE_SCOPE_SHARED_BALANCED ||
+	    queue_scope == FAST_QUEUE_SCOPE_SHARED_LATENCY)
 		return;
-	taskc->counted_specialized = 0;
-	__sync_fetch_and_sub(&specialized_tasks, 1);
-}
-
-/** Looks up one class state after validating its dense index. */
-static __always_inline struct fast_class_state *class_state_for(u32 class_id)
-{
-	if (class_id >= SCX_ADAPTIVE_CLASS_COUNT)
-		return 0;
-	return bpf_map_lookup_elem(&class_state, &class_id);
+	if (taskc->target_cpu < 0 ||
+	    taskc->target_cpu >= num_possible_cpus ||
+	    taskc->target_cpu >= SCX_ADAPTIVE_MAX_CPUS)
+		return;
+	key = taskc->target_cpu;
+	cpuc = bpf_map_lookup_elem(&cpu_state, &key);
+	if (!cpuc)
+		return;
+	if (taskc->policy_class == SCX_ADAPTIVE_CLASS_LATENCY)
+		queued = &cpuc->queued_tasks_by_class[0];
+	else if (taskc->policy_class == SCX_ADAPTIVE_CLASS_BALANCED)
+		queued = &cpuc->queued_tasks_by_class[1];
+	else if (taskc->policy_class == SCX_ADAPTIVE_CLASS_THROUGHPUT)
+		queued = &cpuc->queued_tasks_by_class[2];
+	if (queued && __sync_fetch_and_add(queued, 0) > 0)
+		__sync_fetch_and_sub(queued, 1);
 }
 
 /** Looks up one bounded CPU state entry. */
@@ -289,30 +428,104 @@ static __always_inline struct adaptive_cpu_state *cpu_state_for(s32 cpu)
 	return bpf_map_lookup_elem(&cpu_state, &key);
 }
 
-/** Reads one dense root entity without verifier-visible array indexing. */
-static __always_inline u64 root_vruntime_for(
-	const struct adaptive_cpu_state *cpuc, u32 class_id)
+/** Looks up the cache-line isolated state owned by one physical-core shard. */
+static __always_inline struct core_latency_state *core_latency_state_for(
+	u32 leader)
 {
-	if (class_id == SCX_ADAPTIVE_CLASS_LATENCY)
-		return cpuc->root_vruntime_ns[0];
-	if (class_id == SCX_ADAPTIVE_CLASS_BALANCED)
-		return cpuc->root_vruntime_ns[1];
-	if (class_id == SCX_ADAPTIVE_CLASS_THROUGHPUT)
-		return cpuc->root_vruntime_ns[2];
-	return ~0ULL;
+	if (leader >= num_possible_cpus || leader >= SCX_ADAPTIVE_MAX_CPUS)
+		return 0;
+	return bpf_map_lookup_elem(&core_latency_state, &leader);
 }
 
-/** Writes one dense root entity without verifier-visible array indexing. */
-static __always_inline void set_root_vruntime(
-	struct adaptive_cpu_state *cpuc, u32 class_id, u64 vruntime)
+/** Returns the active policy only while its lease and generation are valid. */
+static __always_inline struct adaptive_policy_control *active_policy(u64 now)
 {
-	if (class_id == SCX_ADAPTIVE_CLASS_LATENCY)
-		cpuc->root_vruntime_ns[0] = vruntime;
-	else if (class_id == SCX_ADAPTIVE_CLASS_BALANCED)
-		cpuc->root_vruntime_ns[1] = vruntime;
-	else if (class_id == SCX_ADAPTIVE_CLASS_THROUGHPUT)
-		cpuc->root_vruntime_ns[2] = vruntime;
+	u32 key = 0;
+	struct adaptive_policy_control *policy;
+
+	policy = bpf_map_lookup_elem(&policy_control, &key);
+	if (!policy || !(policy->flags & SCX_ADAPTIVE_POLICY_VALID) ||
+	    policy->active_slot >= SCX_ADAPTIVE_POLICY_SLOT_COUNT ||
+	    !policy->generation || policy->valid_until_ns <= now ||
+	    !policy->domain_count || !policy->latency_budget_percent ||
+	    policy->latency_budget_percent > 100)
+		return 0;
+	return policy;
 }
+
+/** Uses the leased userspace budget, with immutable rodata as safe fallback. */
+static __always_inline u32 active_latency_budget(u64 now)
+{
+	struct adaptive_policy_control *policy = active_policy(now);
+
+	return policy ? policy->latency_budget_percent : latency_budget_percent;
+}
+
+/** Bounds one singleton's home-core locality lease by a Latency request. */
+static __always_inline u64 active_latency_locality_lease(u64 now)
+{
+	struct adaptive_policy_control *policy = active_policy(now);
+	u64 lease = policy ? policy->latency_successor_lease_ns : latency_slice_ns;
+
+	if (!lease || lease > latency_slice_ns)
+		lease = latency_slice_ns;
+	return lease;
+}
+
+/** Returns a bounded userspace-selected Balanced preemption granule. */
+static __always_inline u64 active_balanced_granularity(u64 now)
+{
+	struct adaptive_policy_control *policy = active_policy(now);
+	u64 granularity = policy ? policy->balanced_preemption_granularity_ns :
+		balanced_slice_ns / 4;
+
+	if (granularity < min_slice_ns)
+		granularity = min_slice_ns;
+	if (granularity > balanced_slice_ns)
+		granularity = balanced_slice_ns;
+	return granularity;
+}
+
+/** Resolves one CPU record from the atomically selected complete policy slot. */
+static __always_inline struct adaptive_cpu_policy *policy_cpu_for(
+	const struct adaptive_policy_control *policy, s32 cpu)
+{
+	u32 key;
+	struct adaptive_cpu_policy *cpu_policy_value;
+
+	if (!policy || cpu < 0 || cpu >= num_possible_cpus ||
+	    cpu >= SCX_ADAPTIVE_MAX_CPUS)
+		return 0;
+	key = policy->active_slot * SCX_ADAPTIVE_MAX_CPUS + (u32)cpu;
+	cpu_policy_value = bpf_map_lookup_elem(&cpu_policy, &key);
+	if (!cpu_policy_value || cpu_policy_value->generation != policy->generation)
+		return 0;
+	return cpu_policy_value;
+}
+
+/** Categorizes a cross-CPU handoff using the active immutable topology view. */
+static __always_inline u32 cpu_locality(s32 from_cpu, s32 to_cpu, u64 now)
+{
+	struct adaptive_policy_control *policy = active_policy(now);
+	struct adaptive_cpu_policy *from;
+	struct adaptive_cpu_policy *to;
+
+	if (!policy || from_cpu < 0 || to_cpu < 0 ||
+	    from_cpu >= num_possible_cpus || to_cpu >= num_possible_cpus ||
+	    from_cpu == to_cpu)
+		return FAST_CPU_LOCALITY_UNKNOWN;
+	from = policy_cpu_for(policy, from_cpu);
+	to = policy_cpu_for(policy, to_cpu);
+	if (!from || !to)
+		return FAST_CPU_LOCALITY_UNKNOWN;
+	if (from->package_id == to->package_id &&
+	    from->core_id == to->core_id)
+		return FAST_CPU_LOCALITY_SMT;
+	if (from->llc_id == to->llc_id)
+		return FAST_CPU_LOCALITY_SAME_LLC;
+	return FAST_CPU_LOCALITY_CROSS_LLC;
+}
+
 /** Updates one already-looked-up per-CPU record for a class dispatch. */
 static __always_inline void account_fast_dispatch(
 	struct adaptive_global_stats *stats, u32 class_id, bool remote)
@@ -326,21 +539,42 @@ static __always_inline void account_fast_dispatch(
 		stats->fast_path_dispatches_by_class[1]++;
 	else if (class_id == SCX_ADAPTIVE_CLASS_THROUGHPUT)
 		stats->fast_path_dispatches_by_class[2]++;
-	if (remote)
+	if (remote) {
 		stats->fast_path_remote_steals++;
-	else
+		if (class_id == SCX_ADAPTIVE_CLASS_LATENCY)
+			stats->fast_path_remote_dispatches_by_class[0]++;
+		else if (class_id == SCX_ADAPTIVE_CLASS_BALANCED)
+			stats->fast_path_remote_dispatches_by_class[1]++;
+		else if (class_id == SCX_ADAPTIVE_CLASS_THROUGHPUT)
+			stats->fast_path_remote_dispatches_by_class[2]++;
+	} else {
 		stats->fast_path_local_dispatches++;
+	}
 }
 
 /** Records one local or remote class dispatch. */
-static __always_inline void record_fast_dispatch(u32 class_id, bool remote)
+static __always_inline void record_fast_dispatch(u32 class_id, bool remote,
+	s32 owner_cpu, s32 actual_cpu, u64 now)
 {
-	account_fast_dispatch(stats_value(), class_id, remote);
+	struct adaptive_global_stats *stats = stats_value();
+	u32 locality;
+
+	account_fast_dispatch(stats, class_id, remote);
+	if (!stats || !remote)
+		return;
+	locality = cpu_locality(owner_cpu, actual_cpu, now);
+	if (locality >= SCX_ADAPTIVE_CPU_LOCALITY_COUNT)
+		return;
+	if (class_id == SCX_ADAPTIVE_CLASS_LATENCY)
+		stats->fast_path_latency_remote_dispatches_by_locality[locality]++;
+	else if (class_id == SCX_ADAPTIVE_CLASS_THROUGHPUT)
+		stats->fast_path_throughput_remote_dispatches_by_locality[locality]++;
 }
 
-/** Records one enqueue and folds direct-dispatch counters into one lookup. */
+/** Records one enqueue and its observation/direct-dispatch properties. */
 static __always_inline void record_fast_enqueue(
-	u32 class_id, bool direct, bool events_suppressed)
+	u32 class_id, bool direct, bool events_suppressed,
+	bool selected_migration, u32 selected_locality)
 {
 	struct adaptive_global_stats *stats = stats_value();
 
@@ -349,9 +583,164 @@ static __always_inline void record_fast_enqueue(
 	stats->fast_path_enqueues++;
 	if (events_suppressed)
 		stats->fast_path_events_suppressed++;
-	if (direct) {
-		account_fast_dispatch(stats, class_id, false);
+	if (direct)
 		stats->fast_path_direct_dispatches++;
+	if (class_id == SCX_ADAPTIVE_CLASS_LATENCY) {
+		if (selected_migration) {
+			stats->fast_path_select_migrations_by_class[0]++;
+			if (selected_locality < SCX_ADAPTIVE_CPU_LOCALITY_COUNT)
+				stats->fast_path_latency_select_migrations_by_locality[
+					selected_locality]++;
+		}
+	} else if (class_id == SCX_ADAPTIVE_CLASS_BALANCED) {
+		if (selected_migration)
+			stats->fast_path_select_migrations_by_class[1]++;
+	} else if (class_id == SCX_ADAPTIVE_CLASS_THROUGHPUT) {
+		if (selected_migration) {
+			stats->fast_path_select_migrations_by_class[2]++;
+			if (selected_locality < SCX_ADAPTIVE_CPU_LOCALITY_COUNT)
+				stats->fast_path_throughput_select_migrations_by_locality[
+					selected_locality]++;
+		}
+	}
+}
+
+/** Records only final select_cpu outcomes, after every candidate override. */
+static __always_inline void record_select_cpu_diagnostics(
+	u32 class_id, u32 latency_path, s32 cpu, s32 prev_cpu, u64 wake_flags)
+{
+	struct adaptive_global_stats *stats;
+	bool migrated = cpu != prev_cpu;
+
+	if (class_id != SCX_ADAPTIVE_CLASS_LATENCY &&
+	    !(wake_flags & SCX_WAKE_SYNC))
+		return;
+	stats = stats_value();
+	if (!stats)
+		return;
+	if (class_id == SCX_ADAPTIVE_CLASS_LATENCY) {
+		if (latency_path == SCX_ADAPTIVE_LATENCY_SELECT_DEFAULT_IDLE) {
+			stats->fast_path_latency_selects_by_path[0]++;
+			if (migrated)
+				stats->fast_path_latency_select_migrations_by_path[0]++;
+		} else if (latency_path == SCX_ADAPTIVE_LATENCY_SELECT_DEFAULT_BUSY) {
+			stats->fast_path_latency_selects_by_path[1]++;
+			if (migrated)
+				stats->fast_path_latency_select_migrations_by_path[1]++;
+		} else if (latency_path == SCX_ADAPTIVE_LATENCY_SELECT_POLICY_VICTIM) {
+			stats->fast_path_latency_selects_by_path[2]++;
+			if (migrated)
+				stats->fast_path_latency_select_migrations_by_path[2]++;
+		} else {
+			stats->fast_path_latency_selects_by_path[3]++;
+			if (migrated)
+				stats->fast_path_latency_select_migrations_by_path[3]++;
+		}
+	}
+	if (!(wake_flags & SCX_WAKE_SYNC))
+		return;
+	if (class_id == SCX_ADAPTIVE_CLASS_LATENCY) {
+		stats->fast_path_select_sync_wakeups_by_class[0]++;
+		if (migrated)
+			stats->fast_path_select_sync_migrations_by_class[0]++;
+	} else if (class_id == SCX_ADAPTIVE_CLASS_BALANCED) {
+		stats->fast_path_select_sync_wakeups_by_class[1]++;
+		if (migrated)
+			stats->fast_path_select_sync_migrations_by_class[1]++;
+	} else if (class_id == SCX_ADAPTIVE_CLASS_THROUGHPUT) {
+		stats->fast_path_select_sync_wakeups_by_class[2]++;
+		if (migrated)
+			stats->fast_path_select_sync_migrations_by_class[2]++;
+	}
+}
+
+/** Records a PREEMPT kick only at the call site that actually issues it. */
+static __always_inline void record_immediate_preemption_kick(u32 class_id)
+{
+	struct adaptive_global_stats *stats = stats_value();
+
+	if (!stats)
+		return;
+	if (class_id == SCX_ADAPTIVE_CLASS_LATENCY)
+		stats->fast_path_immediate_preemption_kicks_by_class[0]++;
+	else if (class_id == SCX_ADAPTIVE_CLASS_BALANCED)
+		stats->fast_path_immediate_preemption_kicks_by_class[1]++;
+}
+
+static __always_inline struct task_context *task_ctx_for(struct task_struct *p);
+
+/** Bins one Throughput victim's uninterrupted service before a reschedule. */
+static __always_inline u32 throughput_preemption_runtime_bin(u64 runtime)
+{
+	if (runtime < 500000ULL)
+		return FAST_THROUGHPUT_PREEMPTION_RUNTIME_BIN_UNDER_500US;
+	if (runtime < 1000000ULL)
+		return FAST_THROUGHPUT_PREEMPTION_RUNTIME_BIN_500US_TO_1MS;
+	if (runtime < 2000000ULL)
+		return FAST_THROUGHPUT_PREEMPTION_RUNTIME_BIN_1MS_TO_2MS;
+	return FAST_THROUGHPUT_PREEMPTION_RUNTIME_BIN_AT_LEAST_2MS;
+}
+
+/** Accounts the service a Throughput victim received before an urgent reschedule. */
+static __always_inline void account_throughput_preemption_service(
+	struct adaptive_global_stats *stats, struct task_struct *prev,
+	const struct adaptive_cpu_state *cpuc, u64 now)
+{
+	struct task_context *taskc;
+	u32 service_bin;
+	u32 runtime_bin;
+	u64 runtime;
+	u64 request;
+
+	if (!stats || !prev || !cpuc)
+		return;
+	taskc = task_ctx_for(prev);
+	if (!taskc || taskc->policy_class != SCX_ADAPTIVE_CLASS_THROUGHPUT ||
+	    !taskc->start_ns || now < taskc->start_ns)
+		return;
+	request = taskc->request_ns;
+	if (!request)
+		return;
+	runtime = now - taskc->start_ns;
+	if (runtime < request / 4)
+		service_bin = FAST_THROUGHPUT_PREEMPTION_BIN_EARLY;
+	else if (runtime < request / 2)
+		service_bin = FAST_THROUGHPUT_PREEMPTION_BIN_MID;
+	else if (runtime < request - request / 10)
+		service_bin = FAST_THROUGHPUT_PREEMPTION_BIN_LATE;
+	else
+		service_bin = FAST_THROUGHPUT_PREEMPTION_BIN_COMPLETE;
+	runtime_bin = throughput_preemption_runtime_bin(runtime);
+	stats->fast_path_throughput_preemption_service_bins[service_bin]++;
+	if (runtime_bin < SCX_ADAPTIVE_PREEMPTION_RUNTIME_BIN_COUNT)
+		stats->fast_path_throughput_preemption_runtime_bins[runtime_bin]++;
+	stats->fast_path_throughput_preemption_runtime_ns += runtime;
+	stats->fast_path_throughput_preemption_request_ns += request;
+}
+
+/** Records the requester and victim of one successfully consumed reschedule. */
+static __always_inline void record_fast_preemption(
+	u32 class_id, u32 victim_class, struct task_struct *prev,
+	const struct adaptive_cpu_state *cpuc, u64 now)
+{
+	struct adaptive_global_stats *stats = stats_value();
+
+	if (!stats)
+		return;
+	stats->fast_path_preemptions++;
+	if (class_id == SCX_ADAPTIVE_CLASS_LATENCY)
+		stats->fast_path_preemptions_by_class[0]++;
+	else if (class_id == SCX_ADAPTIVE_CLASS_BALANCED)
+		stats->fast_path_preemptions_by_class[1]++;
+	else if (class_id == SCX_ADAPTIVE_CLASS_THROUGHPUT)
+		stats->fast_path_preemptions_by_class[2]++;
+	if (victim_class == SCX_ADAPTIVE_CLASS_LATENCY)
+		stats->fast_path_preemption_victims_by_class[0]++;
+	else if (victim_class == SCX_ADAPTIVE_CLASS_BALANCED)
+		stats->fast_path_preemption_victims_by_class[1]++;
+	else if (victim_class == SCX_ADAPTIVE_CLASS_THROUGHPUT) {
+		stats->fast_path_preemption_victims_by_class[2]++;
+		account_throughput_preemption_service(stats, prev, cpuc, now);
 	}
 }
 
@@ -466,88 +855,6 @@ static __always_inline void fill_task_event(struct task_event *event,
 	event->actual_cpu = -1;
 }
 
-/** Preserves at most one request of lag while entering or changing a class. */
-static __always_inline void rebase_fast_vruntime(
-	struct task_struct *p, struct task_context *taskc,
-	u32 target_class, u64 target_request)
-{
-	struct fast_class_state *target = class_state_for(target_class);
-	struct fast_class_state *source;
-	u64 lag;
-	u64 floor;
-	u64 source_request;
-
-	if (!target)
-		return;
-	if (!taskc->fast_path || taskc->policy_class >= SCX_ADAPTIVE_CLASS_COUNT) {
-		floor = target->virtual_time_ns > target_request ?
-			target->virtual_time_ns - target_request : 0;
-		if (taskc->vruntime_ns < floor)
-			taskc->vruntime_ns = floor;
-		return;
-	}
-	if (taskc->policy_class == target_class)
-		return;
-
-	source = class_state_for(taskc->policy_class);
-	if (!source) {
-		taskc->vruntime_ns = target->virtual_time_ns;
-		return;
-	}
-	source_request = task_virtual_service(
-		p, class_slice(taskc->policy_class));
-	if (source->virtual_time_ns >= taskc->vruntime_ns) {
-		lag = source->virtual_time_ns - taskc->vruntime_ns;
-		if (lag > source_request)
-			lag = source_request;
-		if (lag > target_request)
-			lag = target_request;
-		taskc->vruntime_ns = target->virtual_time_ns > lag ?
-			target->virtual_time_ns - lag : 0;
-	} else {
-		lag = taskc->vruntime_ns - source->virtual_time_ns;
-		if (lag > source_request)
-			lag = source_request;
-		if (lag > target_request)
-			lag = target_request;
-		taskc->vruntime_ns = target->virtual_time_ns + lag;
-	}
-}
-
-/** Bounds a returning root entity to one request of per-CPU sleep credit. */
-static __always_inline u64 activate_root_entity(
-	struct adaptive_cpu_state *cpuc, u32 class_id, u64 request)
-{
-	u64 vruntime = root_vruntime_for(cpuc, class_id);
-	u64 floor = cpuc->root_virtual_time_ns > request ?
-		cpuc->root_virtual_time_ns - request : 0;
-
-	if (vruntime < floor) {
-		vruntime = floor;
-		set_root_vruntime(cpuc, class_id, vruntime);
-	}
-	return vruntime;
-}
-
-/** Charges one class request to a CPU's root EEVDF entity. */
-static __always_inline u64 charge_root_entity(
-	struct adaptive_cpu_state *cpuc, u32 class_id, u64 request)
-{
-	u64 vruntime = activate_root_entity(cpuc, class_id, request);
-
-	set_root_vruntime(cpuc, class_id, vruntime + request);
-	return vruntime;
-}
-
-/** Charges a continued request while preserving the class's root fairness. */
-static __always_inline void charge_root_continuation(
-	struct adaptive_cpu_state *cpuc, u32 class_id, u64 request)
-{
-	u64 vruntime = activate_root_entity(cpuc, class_id, request);
-
-	set_root_vruntime(cpuc, class_id, vruntime + request);
-}
-
 static __always_inline u64 fast_queued_on_cpu(s32 cpu);
 
 /** Returns true when an idle target already has local work to preserve. */
@@ -558,53 +865,230 @@ static __always_inline bool cpu_has_local_work(
 		return true;
 	return cpuc->urgent_dispatch_id ||
 		scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON | cpu) > 0 ||
-		scx_bpf_dsq_nr_queued(FAST_LATENCY_OVERFLOW_DSQ) > 0 ||
 		fast_queued_on_cpu(cpu) > 0;
 }
 
-/** Bounds urgent latency service to one root request ahead on the target CPU. */
-static __always_inline bool latency_urgent_allowed(s32 cpu)
+/** Holds enough credit to preserve the configured share across a Normal slice. */
+static __always_inline u64 latency_credit_cap_ns(u32 budget)
 {
-	struct adaptive_cpu_state *cpuc = cpu_state_for(cpu);
+	u64 competing_slice = balanced_slice_ns > throughput_slice_ns ?
+		balanced_slice_ns : throughput_slice_ns;
+	u64 cap = competing_slice * budget / 100;
 
-	return cpuc && root_vruntime_for(cpuc, SCX_ADAPTIVE_CLASS_LATENCY) <
-		cpuc->root_virtual_time_ns + latency_slice_ns;
+	return cap < latency_slice_ns ? latency_slice_ns : cap;
 }
 
-/** Prevents repeated urgent kicks from exceeding the configured disruption budget. */
-static __always_inline bool fast_preemption_time_allowed(
-	const struct adaptive_cpu_state *cpuc, u64 now)
+/** Bounds wakeup borrowing so a continuously runnable task cannot monopolize. */
+static __always_inline u64 latency_debt_cap_ns(void)
 {
+	return latency_slice_ns * FAST_LATENCY_DEBT_CAP_SLICES;
+}
+
+/** Computes signed credit minus debt without mutating remote per-CPU state. */
+static __always_inline s64 latency_balance_for(
+	const struct adaptive_cpu_state *cpuc, u64 now, u32 budget)
+{
+	u64 credit_cap = latency_credit_cap_ns(budget);
+	u64 debt_cap = latency_debt_cap_ns();
+	u64 credit;
+	u64 debt;
+	u64 elapsed;
+	u64 accrued;
+	u64 horizon;
+	if (!cpuc || !budget || budget > 100)
+		return 0;
+	credit = cpuc->latency_credit_ns;
+	debt = cpuc->latency_debt_ns;
+	if (credit > credit_cap)
+		credit = credit_cap;
+	if (debt > debt_cap)
+		debt = debt_cap;
+	if (!cpuc->latency_credit_updated_ns)
+		return latency_slice_ns < credit_cap ?
+			(s64)latency_slice_ns : (s64)credit_cap;
+	if (now <= cpuc->latency_credit_updated_ns)
+		return credit >= debt ? (s64)(credit - debt) :
+			-(s64)(debt - credit);
+
+	elapsed = now - cpuc->latency_credit_updated_ns;
+	horizon = credit_cap + debt_cap;
+	if (elapsed > horizon * 100 / budget)
+		elapsed = horizon * 100 / budget;
+	accrued = elapsed * budget / 100;
+	if (accrued < debt)
+		return -(s64)(debt - accrued);
+	accrued -= debt;
+	return accrued >= credit_cap - credit ? (s64)credit_cap :
+		(s64)(credit + accrued);
+}
+
+/** Refreshes one CPU's bounded credit and debt at a scheduling boundary. */
+static __always_inline s64 refresh_latency_budget(
+	struct adaptive_cpu_state *cpuc, u64 now, u32 budget)
+{
+	s64 balance = latency_balance_for(cpuc, now, budget);
+
+	if (cpuc) {
+		if (balance >= 0) {
+			cpuc->latency_credit_ns = balance;
+			cpuc->latency_debt_ns = 0;
+		} else {
+			cpuc->latency_credit_ns = 0;
+			cpuc->latency_debt_ns = -balance;
+		}
+		cpuc->latency_credit_updated_ns = now;
+	}
+	return balance;
+}
+
+/** Charges actual competing Latency runtime and saturates bounded wake debt. */
+static __always_inline void charge_latency_budget(
+	struct adaptive_cpu_state *cpuc, u64 now, u64 runtime_ns, u32 budget)
+{
+	struct adaptive_global_stats *stats;
+	s64 balance;
+	u64 debt_cap = latency_debt_cap_ns();
+	u64 debt;
+
+	if (!cpuc || !runtime_ns)
+		return;
+	stats = stats_value();
+	if (stats) {
+		stats->fast_path_latency_budget_charge_events++;
+		stats->fast_path_latency_budget_runtime_ns += runtime_ns;
+	}
+	balance = refresh_latency_budget(cpuc, now, budget);
+	if (balance >= 0) {
+		u64 credit = balance;
+
+		if (runtime_ns <= credit) {
+			cpuc->latency_credit_ns = credit - runtime_ns;
+			return;
+		}
+		cpuc->latency_credit_ns = 0;
+		debt = runtime_ns - credit;
+		cpuc->latency_debt_ns = debt < debt_cap ? debt : debt_cap;
+		return;
+	}
+	debt = -balance;
+	if (debt >= debt_cap || runtime_ns >= debt_cap - debt)
+		cpuc->latency_debt_ns = debt_cap;
+	else
+		cpuc->latency_debt_ns = debt + runtime_ns;
+}
+
+/** Allows a true blocked wakeup to borrow only inside the bounded debt window. */
+static __always_inline bool latency_wakeup_budget_available(
+	const struct adaptive_cpu_state *cpuc, u64 now, u32 budget)
+{
+	return latency_balance_for(cpuc, now, budget) >
+		-(s64)latency_debt_cap_ns();
+}
+
+/** Bounds cache-disrupting urgent service to one request per Normal quantum. */
+static __always_inline bool latency_preemption_time_allowed(
+	const struct adaptive_cpu_state *cpuc, u64 now,
+	const struct adaptive_policy_control *policy)
+{
+	u64 interval = latency_preemption_interval_ns;
+	u64 min_runtime = latency_slice_ns;
+
+	if (policy && policy->preemption_interval_ns)
+		interval = policy->preemption_interval_ns;
+	if (cpuc && cpuc->running_class == SCX_ADAPTIVE_CLASS_THROUGHPUT) {
+		min_runtime = throughput_preemption_min_runtime_ns;
+		if (min_runtime < latency_slice_ns)
+			min_runtime = latency_slice_ns;
+		if (min_runtime > throughput_slice_ns)
+			min_runtime = throughput_slice_ns;
+	}
 	if (!cpuc || !cpuc->running_started_ns ||
 	    now < cpuc->running_started_ns ||
-	    now - cpuc->running_started_ns < preemption_min_runtime_ns)
+	    now - cpuc->running_started_ns < min_runtime)
 		return false;
 	if (cpuc->last_preemption_ns &&
 	    (now < cpuc->last_preemption_ns ||
-	     now - cpuc->last_preemption_ns < fast_preemption_interval_ns))
+	     now - cpuc->last_preemption_ns < interval))
 		return false;
 	return true;
 }
 
-/** Claims the existing urgent lane only for a non-latency userspace victim. */
-static __always_inline bool arm_fast_preemption(s32 cpu, u64 now)
+/** Claims or upgrades the reschedule marker for a blocked Latency wakeup. */
+static __always_inline bool claim_latency_resched(
+	struct adaptive_cpu_state *cpuc)
+{
+	u64 marker;
+
+	marker = __sync_val_compare_and_swap(&cpuc->urgent_dispatch_id, 0,
+					     FAST_LATENCY_RESCHED_ID);
+	if (!marker)
+		return true;
+	return marker == FAST_BALANCED_RESCHED_ID &&
+		__sync_val_compare_and_swap(&cpuc->urgent_dispatch_id,
+			FAST_BALANCED_RESCHED_ID, FAST_LATENCY_RESCHED_ID) ==
+			FAST_BALANCED_RESCHED_ID;
+}
+
+/** Requests bounded preemption of a non-Latency userspace victim. */
+static __always_inline bool arm_latency_preemption(s32 cpu, u64 now)
 {
 	struct adaptive_cpu_state *cpuc = cpu_state_for(cpu);
+	struct adaptive_policy_control *policy = active_policy(now);
+	u32 budget = policy ? policy->latency_budget_percent :
+		latency_budget_percent;
+
+	if (!cpuc || !cpuc->online || cpuc->idle ||
+	    cpuc->running_class >= SCX_ADAPTIVE_CLASS_COUNT ||
+	    cpuc->running_class == SCX_ADAPTIVE_CLASS_LATENCY)
+		return false;
+	if (!latency_wakeup_budget_available(cpuc, now, budget)) {
+		STAT_INC(fast_path_preemption_throttles);
+		return false;
+	}
+	if (!claim_latency_resched(cpuc))
+		return false;
+	if (!latency_preemption_time_allowed(cpuc, now, policy)) {
+		STAT_INC(fast_path_preemption_deferrals);
+		return false;
+	}
+	cpuc->last_preemption_ns = now;
+	return true;
+}
+
+/** Preempts only a material EEVDF deadline inversion after a blocked wakeup. */
+static __always_inline bool arm_balanced_preemption(
+	struct task_struct *p, struct task_context *taskc, s32 cpu, u64 now)
+{
+	struct adaptive_cpu_state *cpuc = cpu_state_for(cpu);
+	u64 granularity;
+	u64 balanced_granularity;
+	u64 min_runtime;
+	u64 runtime;
 
 	if (!cpuc || !cpuc->online || cpuc->idle ||
 	    cpuc->running_class >= SCX_ADAPTIVE_CLASS_COUNT ||
 	    cpuc->running_class == SCX_ADAPTIVE_CLASS_LATENCY ||
-	    !latency_urgent_allowed(cpu))
+	    !cpuc->running_started_ns || !cpuc->running_deadline_ns ||
+	    !taskc->request_deadline_ns || now < cpuc->running_started_ns ||
+	    taskc->request_deadline_ns >= cpuc->running_deadline_ns)
 		return false;
-	if (!fast_preemption_time_allowed(cpuc, now)) {
-		STAT_INC(fast_path_preemption_throttles);
+	balanced_granularity = active_balanced_granularity(now);
+	granularity = task_virtual_service(
+		p, SCX_ADAPTIVE_CLASS_BALANCED,
+		cpuc->running_class == SCX_ADAPTIVE_CLASS_THROUGHPUT ?
+			balanced_slice_ns : balanced_granularity);
+	if (cpuc->running_deadline_ns - taskc->request_deadline_ns <= granularity)
 		return false;
-	}
+
+	min_runtime = balanced_granularity;
+	if (cpuc->running_class == SCX_ADAPTIVE_CLASS_THROUGHPUT)
+		min_runtime = min_slice_ns *
+			FAST_BALANCED_THROUGHPUT_MIN_RUNTIME_SLICES;
+	runtime = now - cpuc->running_started_ns;
 	if (__sync_val_compare_and_swap(&cpuc->urgent_dispatch_id, 0,
-					FAST_BPF_URGENT_DISPATCH_ID) != 0)
+					FAST_BALANCED_RESCHED_ID) != 0)
 		return false;
-	cpuc->last_preemption_ns = now;
-	return true;
+	return runtime >= min_runtime;
 }
 
 /** Starts one runnable incarnation after its scheduling path is known. */
@@ -624,45 +1108,74 @@ static __always_inline bool fast_enqueue(struct task_struct *p,
 					 u64 enq_flags, u64 now,
 					 s32 owner_cpu, bool from_select)
 {
-	struct fast_class_state *classc = class_state_for(class_id);
 	struct adaptive_cpu_state *ownerc;
 	struct task_event event = {};
 	s32 selected_idle_cpu = taskc->selected_idle_cpu;
 	u64 request;
 	u64 sleep_credit;
 	u64 virtual_request;
+	bool credit_eligible;
 	bool class_changed;
+	bool clock_changed;
+	bool had_clock;
 	bool direct;
-	bool latency_overflow;
 	bool preempt;
+	bool shared_balanced;
+	bool shared_latency;
+	bool selected_migration;
+	u32 shared_domain = SCX_ADAPTIVE_INVALID_CPU;
+	u32 shared_latency_shard = SCX_ADAPTIVE_INVALID_CPU;
 	bool woke_from_sleep;
+	u32 selected_locality = FAST_CPU_LOCALITY_UNKNOWN;
 
 	ownerc = cpu_state_for(owner_cpu);
-	if (!classc || !ownerc || !ownerc->online ||
+	if (!ownerc || !ownerc->online ||
 	    !bpf_cpumask_test_cpu(owner_cpu, p->cpus_ptr))
 		return false;
-	sync_specialized_task(taskc, class_id);
+	selected_migration = taskc->selected_control_valid &&
+		owner_cpu != taskc->previous_cpu;
+	if (selected_migration &&
+	    (class_id == SCX_ADAPTIVE_CLASS_LATENCY ||
+	     class_id == SCX_ADAPTIVE_CLASS_THROUGHPUT))
+		selected_locality = cpu_locality(
+			taskc->previous_cpu, owner_cpu, now);
 	woke_from_sleep = taskc->last_stop_blocked;
 	begin_enqueue(taskc, now);
 	taskc->selected_idle_cpu = -1;
 	class_changed = !taskc->fast_path || taskc->policy_class != class_id;
+	credit_eligible = class_changed || woke_from_sleep;
+	had_clock = taskc->vruntime_cpu >= 0;
+	clock_changed = taskc->vruntime_cpu != owner_cpu;
 	if (class_changed) {
-		rebase_fast_vruntime(
-			p, taskc, class_id,
-			task_virtual_service(p, class_slice(class_id)));
 		taskc->request_ns = 0;
 		taskc->request_deadline_ns = 0;
 		taskc->throughput_epoch_ns =
 			class_id == SCX_ADAPTIVE_CLASS_THROUGHPUT ?
-			throughput_slice_ns : 0;
+				throughput_slice_ns : 0;
 	}
 	request = task_request_size(taskc, class_id);
-	virtual_request = task_virtual_service(p, request);
+	virtual_request = task_virtual_service(p, class_id, request);
+	if (clock_changed) {
+		if (had_clock && credit_eligible)
+			taskc->vruntime_ns = ownerc->virtual_time_ns < virtual_request ?
+				0 : ownerc->virtual_time_ns - virtual_request;
+		else
+			taskc->vruntime_ns = ownerc->virtual_time_ns;
+		taskc->vruntime_cpu = owner_cpu;
+		if (taskc->request_ns)
+			taskc->request_deadline_ns = taskc->vruntime_ns +
+				task_virtual_service(
+					p, class_id, taskc->request_ns);
+	}
 	if (!taskc->request_ns) {
-		sleep_credit = classc->virtual_time_ns < virtual_request ?
-			classc->virtual_time_ns : virtual_request;
-		if (taskc->vruntime_ns < classc->virtual_time_ns - sleep_credit)
-			taskc->vruntime_ns = classc->virtual_time_ns - sleep_credit;
+		if (credit_eligible && !clock_changed) {
+			sleep_credit = ownerc->virtual_time_ns < virtual_request ?
+				ownerc->virtual_time_ns : virtual_request;
+			if (taskc->vruntime_ns <
+			    ownerc->virtual_time_ns - sleep_credit)
+				taskc->vruntime_ns =
+					ownerc->virtual_time_ns - sleep_credit;
+		}
 		taskc->request_ns = request;
 		taskc->request_deadline_ns = taskc->vruntime_ns + virtual_request;
 	}
@@ -691,35 +1204,94 @@ static __always_inline bool fast_enqueue(struct task_struct *p,
 
 	direct = selected_idle_cpu == owner_cpu &&
 		 !cpu_has_local_work(owner_cpu, ownerc);
-	latency_overflow = class_id == SCX_ADAPTIVE_CLASS_LATENCY &&
-		(scx_bpf_dsq_nr_queued(FAST_LATENCY_OVERFLOW_DSQ) > 0 ||
-		 scx_bpf_dsq_nr_queued(class_dsq(
-			SCX_ADAPTIVE_CLASS_LATENCY, owner_cpu)) > 0);
+	if (class_id == SCX_ADAPTIVE_CLASS_LATENCY && !direct &&
+	    woke_from_sleep && p->nr_cpus_allowed == num_possible_cpus &&
+	    !is_migration_disabled(p) && p->static_prio == FAST_DEFAULT_STATIC_PRIO) {
+		shared_domain = immutable_domain_for_cpu(owner_cpu);
+		shared_latency_shard = immutable_core_leader_for_cpu(owner_cpu);
+	} else if (class_id == SCX_ADAPTIVE_CLASS_BALANCED && !direct &&
+	    !woke_from_sleep && p->nr_cpus_allowed == num_possible_cpus &&
+	    !is_migration_disabled(p) && p->static_prio == FAST_DEFAULT_STATIC_PRIO)
+		shared_domain = immutable_domain_for_cpu(owner_cpu);
+	shared_latency = class_id == SCX_ADAPTIVE_CLASS_LATENCY &&
+		shared_domain < num_domains &&
+		shared_latency_shard < num_possible_cpus &&
+		immutable_domain_for_cpu(shared_latency_shard) == shared_domain;
+	shared_balanced = class_id == SCX_ADAPTIVE_CLASS_BALANCED &&
+		shared_domain < num_domains;
+	preempt = false;
+	if (shared_latency) {
+		struct core_latency_state *shardc =
+			core_latency_state_for(shared_latency_shard);
+
+		if (shardc && scx_bpf_dsq_nr_queued(
+				shared_latency_dsq(shared_latency_shard)) <= 0)
+			shardc->singleton_release_ns = now +
+				active_latency_locality_lease(now);
+	}
 	if (direct) {
-		taskc->class_queue_accounted = 0;
-		charge_root_entity(ownerc, class_id, class_slice(class_id));
+		taskc->class_queue_accounted = FAST_QUEUE_SCOPE_NONE;
 		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | owner_cpu,
 				   taskc->request_ns, enq_flags);
 	} else {
-		taskc->class_queue_accounted = 1;
+		taskc->class_queue_accounted = shared_latency ?
+			FAST_QUEUE_SCOPE_SHARED_LATENCY :
+			(shared_balanced ? FAST_QUEUE_SCOPE_SHARED_BALANCED :
+			 FAST_QUEUE_SCOPE_PRIVATE);
 		__sync_fetch_and_add(&class_queued_tasks, 1);
-		scx_bpf_dsq_insert_vtime(p,
-				  latency_overflow ? FAST_LATENCY_OVERFLOW_DSQ :
-					  class_dsq(class_id, owner_cpu),
-				  taskc->request_ns,
-				  taskc->request_deadline_ns, enq_flags);
+		if (class_id == SCX_ADAPTIVE_CLASS_LATENCY) {
+			__sync_fetch_and_add(&latency_queued_tasks, 1);
+			if (shared_latency) {
+				__sync_fetch_and_add(&shared_latency_queued_tasks, 1);
+				STAT_INC(fast_path_shared_latency_enqueues);
+			} else {
+				__sync_fetch_and_add(&private_latency_queued_tasks, 1);
+				__sync_fetch_and_add(
+					&ownerc->queued_tasks_by_class[0], 1);
+			}
+		} else if (shared_balanced) {
+			__sync_fetch_and_add(&shared_balanced_queued_tasks, 1);
+			STAT_INC(fast_path_shared_balanced_enqueues);
+		} else if (class_id == SCX_ADAPTIVE_CLASS_BALANCED) {
+			__sync_fetch_and_add(&normal_queued_tasks, 1);
+			__sync_fetch_and_add(
+				&ownerc->queued_tasks_by_class[1], 1);
+		} else if (class_id == SCX_ADAPTIVE_CLASS_THROUGHPUT) {
+			__sync_fetch_and_add(&normal_queued_tasks, 1);
+			__sync_fetch_and_add(
+				&ownerc->queued_tasks_by_class[2], 1);
+		}
+		if (shared_latency)
+			scx_bpf_dsq_insert(
+				p, shared_latency_dsq(shared_latency_shard),
+				taskc->request_ns, enq_flags);
+		else if (shared_balanced)
+			scx_bpf_dsq_insert(
+				p, balanced_overflow_dsq(shared_domain),
+				taskc->request_ns, enq_flags);
+		else
+			scx_bpf_dsq_insert_vtime(
+				p, class_id == SCX_ADAPTIVE_CLASS_LATENCY ?
+					latency_dsq(owner_cpu) : task_dsq(owner_cpu),
+				taskc->request_ns, taskc->request_deadline_ns,
+				enq_flags);
+		if (woke_from_sleep && class_id == SCX_ADAPTIVE_CLASS_LATENCY)
+			preempt = arm_latency_preemption(owner_cpu, now);
+		else if (woke_from_sleep && class_id == SCX_ADAPTIVE_CLASS_BALANCED)
+			preempt = arm_balanced_preemption(
+				p, taskc, owner_cpu, now);
 	}
-	record_fast_enqueue(class_id, direct,
-			    !taskc->observe_fast_events);
-	preempt = !direct &&
-		  woke_from_sleep &&
-		  class_id == SCX_ADAPTIVE_CLASS_LATENCY &&
-		  arm_fast_preemption(owner_cpu, now);
+	record_fast_enqueue(class_id, direct, !taskc->observe_fast_events,
+			 selected_migration, selected_locality);
+	/* A custom DSQ does not inherit select_cpu's idle wakeup guarantee. */
+	if (!direct && !preempt && ownerc->idle &&
+	    (selected_idle_cpu == owner_cpu || !from_select))
+		scx_bpf_kick_cpu(owner_cpu, SCX_KICK_IDLE);
 	if (!from_select) {
-		if (preempt)
+		if (preempt) {
+			record_immediate_preemption_kick(class_id);
 			scx_bpf_kick_cpu(owner_cpu, SCX_KICK_PREEMPT);
-		else if (selected_idle_cpu == owner_cpu)
-			scx_bpf_kick_cpu(owner_cpu, SCX_KICK_IDLE);
+		}
 	}
 	return true;
 }
@@ -751,7 +1323,6 @@ static __always_inline void fallback_fast_enqueue(
 	struct task_event event = {};
 	bool woke_from_sleep = taskc->last_stop_blocked;
 
-	sync_specialized_task(taskc, class_id);
 	begin_enqueue(taskc, now);
 	taskc->selected_idle_cpu = -1;
 	taskc->target_cpu = -1;
@@ -761,7 +1332,7 @@ static __always_inline void fallback_fast_enqueue(
 	taskc->request_deadline_ns = 0;
 	taskc->throughput_epoch_ns =
 		class_id == SCX_ADAPTIVE_CLASS_THROUGHPUT ?
-		throughput_slice_ns : 0;
+			throughput_slice_ns : 0;
 	taskc->class_queue_accounted = 0;
 	taskc->observe_fast_events =
 		!!(control_flags & SCX_ADAPTIVE_CONTROL_OBSERVE) &&
@@ -783,134 +1354,289 @@ static __always_inline void fallback_fast_enqueue(
 	fallback_dispatch(p, taskc, enq_flags);
 }
 
-/** Selects a class by per-CPU root EEVDF from one CPU's task queues. */
-static __always_inline s32 select_fast_class(
-	struct adaptive_cpu_state *cpuc, s32 queue_cpu, u32 excluded,
-	bool include_latency_overflow)
+/** Moves the earliest unified task from one CPU into the caller's local DSQ. */
+static __always_inline bool dispatch_fast_task(s32 src_cpu)
 {
-	u64 best_deadline = ~0ULL;
-	u64 next_deadline = ~0ULL;
-	u64 next_vruntime = ~0ULL;
-	s32 best = -1;
-	s32 next = -1;
-	u32 class_id;
-
-	if (!cpuc || queue_cpu < 0 || queue_cpu >= num_possible_cpus)
-		return -1;
-
-	#pragma unroll
-	for (class_id = 0; class_id < SCX_ADAPTIVE_CLASS_COUNT; class_id++) {
-		u64 effective;
-		u64 deadline;
-		u64 request;
-		s64 queued;
-
-		if (excluded & (1U << class_id))
-			continue;
-		queued = scx_bpf_dsq_nr_queued(class_dsq(class_id, queue_cpu));
-		if (include_latency_overflow &&
-		    class_id == SCX_ADAPTIVE_CLASS_LATENCY)
-			queued += scx_bpf_dsq_nr_queued(
-				FAST_LATENCY_OVERFLOW_DSQ);
-		if (queued <= 0)
-			continue;
-		request = class_id == SCX_ADAPTIVE_CLASS_LATENCY && queued > 1 ?
-			latency_backlog_request_ns : class_slice(class_id);
-		effective = activate_root_entity(cpuc, class_id, request);
-		deadline = effective + request;
-		if (effective < next_vruntime ||
-		    (effective == next_vruntime && deadline < next_deadline)) {
-			next_vruntime = effective;
-			next_deadline = deadline;
-			next = class_id;
-		}
-		if (effective <= cpuc->root_virtual_time_ns &&
-		    (deadline < best_deadline ||
-		     (deadline == best_deadline &&
-		      (best < 0 || class_id < best)))) {
-			best_deadline = deadline;
-			best = class_id;
-		}
-	}
-	if (best >= 0 || next < 0)
-		return best;
-	cpuc->root_virtual_time_ns = next_vruntime;
-	return next;
-}
-
-/** Prefers a shared latency task's target CPU until one latency slice elapses. */
-static __always_inline bool dispatch_latency_overflow(s32 dst_cpu,
-						       bool *remote)
-{
-	struct task_struct *p;
-	u32 claim = dst_cpu + 1;
-	u32 scanned = 0;
-	u64 now = bpf_ktime_get_ns();
-	bool moved = false;
-
-	*remote = false;
-
-	if (__sync_val_compare_and_swap(&latency_overflow_claim, 0, claim) != 0)
+	if (src_cpu < 0 || src_cpu >= num_possible_cpus)
 		return false;
-	bpf_for_each(scx_dsq, p, FAST_LATENCY_OVERFLOW_DSQ, 0) {
-		struct task_context *taskc;
-		u64 wait_ns;
-
-		if (scanned++ >= FAST_LATENCY_SCAN_LIMIT)
-			break;
-		if (!bpf_cpumask_test_cpu(dst_cpu, p->cpus_ptr))
-			continue;
-		taskc = task_ctx_for(p);
-		if (!taskc)
-			continue;
-		wait_ns = now >= taskc->enqueue_ns ? now - taskc->enqueue_ns : 0;
-		if (taskc->target_cpu != dst_cpu && wait_ns < latency_slice_ns)
-			continue;
-		if (!scx_bpf_dsq_move(BPF_FOR_EACH_ITER, p, SCX_DSQ_LOCAL, 0))
-			continue;
-		*remote = taskc->target_cpu != dst_cpu;
-		moved = true;
-		break;
-	}
-	__sync_val_compare_and_swap(&latency_overflow_claim, claim, 0);
-	return moved;
+	return scx_bpf_dsq_move_to_local(task_dsq(src_cpu));
 }
 
-/** Moves one task from a class queue into the caller's local DSQ. */
-static __always_inline bool dispatch_fast_class(
-	s32 dst_cpu, s32 src_cpu, u32 class_id, bool remote)
+/** Moves the earliest latency request into the caller's local DSQ. */
+static __always_inline bool dispatch_latency_task(s32 cpu)
+{
+	if (cpu < 0 || cpu >= num_possible_cpus)
+		return false;
+	return scx_bpf_dsq_move_to_local(latency_dsq(cpu));
+}
+
+/** Returns the caller's physical-core Latency shard depth. */
+static __always_inline s64 shared_latency_depth(s32 cpu)
+{
+	u32 leader = immutable_core_leader_for_cpu(cpu);
+
+	if (leader >= num_possible_cpus)
+		return 0;
+	return scx_bpf_dsq_nr_queued(shared_latency_dsq(leader));
+}
+
+/** Returns one domain's current movable Balanced queue depth. */
+static __always_inline s64 shared_balanced_depth(s32 cpu)
+{
+	u32 domain_id = immutable_domain_for_cpu(cpu);
+
+	if (domain_id >= num_domains)
+		return 0;
+	return scx_bpf_dsq_nr_queued(balanced_overflow_dsq(domain_id));
+}
+
+/** Consumes one wide-affinity Balanced overflow task from the local domain. */
+static __always_inline bool dispatch_shared_balanced(s32 cpu)
+{
+	u32 domain_id;
+
+	domain_id = immutable_domain_for_cpu(cpu);
+	if (domain_id >= num_domains)
+		return false;
+	if (shared_balanced_depth(cpu) <= 0)
+		return false;
+	STAT_INC(fast_path_shared_balanced_dispatch_attempts);
+	if (scx_bpf_dsq_move_to_local(balanced_overflow_dsq(domain_id))) {
+		STAT_INC(fast_path_shared_balanced_dispatches);
+		return true;
+	}
+	STAT_INC(fast_path_shared_balanced_dispatch_failures);
+	return false;
+}
+
+/** Leaves a singleton on its core when either representative SMT is idle. */
+static __always_inline bool defer_shared_latency_to_idle_core(u32 leader)
+{
+	struct adaptive_cpu_state *cpuc;
+	u32 peer = immutable_core_peer_for_leader(leader);
+
+	cpuc = cpu_state_for(leader);
+	if (cpuc && cpuc->online && cpuc->idle) {
+		STAT_INC(fast_path_latency_idle_source_deferrals);
+		scx_bpf_kick_cpu(leader, SCX_KICK_IDLE);
+		return true;
+	}
+	if (peer == leader || peer >= num_possible_cpus)
+		return false;
+	cpuc = cpu_state_for(peer);
+	if (!cpuc || !cpuc->online || !cpuc->idle)
+		return false;
+	STAT_INC(fast_path_latency_idle_source_deferrals);
+	scx_bpf_kick_cpu(peer, SCX_KICK_IDLE);
+	return true;
+}
+
+/** Serializes one physical-core Latency shard move and rechecks its depth. */
+static __always_inline bool dispatch_shared_latency_shard(
+	u32 leader, s32 dst_cpu, bool preserve_successor, u64 now)
+{
+	struct core_latency_state *shardc = core_latency_state_for(leader);
+	u32 claim = dst_cpu + 1;
+	u64 previous_release;
+	s64 queued;
+	bool moved;
+
+	if (!shardc || leader >= num_possible_cpus || dst_cpu < 0 ||
+	    dst_cpu >= num_possible_cpus)
+		return false;
+	if (scx_bpf_dsq_nr_queued(shared_latency_dsq(leader)) <= 0)
+		return false;
+	if (__sync_val_compare_and_swap(&shardc->dispatch_claim, 0, claim) != 0) {
+		STAT_INC(fast_path_steal_claim_conflicts);
+		return false;
+	}
+	queued = scx_bpf_dsq_nr_queued(shared_latency_dsq(leader));
+	if (queued <= 0 || (preserve_successor && queued <= 1)) {
+		__sync_val_compare_and_swap(&shardc->dispatch_claim, claim, 0);
+		return false;
+	}
+	previous_release = shardc->singleton_release_ns;
+	STAT_INC(fast_path_shared_latency_dispatch_attempts);
+	moved = scx_bpf_dsq_move_to_local(shared_latency_dsq(leader));
+	queued = scx_bpf_dsq_nr_queued(shared_latency_dsq(leader));
+	if (queued <= 0)
+		__sync_val_compare_and_swap(
+			&shardc->singleton_release_ns, previous_release, 0);
+	else if (moved && preserve_successor && queued <= 1)
+		shardc->singleton_release_ns = now +
+			active_latency_locality_lease(now);
+	__sync_val_compare_and_swap(&shardc->dispatch_claim, claim, 0);
+	if (moved) {
+		STAT_INC(fast_path_shared_latency_dispatches);
+		return true;
+	}
+	STAT_INC(fast_path_shared_latency_dispatch_failures);
+	return false;
+}
+
+/** Consumes one blocked Latency wakeup assigned to the caller's core. */
+static __always_inline bool dispatch_shared_latency(s32 cpu, u64 now)
+{
+	return dispatch_shared_latency_shard(
+		immutable_core_leader_for_cpu(cpu), cpu, false, now);
+}
+
+/**
+ * Lets credit-backed capacity rescue another core's backlog immediately and
+ * its singleton after a bounded locality lease. Repeated bounded windows cover
+ * large CPU sets without a full topology scan on every dispatch callback.
+ */
+static __always_inline bool spill_shared_latency_backlog(s32 dst_cpu, u64 now)
 {
 	struct adaptive_cpu_state *dst = cpu_state_for(dst_cpu);
-	bool latency_backlog;
-	bool overflow_remote;
-	u64 request;
-	u64 vruntime;
+	u32 dst_domain = immutable_domain_for_cpu(dst_cpu);
+	u32 dst_leader = immutable_core_leader_for_cpu(dst_cpu);
+	u32 cursor;
+	u32 scan;
 
-	if (!dst || src_cpu < 0 || src_cpu >= num_possible_cpus ||
-	    class_id >= SCX_ADAPTIVE_CLASS_COUNT)
+	if (!dst || num_core_leaders <= 1 || dst_domain >= num_domains ||
+	    dst_leader >= num_possible_cpus ||
+	    !__sync_fetch_and_add(&shared_latency_queued_tasks, 0))
 		return false;
-	latency_backlog = class_id == SCX_ADAPTIVE_CLASS_LATENCY &&
-		(scx_bpf_dsq_nr_queued(class_dsq(class_id, src_cpu)) +
-		 (!remote ?
-		  scx_bpf_dsq_nr_queued(FAST_LATENCY_OVERFLOW_DSQ) : 0)) > 1;
-	request = latency_backlog ? latency_backlog_request_ns :
-		class_slice(class_id);
-	vruntime = charge_root_entity(dst, class_id, request);
-	if (scx_bpf_dsq_move_to_local(class_dsq(class_id, src_cpu))) {
-		record_fast_dispatch(class_id, remote);
-		if (latency_backlog)
-			STAT_INC(fast_path_latency_backlog_boosts);
-		return true;
+	STAT_INC(fast_path_latency_steal_attempts);
+	cursor = dst->steal_cursor++;
+
+	bpf_for(scan, 0, FAST_STEAL_SCAN_LIMIT) {
+		struct core_latency_state *shardc;
+		u32 leader;
+		s32 src_cpu;
+		s64 queued;
+		bool preserve_successor;
+
+		if (scan >= num_core_leaders)
+			break;
+		leader = immutable_core_leader_at(
+			(cursor + scan) % num_core_leaders);
+		src_cpu = leader;
+		if (leader == dst_leader ||
+		    immutable_domain_for_cpu(src_cpu) != dst_domain)
+			continue;
+		queued = scx_bpf_dsq_nr_queued(shared_latency_dsq(leader));
+		if (queued <= 0)
+			continue;
+		preserve_successor = queued > 1;
+		if (!preserve_successor) {
+			if (defer_shared_latency_to_idle_core(leader))
+				continue;
+			shardc = core_latency_state_for(leader);
+			if (!shardc || (shardc->singleton_release_ns &&
+			    now < shardc->singleton_release_ns))
+				continue;
+		}
+		if (dispatch_shared_latency_shard(
+			leader, dst_cpu, preserve_successor, now)) {
+			STAT_INC(fast_path_latency_remote_steals);
+			if (preserve_successor)
+				STAT_INC(fast_path_latency_remote_steals_preserving_successor);
+			else
+				STAT_INC(fast_path_latency_remote_steals_fallback);
+			return true;
+		}
 	}
-	if (class_id == SCX_ADAPTIVE_CLASS_LATENCY && !remote &&
-	    dispatch_latency_overflow(dst_cpu, &overflow_remote)) {
-		record_fast_dispatch(class_id, overflow_remote);
-		if (latency_backlog)
-			STAT_INC(fast_path_latency_backlog_boosts);
-		return true;
+	return false;
+}
+
+/** Final idle-only rescue scans every core shard, including other domains. */
+static __always_inline bool rescue_shared_latency_when_idle(s32 dst_cpu, u64 now)
+{
+	u32 dst_leader = immutable_core_leader_for_cpu(dst_cpu);
+	u32 scan;
+
+	if (num_core_leaders <= 1 || dst_leader >= num_possible_cpus ||
+	    !__sync_fetch_and_add(&shared_latency_queued_tasks, 0))
+		return false;
+	STAT_INC(fast_path_latency_steal_attempts);
+	bpf_for(scan, 0, SCX_ADAPTIVE_MAX_CPUS) {
+		u32 leader;
+		s64 queued;
+
+		if (scan >= num_core_leaders)
+			break;
+		leader = immutable_core_leader_at(scan);
+		if (leader == dst_leader)
+			continue;
+		queued = scx_bpf_dsq_nr_queued(shared_latency_dsq(leader));
+		if (queued <= 0)
+			continue;
+		if (queued == 1 && defer_shared_latency_to_idle_core(leader))
+			continue;
+		if (dispatch_shared_latency_shard(
+			leader, dst_cpu, false, now)) {
+			STAT_INC(fast_path_latency_remote_steals);
+			STAT_INC(fast_path_latency_remote_steals_fallback);
+			return true;
+		}
 	}
-	set_root_vruntime(dst, class_id, vruntime);
-	STAT_INC(fast_path_dispatch_failures);
+	return false;
+}
+
+/** Preserves private affinity work before consuming the movable request lane. */
+static __always_inline bool dispatch_latency_work(
+	s32 cpu, s64 private_queued, u64 now)
+{
+	if (private_queued > 0 && dispatch_latency_task(cpu))
+		return true;
+	return dispatch_shared_latency(cpu, now);
+}
+
+/** Rescues Latency backlog while optionally preserving one local successor. */
+static __always_inline bool steal_latency_task(s32 dst_cpu,
+	bool preserve_successor)
+{
+	struct adaptive_cpu_state *dst = cpu_state_for(dst_cpu);
+	u64 private_latency;
+	u32 cursor;
+	u32 scan;
+
+	private_latency = __sync_fetch_and_add(&private_latency_queued_tasks, 0);
+	if (!dst || num_possible_cpus <= 1 || !private_latency)
+		return false;
+	STAT_INC(fast_path_latency_steal_attempts);
+	cursor = dst->steal_cursor++;
+
+	bpf_for(scan, 0, FAST_STEAL_SCAN_LIMIT) {
+		struct adaptive_cpu_state *src;
+		s32 src_cpu;
+
+		if (scan >= num_possible_cpus - 1)
+			break;
+		src_cpu = (dst_cpu + 1 +
+			   (cursor + scan) % (num_possible_cpus - 1)) %
+			  num_possible_cpus;
+		s64 queued = scx_bpf_dsq_nr_queued(latency_dsq(src_cpu));
+
+		if (queued <= 0 || (preserve_successor && queued <= 1))
+			continue;
+		src = cpu_state_for(src_cpu);
+		if (!src)
+			continue;
+		if (!preserve_successor && queued == 1 && src->online && src->idle) {
+			STAT_INC(fast_path_latency_idle_source_deferrals);
+			scx_bpf_kick_cpu(src_cpu, SCX_KICK_IDLE);
+			continue;
+		}
+		if (__sync_val_compare_and_swap(&src->steal_claim, 0,
+						  dst_cpu + 1) != 0) {
+			STAT_INC(fast_path_steal_claim_conflicts);
+			continue;
+		}
+		if (dispatch_latency_task(src_cpu)) {
+			__sync_val_compare_and_swap(
+				&src->steal_claim, dst_cpu + 1, 0);
+			STAT_INC(fast_path_latency_remote_steals);
+			if (preserve_successor)
+				STAT_INC(fast_path_latency_remote_steals_preserving_successor);
+			else
+				STAT_INC(fast_path_latency_remote_steals_fallback);
+			return true;
+		}
+		__sync_val_compare_and_swap(&src->steal_claim, dst_cpu + 1, 0);
+	}
 	return false;
 }
 
@@ -922,48 +1648,66 @@ static __always_inline u64 fast_queued_on_cpu(s32 cpu)
 
 	if (cpu < 0 || cpu >= num_possible_cpus)
 		return 0;
-	count = scx_bpf_dsq_nr_queued(
-		class_dsq(SCX_ADAPTIVE_CLASS_LATENCY, cpu));
+	count = scx_bpf_dsq_nr_queued(task_dsq(cpu));
 	if (count > 0)
 		queued += count;
-	count = scx_bpf_dsq_nr_queued(
-		class_dsq(SCX_ADAPTIVE_CLASS_BALANCED, cpu));
-	if (count > 0)
-		queued += count;
-	count = scx_bpf_dsq_nr_queued(
-		class_dsq(SCX_ADAPTIVE_CLASS_THROUGHPUT, cpu));
+	count = scx_bpf_dsq_nr_queued(latency_dsq(cpu));
 	if (count > 0)
 		queued += count;
 	return queued;
 }
 
-/** Preserves a small local successor set while still draining real backlog. */
-static __always_inline bool source_can_spare(s32 cpu)
+/**
+ * Lets an idle destination drain a source while preserving the short Normal
+ * successor set behind a running Latency request until no stronger donor
+ * exists. This keeps a long CPU task cache-local when another source already
+ * has real backlog, without allowing the destination to remain idle.
+ */
+static __always_inline bool source_can_spare(s32 cpu, u64 now,
+					       u64 successor_lease_ns)
 {
 	struct adaptive_cpu_state *cpuc = cpu_state_for(cpu);
-	u64 queued;
-
-	if (!specialized_tasks) {
-		s64 balanced = scx_bpf_dsq_nr_queued(
-			class_dsq(SCX_ADAPTIVE_CLASS_BALANCED, cpu));
-
-		queued = balanced > 0 ? balanced : 0;
-	} else {
-		queued = fast_queued_on_cpu(cpu);
-	}
+	s64 count = scx_bpf_dsq_nr_queued(task_dsq(cpu));
+	u64 queued = count > 0 ? count : 0;
 
 	if (!cpuc || !queued)
 		return false;
 	if (!cpuc->online)
 		return true;
-	if (queued > 2)
+	/* An idle source cannot be running the sole queued task; taking it is
+	 * work-conserving and avoids leaving a destination idle behind stale
+	 * per-CPU queue state. */
+	if (cpuc->idle) {
+		if (queued == 1 &&
+		    cpuc->queued_tasks_by_class[SCX_ADAPTIVE_CLASS_THROUGHPUT] == 1 &&
+		    cpuc->queued_tasks_by_class[SCX_ADAPTIVE_CLASS_BALANCED] == 0) {
+			STAT_INC(fast_path_steal_idle_throughput_deferrals);
+			/* The owner is already idle; make its local dispatch runnable. */
+			scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
+			return false;
+		}
+		STAT_INC(fast_path_steal_idle_source_admissions);
 		return true;
-	return !cpuc->idle &&
-		cpuc->running_class != SCX_ADAPTIVE_CLASS_LATENCY;
+	}
+	/* Preserve one cache-hot successor for the measured Latency stopping time. */
+	if (queued == 1 && !cpuc->idle &&
+	    cpuc->running_class == SCX_ADAPTIVE_CLASS_LATENCY &&
+	    (!cpuc->running_started_ns || now < cpuc->running_started_ns ||
+	     now - cpuc->running_started_ns < successor_lease_ns)) {
+		STAT_INC(fast_path_steal_latency_successor_deferrals);
+		return false;
+	}
+	if (queued > 1)
+		return true;
+	if (!cpuc->idle &&
+	    cpuc->running_class == SCX_ADAPTIVE_CLASS_LATENCY)
+		STAT_INC(fast_path_steal_latency_source_admissions);
+	return !cpuc->idle;
 }
 
 /** Scans once from a rotating origin and serializes movers per source CPU. */
-static __always_inline bool steal_fast_task(s32 dst_cpu)
+static __always_inline bool steal_fast_task(s32 dst_cpu, u64 now,
+					      u64 successor_lease_ns)
 {
 	struct adaptive_cpu_state *dst = cpu_state_for(dst_cpu);
 	u32 cursor;
@@ -972,25 +1716,22 @@ static __always_inline bool steal_fast_task(s32 dst_cpu)
 	if (!dst || num_possible_cpus <= 1)
 		return false;
 
-	if (__sync_fetch_and_add(&class_queued_tasks, 0) == 0) {
+	if (__sync_fetch_and_add(&normal_queued_tasks, 0) == 0) {
 		STAT_INC(fast_path_empty_steal_skips);
 		return false;
 	}
 	STAT_INC(fast_path_steal_attempts);
 	cursor = dst->steal_cursor++;
-
 	bpf_for(scan, 0, FAST_STEAL_SCAN_LIMIT) {
 		struct adaptive_cpu_state *src;
-		u32 excluded = 0;
 		s32 src_cpu;
-		bool dispatched = false;
 
 		if (scan >= num_possible_cpus - 1)
 			break;
 		src_cpu = (dst_cpu + 1 +
 			   (cursor + scan) % (num_possible_cpus - 1)) %
 			  num_possible_cpus;
-		if (!source_can_spare(src_cpu))
+		if (!source_can_spare(src_cpu, now, successor_lease_ns))
 			continue;
 		src = cpu_state_for(src_cpu);
 		if (!src)
@@ -1001,138 +1742,172 @@ static __always_inline bool steal_fast_task(s32 dst_cpu)
 			continue;
 		}
 
-		if (!specialized_tasks &&
-		    scx_bpf_dsq_move_to_local(class_dsq(
-			    SCX_ADAPTIVE_CLASS_BALANCED, src_cpu))) {
-			record_fast_dispatch(SCX_ADAPTIVE_CLASS_BALANCED, true);
-			dispatched = true;
-		}
-
-		bpf_repeat(SCX_ADAPTIVE_CLASS_COUNT) {
-			s32 class_id;
-
-			if (dispatched)
-				break;
-			class_id = select_fast_class(
-				dst, src_cpu, excluded, false);
-			if (class_id < 0)
-				break;
-			if (dispatch_fast_class(
-				dst_cpu, src_cpu, class_id, true)) {
-				dispatched = true;
-				break;
-			}
-			excluded |= 1U << class_id;
+		if (dispatch_fast_task(src_cpu)) {
+			__sync_val_compare_and_swap(
+				&src->steal_claim, dst_cpu + 1, 0);
+			return true;
 		}
 		__sync_val_compare_and_swap(&src->steal_claim, dst_cpu + 1, 0);
-		if (dispatched)
-			return true;
 	}
+	STAT_INC(fast_path_steal_scan_exhaustions);
 	return false;
 }
 
-/** Moves Balanced work directly while no task needs class arbitration. */
-static __always_inline bool dispatch_balanced_only(s32 cpu)
-{
-	if (specialized_tasks ||
-	    !scx_bpf_dsq_move_to_local(
-		class_dsq(SCX_ADAPTIVE_CLASS_BALANCED, cpu)))
-		return false;
-	record_fast_dispatch(SCX_ADAPTIVE_CLASS_BALANCED, false);
-	return true;
-}
-
-/** Returns a preemptible running class on one allowed CPU, or the sentinel. */
-static __always_inline u32 preemptible_class(
-	struct task_struct *p, s32 cpu, u64 now)
+/** Performs the constant-time safety check for one userspace-selected CPU. */
+static __noinline u32 policy_latency_victim_class(
+	struct task_struct *p, s32 cpu, u64 now,
+	const struct adaptive_policy_control *policy)
 {
 	struct adaptive_cpu_state *cpuc = cpu_state_for(cpu);
+	u32 budget = policy ? policy->latency_budget_percent :
+		latency_budget_percent;
 
 	if (!cpuc || !cpuc->online || cpuc->idle || cpuc->urgent_dispatch_id ||
 	    !bpf_cpumask_test_cpu(cpu, p->cpus_ptr) ||
 	    cpuc->running_class >= SCX_ADAPTIVE_CLASS_COUNT ||
 	    cpuc->running_class == SCX_ADAPTIVE_CLASS_LATENCY ||
-	    !fast_preemption_time_allowed(cpuc, now))
+	    scx_bpf_dsq_nr_queued(latency_dsq(cpu)) > 0 ||
+	    !latency_wakeup_budget_available(cpuc, now, budget) ||
+	    !latency_preemption_time_allowed(cpuc, now, policy))
 		return FAST_NO_RUNNING_CLASS;
 	return cpuc->running_class;
 }
 
-/** Prefers the previous CPU, then any throughput CPU, then Balanced. */
-static __always_inline s32 pick_latency_victim(struct task_struct *p,
-					   s32 prev_cpu, u64 now)
+/** Checks at most two topology candidates published by the Rust policy. */
+static __always_inline s32 pick_policy_latency_victim(
+	struct task_struct *p, s32 prev_cpu, u64 now,
+	const struct adaptive_policy_control *policy)
 {
-	struct adaptive_cpu_state *prevc;
-	s32 balanced = -1;
-	s32 throughput = -1;
-	u32 class_id;
-	u32 cpu;
+	struct adaptive_cpu_state *prevc = cpu_state_for(prev_cpu);
+	struct adaptive_cpu_policy *prevc_policy;
+	u32 first_class = FAST_NO_RUNNING_CLASS;
+	u32 second_class = FAST_NO_RUNNING_CLASS;
+	u32 first;
+	u32 second;
 
-	prevc = cpu_state_for(prev_cpu);
 	if (prevc && prevc->online && !prevc->idle &&
 	    prevc->running_class == SCX_ADAPTIVE_CLASS_LATENCY &&
 	    bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr) &&
-	    scx_bpf_dsq_nr_queued(
-		class_dsq(SCX_ADAPTIVE_CLASS_LATENCY, prev_cpu)) <= 0)
+	    scx_bpf_dsq_nr_queued(latency_dsq(prev_cpu)) <= 0)
 		return prev_cpu;
-
-	class_id = preemptible_class(p, prev_cpu, now);
-	if (class_id == SCX_ADAPTIVE_CLASS_THROUGHPUT ||
-	    class_id == SCX_ADAPTIVE_CLASS_BALANCED)
+	if (policy_latency_victim_class(p, prev_cpu, now, policy) <
+	    SCX_ADAPTIVE_CLASS_COUNT)
 		return prev_cpu;
-
-	bpf_for(cpu, 0, SCX_ADAPTIVE_MAX_CPUS) {
-		if (cpu >= num_possible_cpus)
-			break;
-		if ((s32)cpu == prev_cpu)
-			continue;
-		class_id = preemptible_class(p, cpu, now);
-		if (class_id == SCX_ADAPTIVE_CLASS_THROUGHPUT) {
-			throughput = cpu;
-			break;
-		}
-		if (class_id == SCX_ADAPTIVE_CLASS_BALANCED && balanced < 0)
-			balanced = cpu;
-	}
-	return throughput >= 0 ? throughput : balanced;
-}
-
-/** Atomically claims one allowed idle CPU from a scheduler-owned mask. */
-static __always_inline s32 claim_idle_cpu(struct task_struct *p, s32 prev_cpu,
-						  const struct cpumask *idle_mask)
-{
-	u32 selected;
-
-	if (!idle_mask)
+	prevc_policy = policy_cpu_for(policy, prev_cpu);
+	if (!prevc_policy)
 		return -1;
-	if (prev_cpu >= 0 && prev_cpu < num_possible_cpus &&
-	    bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr) &&
-	    bpf_cpumask_test_cpu(prev_cpu, idle_mask) &&
-	    scx_bpf_test_and_clear_cpu_idle(prev_cpu))
-		return prev_cpu;
-
-	selected = bpf_cpumask_any_and_distribute(p->cpus_ptr, idle_mask);
-	if (selected < num_possible_cpus &&
-	    scx_bpf_test_and_clear_cpu_idle(selected))
-		return selected;
+	first = prevc_policy->latency_candidate_cpu[0];
+	second = prevc_policy->latency_candidate_cpu[1];
+	if (first < num_possible_cpus)
+		first_class = policy_latency_victim_class(p, first, now, policy);
+	if (second < num_possible_cpus)
+		second_class = policy_latency_victim_class(p, second, now, policy);
+	if (first_class == SCX_ADAPTIVE_CLASS_THROUGHPUT)
+		return first;
+	if (second_class == SCX_ADAPTIVE_CLASS_THROUGHPUT)
+		return second;
+	if (first_class == SCX_ADAPTIVE_CLASS_BALANCED)
+		return first;
+	if (second_class == SCX_ADAPTIVE_CLASS_BALANCED)
+		return second;
 	return -1;
 }
 
-/** Preserves bulk locality and gives latency work an idle core or victim. */
+/** Scores one CPU's live Normal pressure without scanning any runqueue. */
+static __always_inline u64 balanced_cpu_pressure(
+	const struct adaptive_cpu_state *cpuc)
+{
+	u64 pressure;
+
+	if (!cpuc)
+		return ~0ULL;
+	pressure = cpuc->queued_tasks_by_class[SCX_ADAPTIVE_CLASS_BALANCED] +
+		   cpuc->queued_tasks_by_class[SCX_ADAPTIVE_CLASS_THROUGHPUT];
+	if (cpuc->running_class == SCX_ADAPTIVE_CLASS_BALANCED)
+		pressure += 1;
+	else if (cpuc->running_class == SCX_ADAPTIVE_CLASS_THROUGHPUT)
+		pressure += 3;
+	else if (cpuc->running_class == SCX_ADAPTIVE_CLASS_LATENCY)
+		pressure += 4;
+	if (cpuc->urgent_dispatch_id == FAST_BALANCED_RESCHED_ID)
+		pressure += 1;
+	else if (cpuc->urgent_dispatch_id == FAST_LATENCY_RESCHED_ID)
+		pressure += 4;
+	return pressure;
+}
+
+/** Revalidates one userspace Normal candidate against current kernel state. */
+static __noinline u64 policy_balanced_candidate_pressure(
+	struct task_struct *p, s32 cpu)
+{
+	struct adaptive_cpu_state *cpuc = cpu_state_for(cpu);
+
+	if (!cpuc || !cpuc->online || cpuc->idle ||
+	    !bpf_cpumask_test_cpu(cpu, p->cpus_ptr) ||
+	    cpuc->running_class >= SCX_ADAPTIVE_CLASS_COUNT ||
+	    cpuc->running_class == SCX_ADAPTIVE_CLASS_LATENCY ||
+	    cpuc->urgent_dispatch_id == FAST_LATENCY_RESCHED_ID ||
+	    cpuc->queued_tasks_by_class[SCX_ADAPTIVE_CLASS_LATENCY] > 0)
+		return ~0ULL;
+	return balanced_cpu_pressure(cpuc);
+}
+
+/** Uses two slow-path candidates only when their live pressure is materially lower. */
+static __always_inline s32 pick_policy_balanced_target(
+	struct task_struct *p, s32 prev_cpu,
+	const struct adaptive_policy_control *policy)
+{
+	struct adaptive_cpu_state *prevc = cpu_state_for(prev_cpu);
+	struct adaptive_cpu_policy *prevc_policy;
+	u64 prev_pressure;
+	u64 first_pressure = ~0ULL;
+	u64 second_pressure = ~0ULL;
+	u64 best_pressure;
+	u32 first;
+	u32 second;
+	s32 best;
+
+	if (!prevc || !prevc->online || prevc->idle ||
+	    !bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr))
+		return -1;
+	prevc_policy = policy_cpu_for(policy, prev_cpu);
+	if (!prevc_policy)
+		return -1;
+	prev_pressure = balanced_cpu_pressure(prevc);
+	first = prevc_policy->normal_candidate_cpu[0];
+	second = prevc_policy->normal_candidate_cpu[1];
+	if (first < num_possible_cpus)
+		first_pressure = policy_balanced_candidate_pressure(p, first);
+	if (second < num_possible_cpus)
+		second_pressure = policy_balanced_candidate_pressure(p, second);
+	if (first_pressure <= second_pressure) {
+		best = first;
+		best_pressure = first_pressure;
+	} else {
+		best = second;
+		best_pressure = second_pressure;
+	}
+	if (best_pressure == ~0ULL ||
+	    best_pressure + FAST_BALANCED_PLACEMENT_HYSTERESIS > prev_pressure)
+		return -1;
+	return best;
+}
+
+/** Preserves kernel wake affinity while retaining class-specific idle handling. */
 s32 BPF_STRUCT_OPS(adaptive_select_cpu, struct task_struct *p, s32 prev_cpu,
 			   u64 wake_flags)
 {
 	struct task_context *taskc = task_ctx_for(p);
 	struct task_control_value *control;
 	struct adaptive_cpu_state *prevc;
-	const struct cpumask *idle_smtmask;
-	const struct cpumask *idle_mask;
 	u32 class_id = SCX_ADAPTIVE_CLASS_BALANCED;
 	u32 control_flags = SCX_ADAPTIVE_CONTROL_BPF_SCHED |
 			    SCX_ADAPTIVE_CONTROL_OBSERVE |
 			    SCX_ADAPTIVE_CONTROL_COARSE_OBSERVE;
+	u32 latency_select_path = SCX_ADAPTIVE_LATENCY_SELECT_FALLBACK;
 	u32 selected;
 	s32 cpu = -1;
-	u64 now = bpf_ktime_get_ns();
+	bool is_idle = false;
 
 	if (!taskc)
 		return prev_cpu;
@@ -1143,65 +1918,60 @@ s32 BPF_STRUCT_OPS(adaptive_select_cpu, struct task_struct *p, s32 prev_cpu,
 		class_id = control->class_id;
 		control_flags = control->flags;
 	}
-	taskc->selected_class_id = class_id;
 	taskc->selected_control_flags = control_flags;
 	taskc->selected_control_valid = 1;
-	if (class_id != SCX_ADAPTIVE_CLASS_LATENCY) {
-		bool is_idle = false;
-
-		prevc = cpu_state_for(prev_cpu);
-		if (class_id == SCX_ADAPTIVE_CLASS_THROUGHPUT &&
-		    prevc && prevc->online &&
-		    bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr) &&
-		    scx_bpf_test_and_clear_cpu_idle(prev_cpu)) {
-			taskc->selected_idle_cpu = prev_cpu;
-			cpu = prev_cpu;
-			goto selected;
-		}
-		cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
-		if (cpu >= 0 && cpu < num_possible_cpus &&
-		    bpf_cpumask_test_cpu(cpu, p->cpus_ptr)) {
-			if (is_idle)
-				taskc->selected_idle_cpu = cpu;
-			goto selected;
-		}
-		if (prev_cpu >= 0 && prev_cpu < num_possible_cpus &&
-		    bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr))
-			cpu = prev_cpu;
-		else {
-			selected = bpf_cpumask_any_distribute(p->cpus_ptr);
-			cpu = selected < num_possible_cpus ? selected : -1;
-		}
+	taskc->selected_class_id = class_id;
+	prevc = cpu_state_for(prev_cpu);
+	if (class_id == SCX_ADAPTIVE_CLASS_THROUGHPUT &&
+	    prevc && prevc->online &&
+	    bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr) &&
+	    scx_bpf_test_and_clear_cpu_idle(prev_cpu)) {
+		taskc->selected_idle_cpu = prev_cpu;
+		cpu = prev_cpu;
 		goto selected;
 	}
+	cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
+	if (cpu >= 0 && cpu < num_possible_cpus &&
+	    bpf_cpumask_test_cpu(cpu, p->cpus_ptr)) {
+		if (class_id == SCX_ADAPTIVE_CLASS_LATENCY)
+			latency_select_path = is_idle ?
+				SCX_ADAPTIVE_LATENCY_SELECT_DEFAULT_IDLE :
+				SCX_ADAPTIVE_LATENCY_SELECT_DEFAULT_BUSY;
+		if (!is_idle && taskc->last_stop_blocked &&
+		    (class_id == SCX_ADAPTIVE_CLASS_LATENCY ||
+		     class_id == SCX_ADAPTIVE_CLASS_BALANCED)) {
+			u64 now = bpf_ktime_get_ns();
+			struct adaptive_policy_control *policy = active_policy(now);
+			s32 target;
 
-	idle_smtmask = scx_bpf_get_idle_smtmask();
-	cpu = claim_idle_cpu(p, prev_cpu, idle_smtmask);
-	if (idle_smtmask)
-		scx_bpf_put_idle_cpumask(idle_smtmask);
-	if (cpu >= 0) {
-		taskc->selected_idle_cpu = cpu;
+			if (class_id == SCX_ADAPTIVE_CLASS_LATENCY)
+				target = pick_policy_latency_victim(
+					p, prev_cpu, now, policy);
+			else
+				target = pick_policy_balanced_target(
+					p, prev_cpu, policy);
+			if (target >= 0) {
+				cpu = target;
+				if (class_id == SCX_ADAPTIVE_CLASS_LATENCY)
+					latency_select_path =
+						SCX_ADAPTIVE_LATENCY_SELECT_POLICY_VICTIM;
+			}
+		}
+		if (is_idle)
+			taskc->selected_idle_cpu = cpu;
 		goto selected;
 	}
-
-	idle_mask = scx_bpf_get_idle_cpumask();
-	cpu = claim_idle_cpu(p, prev_cpu, idle_mask);
-	if (idle_mask)
-		scx_bpf_put_idle_cpumask(idle_mask);
-	if (cpu >= 0)
-		taskc->selected_idle_cpu = cpu;
-	if (cpu < 0)
-		cpu = pick_latency_victim(p, prev_cpu, now);
-	if (cpu < 0 && prev_cpu >= 0 &&
+	if (prev_cpu >= 0 && prev_cpu < num_possible_cpus &&
 	    bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr))
 		cpu = prev_cpu;
-	if (cpu < 0) {
+	else {
 		selected = bpf_cpumask_any_distribute(p->cpus_ptr);
-		if (selected < num_possible_cpus)
-			cpu = selected;
+		cpu = selected < num_possible_cpus ? selected : -1;
 	}
 
 selected:
+	record_select_cpu_diagnostics(class_id, latency_select_path, cpu, prev_cpu,
+				      wake_flags);
 	if (cpu >= 0 && taskc->selected_idle_cpu == cpu &&
 	    class_id == SCX_ADAPTIVE_CLASS_LATENCY &&
 	    !cpu_has_local_work(cpu, cpu_state_for(cpu)) &&
@@ -1226,7 +1996,7 @@ void BPF_STRUCT_OPS(adaptive_enqueue, struct task_struct *p, u64 enq_flags)
 	if (!taskc) {
 		scx_bpf_dsq_insert(p, SCX_DSQ_GLOBAL, SCX_SLICE_DFL, enq_flags);
 		STAT_INC(fallback_dispatches);
-		return;
+		goto out;
 	}
 
 	if (is_safe_task(p)) {
@@ -1234,7 +2004,7 @@ void BPF_STRUCT_OPS(adaptive_enqueue, struct task_struct *p, u64 enq_flags)
 		taskc->selected_idle_cpu = -1;
 		taskc->fast_path = 0;
 		fallback_dispatch(p, taskc, enq_flags);
-		return;
+		goto out;
 	}
 	if (__COMPAT_is_enq_cpu_selected(enq_flags) &&
 	    taskc->selected_control_valid &&
@@ -1253,100 +2023,142 @@ void BPF_STRUCT_OPS(adaptive_enqueue, struct task_struct *p, u64 enq_flags)
 	}
 	if (fast_enqueue(p, taskc, class_id, control_flags, enq_flags, now,
 			 scx_bpf_task_cpu(p), false))
-		return;
-	fallback_fast_enqueue(
-		p, taskc, class_id, control_flags, enq_flags, now);
-}
+		goto out;
+	fallback_fast_enqueue(p, taskc, class_id, control_flags, enq_flags, now);
 
-/** Extends an uncontended Throughput epoch without a dequeue/dispatch cycle. */
-static __always_inline bool continue_throughput_task(
-	struct task_struct *prev, s32 cpu, struct adaptive_cpu_state *cpuc)
-{
-	struct task_context *taskc;
-	struct task_control_value *control;
-	struct fast_class_state *classc;
-	u64 consumed;
-	u64 request;
-	u64 now;
+out:
+	/* A non-local ENQ_LAST insert must trigger a follow-up scheduling event. */
+	if (enq_flags & SCX_ENQ_LAST) {
+		s32 cpu = scx_bpf_task_cpu(p);
 
-	if (!prev || !cpuc || cpuc->running_class != SCX_ADAPTIVE_CLASS_THROUGHPUT ||
-	    !(prev->scx.flags & SCX_TASK_QUEUED) ||
-	    scx_bpf_task_cpu(prev) != cpu ||
-	    !bpf_cpumask_test_cpu(cpu, prev->cpus_ptr) ||
-	    __sync_fetch_and_add(&class_queued_tasks, 0) > 0 ||
-	    cpu_has_local_work(cpu, cpuc))
-		return false;
-	taskc = task_ctx_for(prev);
-	if (!taskc || !taskc->fast_path || taskc->observe_fast_events ||
-	    taskc->policy_class != SCX_ADAPTIVE_CLASS_THROUGHPUT)
-		return false;
-	control = fast_control_for(prev, taskc);
-	if (!control || control->class_id != SCX_ADAPTIVE_CLASS_THROUGHPUT ||
-	    (control->flags & SCX_ADAPTIVE_CONTROL_OBSERVE))
-		return false;
-	consumed = taskc->request_ns;
-	if (consumed < min_slice_ns || consumed > max_slice_ns)
-		consumed = throughput_slice_ns;
-	taskc->vruntime_ns += task_virtual_service(prev, consumed);
-	classc = class_state_for(SCX_ADAPTIVE_CLASS_THROUGHPUT);
-	if (classc && classc->virtual_time_ns < taskc->vruntime_ns)
-		classc->virtual_time_ns = taskc->vruntime_ns;
-
-	request = task_request_size(taskc, SCX_ADAPTIVE_CLASS_THROUGHPUT);
-	request = request <= max_slice_ns / 2 ? request * 2 : max_slice_ns;
-	taskc->throughput_epoch_ns = request;
-	taskc->request_ns = request;
-	taskc->request_deadline_ns = taskc->vruntime_ns +
-		task_virtual_service(prev, request);
-	now = bpf_ktime_get_ns();
-	taskc->start_ns = now;
-	prev->scx.slice = request;
-	charge_root_continuation(cpuc, SCX_ADAPTIVE_CLASS_THROUGHPUT, request);
-	STAT_INC(fast_path_prev_continuations);
-	return true;
+		if (cpu >= 0 && cpu < num_possible_cpus)
+			scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
+	}
 }
 
 /** Wakes the control plane when requested and dispatches bounded BPF work. */
 void BPF_STRUCT_OPS(adaptive_dispatch, s32 cpu, struct task_struct *prev)
 {
 	struct adaptive_cpu_state *cpuc = cpu_state_for(cpu);
-	u32 excluded = 0;
+	s64 latency_queued;
+	s64 normal_queued;
+	u64 now = bpf_ktime_get_ns();
+	struct adaptive_policy_control *policy = active_policy(now);
+	u32 budget = policy ? policy->latency_budget_percent :
+		latency_budget_percent;
+	u64 successor_lease_ns = policy ? policy->latency_successor_lease_ns :
+		latency_slice_ns;
+	s64 balance = refresh_latency_budget(cpuc, now, budget);
+	bool remote_latency_queued;
+	bool remote_normal_queued;
+	bool latency_work_queued;
+	bool latency_resched = false;
+	bool balanced_resched = false;
+	bool rescheduled;
+	u32 preemption_victim_class = FAST_NO_RUNNING_CLASS;
 
-	if (cpuc &&
+	/* A missing or stale policy must retain the immutable bounded fallback. */
+	if (!successor_lease_ns || successor_lease_ns > latency_slice_ns)
+		successor_lease_ns = latency_slice_ns;
+
+	if (cpuc)
+		cpuc->latency_dispatch_charged = 0;
+	if (scx_bpf_dispatch_nr_slots() > 0 && cpuc &&
 	    __sync_val_compare_and_swap(&cpuc->urgent_dispatch_id,
-					FAST_BPF_URGENT_DISPATCH_ID, 0) ==
-					FAST_BPF_URGENT_DISPATCH_ID &&
-	    scx_bpf_dispatch_nr_slots() > 0 &&
-	    dispatch_fast_class(
-		cpu, cpu, SCX_ADAPTIVE_CLASS_LATENCY, false)) {
-		STAT_INC(fast_path_preemptions);
-		return;
+					FAST_LATENCY_RESCHED_ID, 0) ==
+					FAST_LATENCY_RESCHED_ID) {
+		latency_resched = true;
+	} else if (scx_bpf_dispatch_nr_slots() > 0 && cpuc &&
+		   __sync_val_compare_and_swap(&cpuc->urgent_dispatch_id,
+					       FAST_BALANCED_RESCHED_ID, 0) ==
+					       FAST_BALANCED_RESCHED_ID) {
+		balanced_resched = true;
 	}
-	if (!specialized_tasks) {
-		if (scx_bpf_dispatch_nr_slots() > 0 &&
-		    dispatch_balanced_only(cpu))
+	rescheduled = latency_resched || balanced_resched;
+	if (rescheduled && cpuc)
+		preemption_victim_class = cpuc->running_class;
+	latency_queued = scx_bpf_dsq_nr_queued(latency_dsq(cpu));
+	normal_queued = scx_bpf_dsq_nr_queued(task_dsq(cpu));
+	latency_work_queued = latency_queued > 0 || shared_latency_depth(cpu) > 0;
+	if (scx_bpf_dispatch_nr_slots() > 0 && latency_work_queued &&
+	    (normal_queued <= 0 || latency_resched ||
+	     (cpuc && balance >= (s64)latency_slice_ns))) {
+		if (dispatch_latency_work(cpu, latency_queued, now)) {
+			if (cpuc && (normal_queued > 0 || latency_resched)) {
+				cpuc->latency_dispatch_charged = 1;
+				STAT_INC(fast_path_latency_backlog_boosts);
+			} else if (cpuc) {
+				cpuc->latency_dispatch_charged = 0;
+			}
+			if (rescheduled)
+				record_fast_preemption(
+					latency_resched ? SCX_ADAPTIVE_CLASS_LATENCY :
+						SCX_ADAPTIVE_CLASS_BALANCED,
+					preemption_victim_class, prev, cpuc, now);
 			return;
-		if (scx_bpf_dispatch_nr_slots() > 0)
-			steal_fast_task(cpu);
+		}
+	}
+	/* Spend available credit on another core only when its burst has backlog. */
+	if (scx_bpf_dispatch_nr_slots() > 0 && cpuc &&
+	    balance >= (s64)latency_slice_ns &&
+	    __sync_fetch_and_add(&shared_latency_queued_tasks, 0) > 0 &&
+	    (dispatch_shared_latency(cpu, now) ||
+	     spill_shared_latency_backlog(cpu, now))) {
+		cpuc->latency_dispatch_charged = 1;
+		STAT_INC(fast_path_latency_backlog_boosts);
 		return;
 	}
-
-	bpf_repeat(SCX_ADAPTIVE_CLASS_COUNT) {
-		s32 class_id;
-
-		if (scx_bpf_dispatch_nr_slots() == 0)
-			break;
-		class_id = select_fast_class(cpuc, cpu, excluded, true);
-		if (class_id < 0)
-			break;
-		if (dispatch_fast_class(cpu, cpu, class_id, false))
+	if (scx_bpf_dispatch_nr_slots() > 0 && normal_queued > 0 &&
+	    dispatch_fast_task(cpu)) {
+		if (rescheduled)
+			record_fast_preemption(
+				latency_resched ? SCX_ADAPTIVE_CLASS_LATENCY :
+					SCX_ADAPTIVE_CLASS_BALANCED,
+				preemption_victim_class, prev, cpuc, now);
+		return;
+	}
+	/* Races must remain work-conserving even when the normal head vanished. */
+	if (scx_bpf_dispatch_nr_slots() > 0 && latency_work_queued &&
+	    dispatch_latency_work(cpu, latency_queued, now)) {
+		if (cpuc)
+			cpuc->latency_dispatch_charged = 0;
+		if (rescheduled)
+			record_fast_preemption(
+				latency_resched ? SCX_ADAPTIVE_CLASS_LATENCY :
+					SCX_ADAPTIVE_CLASS_BALANCED,
+				preemption_victim_class, prev, cpuc, now);
+		return;
+	}
+	if (rescheduled)
+		STAT_INC(fast_path_dispatch_failures);
+	remote_latency_queued =
+		__sync_fetch_and_add(&latency_queued_tasks, 0) > 0;
+	remote_normal_queued =
+		__sync_fetch_and_add(&normal_queued_tasks, 0) > 0;
+	if (scx_bpf_dispatch_nr_slots() > 0 && remote_latency_queued && cpuc &&
+	    balance >= (s64)latency_slice_ns &&
+	    (dispatch_shared_latency(cpu, now) ||
+	     spill_shared_latency_backlog(cpu, now) ||
+	     steal_latency_task(cpu, true))) {
+		cpuc->latency_dispatch_charged = 1;
+		STAT_INC(fast_path_latency_backlog_boosts);
+		return;
+	}
+	if (scx_bpf_dispatch_nr_slots() > 0 &&
+	    dispatch_shared_balanced(cpu))
+		return;
+	if (scx_bpf_dispatch_nr_slots() > 0 && remote_normal_queued &&
+	    steal_fast_task(cpu, now, successor_lease_ns))
+		return;
+	/* Only a truly idle destination rescues Latency without available credit. */
+	if (scx_bpf_dispatch_nr_slots() > 0 && remote_latency_queued &&
+	    (!prev || !(prev->scx.flags & SCX_TASK_QUEUED))) {
+		if (dispatch_shared_latency(cpu, now) ||
+		    rescue_shared_latency_when_idle(cpu, now) ||
+		    steal_latency_task(cpu, false))
 			return;
-		excluded |= 1U << class_id;
+		STAT_INC(fast_path_remote_backlog_no_dispatches);
 	}
-	if (continue_throughput_task(prev, cpu, cpuc))
-		return;
-	if (scx_bpf_dispatch_nr_slots() > 0)
-		steal_fast_task(cpu);
 }
 
 /** Clears the staged slot and reports the actual CPU when a task begins. */
@@ -1363,20 +2175,42 @@ void BPF_STRUCT_OPS(adaptive_running, struct task_struct *p)
 	clear_class_queue_account(taskc);
 	taskc->start_ns = now;
 	cpuc = cpu_state_for(cpu);
+	if (cpuc && taskc->fast_path &&
+	    taskc->policy_class < SCX_ADAPTIVE_CLASS_COUNT) {
+		if (taskc->vruntime_cpu != (s32)cpu) {
+			taskc->vruntime_ns = cpuc->virtual_time_ns;
+			taskc->vruntime_cpu = cpu;
+			if (taskc->request_ns)
+				taskc->request_deadline_ns = taskc->vruntime_ns +
+					task_virtual_service(
+						p, taskc->policy_class,
+						taskc->request_ns);
+		}
+		if (cpuc->virtual_time_ns < taskc->vruntime_ns)
+			cpuc->virtual_time_ns = taskc->vruntime_ns;
+	}
 	if (cpuc) {
 		cpuc->running_class =
 			taskc->policy_class < SCX_ADAPTIVE_CLASS_COUNT ?
 			taskc->policy_class : SCX_ADAPTIVE_CLASS_BALANCED;
 		cpuc->running_started_ns = now;
+		cpuc->running_deadline_ns =
+			taskc->fast_path ? taskc->request_deadline_ns : 0;
+		taskc->latency_budget_charged =
+			taskc->fast_path &&
+			taskc->policy_class == SCX_ADAPTIVE_CLASS_LATENCY &&
+			cpuc->latency_dispatch_charged;
+		cpuc->latency_dispatch_charged = 0;
 	}
 
-	if (taskc->fast_path && taskc->policy_class < SCX_ADAPTIVE_CLASS_COUNT) {
-		struct fast_class_state *classc = class_state_for(taskc->policy_class);
-
-		if (classc && classc->virtual_time_ns < taskc->vruntime_ns)
-			classc->virtual_time_ns = taskc->vruntime_ns;
-	}
+	/* Pre-existing tasks may run once before this scheduler sees an enqueue. */
+	if (!taskc->enqueue_sequence)
+		return;
 	if (taskc->fast_path) {
+		if (taskc->target_cpu >= 0)
+			record_fast_dispatch(
+				taskc->policy_class, taskc->target_cpu != (s32)cpu,
+				taskc->target_cpu, cpu, now);
 		if (taskc->observe_fast_events) {
 			fill_task_event(&event, p, taskc,
 					SCX_ADAPTIVE_EVENT_RUNNING, now);
@@ -1407,11 +2241,58 @@ void BPF_STRUCT_OPS(adaptive_stopping, struct task_struct *p, bool runnable)
 	if (cpuc) {
 		cpuc->running_class = FAST_NO_RUNNING_CLASS;
 		cpuc->running_started_ns = 0;
+		cpuc->running_deadline_ns = 0;
 	}
 	taskc->stop_ns = now;
 	taskc->last_stop_blocked = !runnable;
 	runtime_ns = taskc->start_ns && now >= taskc->start_ns ?
 		     now - taskc->start_ns : 0;
+	if (cpuc && taskc->fast_path) {
+		if (taskc->policy_class == SCX_ADAPTIVE_CLASS_LATENCY)
+			__sync_fetch_and_add(&cpuc->runtime_ns_by_class[0], runtime_ns);
+		else if (taskc->policy_class == SCX_ADAPTIVE_CLASS_BALANCED)
+			__sync_fetch_and_add(&cpuc->runtime_ns_by_class[1], runtime_ns);
+		else if (taskc->policy_class == SCX_ADAPTIVE_CLASS_THROUGHPUT)
+			__sync_fetch_and_add(&cpuc->runtime_ns_by_class[2], runtime_ns);
+	}
+	if (cpuc && taskc->latency_budget_charged)
+		charge_latency_budget(
+			cpuc, now, runtime_ns, active_latency_budget(now));
+	taskc->latency_budget_charged = 0;
+	/* A pre-existing task can stop before its first scheduler enqueue. */
+	if (!taskc->enqueue_sequence) {
+		taskc->target_cpu = -1;
+		return;
+	}
+	/* Sample one in sixteen stops so diagnostics do not become a hot-path cost. */
+	if (taskc->fast_path &&
+	    !(taskc->enqueue_sequence & FAST_PIPELINE_SAMPLE_MASK)) {
+		struct adaptive_global_stats *stats = stats_value();
+		s64 normal_depth = scx_bpf_dsq_nr_queued(task_dsq(cpu));
+		s64 latency_depth = scx_bpf_dsq_nr_queued(latency_dsq(cpu));
+		u32 core_leader = immutable_core_leader_for_cpu(cpu);
+
+		if (core_leader < num_possible_cpus) {
+			s64 shared_depth = scx_bpf_dsq_nr_queued(
+				shared_latency_dsq(core_leader));
+
+			if (shared_depth > 0)
+				latency_depth += shared_depth;
+		}
+
+		if (stats) {
+			if (normal_depth > 0)
+				stats->fast_path_pipeline_normal_depth_sum +=
+					normal_depth;
+			if (latency_depth > 0)
+				stats->fast_path_pipeline_latency_depth_sum +=
+					latency_depth;
+			if (normal_depth > 0 || latency_depth > 0)
+				stats->fast_path_pipeline_ready_samples++;
+			else
+				stats->fast_path_pipeline_empty_samples++;
+		}
+	}
 
 	if (taskc->fast_path) {
 		u64 assigned_ns = taskc->request_ns;
@@ -1420,7 +2301,8 @@ void BPF_STRUCT_OPS(adaptive_stopping, struct task_struct *p, bool runnable)
 		bool interrupted = runnable && assigned_ns &&
 			runtime_ns < assigned_ns * 9 / 10;
 
-		taskc->vruntime_ns += task_virtual_service(p, runtime_ns);
+		taskc->vruntime_ns += task_virtual_service(
+			p, taskc->policy_class, runtime_ns);
 		if (interrupted && remaining_ns >= min_slice_ns) {
 			taskc->request_ns = remaining_ns;
 		} else {
@@ -1469,6 +2351,11 @@ void BPF_STRUCT_OPS(adaptive_dequeue, struct task_struct *p, u64 deq_flags)
 		return;
 	now = bpf_ktime_get_ns();
 	clear_class_queue_account(taskc);
+	/* A pre-attach dequeue has no runnable incarnation to cancel. */
+	if (!taskc->enqueue_sequence) {
+		taskc->target_cpu = -1;
+		return;
+	}
 	if (taskc->fast_path) {
 		taskc->request_ns = 0;
 		taskc->request_deadline_ns = 0;
@@ -1488,6 +2375,47 @@ void BPF_STRUCT_OPS(adaptive_dequeue, struct task_struct *p, u64 deq_flags)
 	taskc->target_cpu = -1;
 }
 
+/** Completes a coalesced wakeup reschedule after one bounded victim granule. */
+void BPF_STRUCT_OPS(adaptive_tick, struct task_struct *p)
+{
+	struct adaptive_cpu_state *cpuc;
+	u32 cpu = bpf_get_smp_processor_id();
+	u64 marker;
+	u64 min_runtime;
+	u64 now;
+
+	cpuc = cpu_state_for(cpu);
+	if (!cpuc ||
+	    cpuc->running_class >= SCX_ADAPTIVE_CLASS_COUNT ||
+	    cpuc->running_class == SCX_ADAPTIVE_CLASS_LATENCY ||
+	    !cpuc->running_started_ns)
+		return;
+	marker = cpuc->urgent_dispatch_id;
+	if (marker != FAST_LATENCY_RESCHED_ID &&
+	    marker != FAST_BALANCED_RESCHED_ID)
+		return;
+	now = bpf_ktime_get_ns();
+	if (now < cpuc->running_started_ns)
+		return;
+	if (marker == FAST_LATENCY_RESCHED_ID) {
+		struct adaptive_policy_control *policy = active_policy(now);
+
+		if (!latency_preemption_time_allowed(cpuc, now, policy))
+			return;
+		cpuc->last_preemption_ns = now;
+		p->scx.slice = 0;
+		return;
+	}
+	min_runtime = active_balanced_granularity(now);
+	if (marker == FAST_BALANCED_RESCHED_ID &&
+	    cpuc->running_class == SCX_ADAPTIVE_CLASS_THROUGHPUT)
+		min_runtime = min_slice_ns *
+			FAST_BALANCED_THROUGHPUT_MIN_RUNTIME_SLICES;
+	if (now - cpuc->running_started_ns < min_runtime)
+		return;
+	p->scx.slice = 0;
+}
+
 /** Updates the BPF-owned per-CPU idle state. */
 static __always_inline void update_cpu_state(s32 cpu, bool idle)
 {
@@ -1502,10 +2430,12 @@ static __always_inline void update_cpu_state(s32 cpu, bool idle)
 		return;
 	cpuc->online = 1;
 	cpuc->idle = idle;
-	if (idle)
+	if (idle) {
 		cpuc->running_class = FAST_NO_RUNNING_CLASS;
-	if (idle)
 		cpuc->running_started_ns = 0;
+		cpuc->running_deadline_ns = 0;
+		cpuc->latency_dispatch_charged = 0;
+	}
 }
 
 /** sched_ext callback wrapper for an idle-state transition. */
@@ -1537,7 +2467,12 @@ void BPF_STRUCT_OPS(adaptive_cpu_offline, s32 cpu)
 	cpuc->urgent_dispatch_id = 0;
 	cpuc->steal_claim = 0;
 	cpuc->running_class = FAST_NO_RUNNING_CLASS;
+	cpuc->latency_dispatch_charged = 0;
 	cpuc->running_started_ns = 0;
+	cpuc->running_deadline_ns = 0;
+	cpuc->latency_credit_ns = 0;
+	cpuc->latency_debt_ns = 0;
+	cpuc->latency_credit_updated_ns = 0;
 }
 
 /** Allocates stable task/process identities before sched_ext enables a task. */
@@ -1583,6 +2518,7 @@ s32 BPF_STRUCT_OPS(adaptive_init_task, struct task_struct *p,
 	taskc->exec_generation = processc->exec_generation;
 	taskc->previous_cpu = -1;
 	taskc->target_cpu = -1;
+	taskc->vruntime_cpu = -1;
 	taskc->selected_idle_cpu = -1;
 	taskc->class_queue_accounted = 0;
 	taskc->selected_class_id = SCX_ADAPTIVE_CLASS_BALANCED;
@@ -1608,7 +2544,6 @@ void BPF_STRUCT_OPS(adaptive_exit_task, struct task_struct *p,
 	if (!taskc)
 		return;
 	clear_class_queue_account(taskc);
-	clear_specialized_task(taskc);
 	fill_task_event(&event, p, taskc, SCX_ADAPTIVE_EVENT_EXIT,
 			bpf_ktime_get_ns());
 	emit_event(&event);
@@ -1632,7 +2567,6 @@ int BPF_PROG(adaptive_process_exec, struct task_struct *p, u32 old_pid,
 	if (!processc || !taskc)
 		return 0;
 	clear_class_queue_account(taskc);
-	clear_specialized_task(taskc);
 	processc->exec_generation++;
 	if (processc->exec_generation == 0)
 		processc->exec_generation++;
@@ -1646,7 +2580,9 @@ int BPF_PROG(adaptive_process_exec, struct task_struct *p, u32 old_pid,
 	taskc->selected_class_id = SCX_ADAPTIVE_CLASS_BALANCED;
 	taskc->selected_control_flags = 0;
 	taskc->selected_control_valid = 0;
+	taskc->latency_budget_charged = 0;
 	taskc->vruntime_ns = 0;
+	taskc->vruntime_cpu = -1;
 	taskc->request_ns = 0;
 	taskc->request_deadline_ns = 0;
 	taskc->throughput_epoch_ns = 0;
@@ -1661,36 +2597,72 @@ int BPF_PROG(adaptive_process_exec, struct task_struct *p, u32 old_pid,
 /** Validates loader parameters before sched_ext takes control of normal tasks. */
 s32 BPF_STRUCT_OPS_SLEEPABLE(adaptive_init)
 {
+	u32 core_index;
 	u32 cpu;
-	u32 class_id;
+	u32 domain_id;
 	s32 ret;
 
-	if (!usersched_pid || !num_possible_cpus ||
+	if (!usersched_pid || !num_possible_cpus || !num_domains ||
+	    !num_core_leaders || num_core_leaders > num_possible_cpus ||
 	    num_possible_cpus > SCX_ADAPTIVE_MAX_CPUS)
+		return -EINVAL;
+	if (num_domains > num_possible_cpus ||
+	    num_domains > SCX_ADAPTIVE_MAX_CPUS)
 		return -EINVAL;
 	if (!min_slice_ns || min_slice_ns > max_slice_ns)
 		return -EINVAL;
-	if (!preemption_min_runtime_ns ||
-	    fast_preemption_interval_ns < preemption_min_runtime_ns)
+	if (!latency_budget_percent || latency_budget_percent > 100 ||
+	    !latency_preemption_interval_ns)
 		return -EINVAL;
 	if (latency_slice_ns < min_slice_ns || latency_slice_ns > max_slice_ns ||
 	    balanced_slice_ns < min_slice_ns || balanced_slice_ns > max_slice_ns ||
 	    throughput_slice_ns < min_slice_ns || throughput_slice_ns > max_slice_ns)
 		return -EINVAL;
 	bpf_for(cpu, 0, SCX_ADAPTIVE_MAX_CPUS) {
+		u32 leader;
+		u32 peer;
+
 		if (cpu >= num_possible_cpus)
 			break;
-		#pragma unroll
-		for (class_id = 0; class_id < SCX_ADAPTIVE_CLASS_COUNT;
-		     class_id++) {
-			ret = scx_bpf_create_dsq(class_dsq(class_id, cpu), -1);
-			if (ret)
-				return ret;
-		}
+		leader = immutable_core_leader_for_cpu(cpu);
+		peer = immutable_core_peer_for_leader(leader);
+		if (immutable_domain_for_cpu(cpu) >= num_domains ||
+		    leader >= num_possible_cpus ||
+		    immutable_core_leader_for_cpu(leader) != leader ||
+		    immutable_domain_for_cpu(leader) != immutable_domain_for_cpu(cpu) ||
+		    peer >= num_possible_cpus ||
+		    immutable_core_leader_for_cpu(peer) != leader ||
+		    immutable_domain_for_cpu(peer) != immutable_domain_for_cpu(leader))
+			return -EINVAL;
+		ret = scx_bpf_create_dsq(task_dsq(cpu), -1);
+		if (ret)
+			return ret;
+		ret = scx_bpf_create_dsq(latency_dsq(cpu), -1);
+		if (ret)
+			return ret;
 	}
-	ret = scx_bpf_create_dsq(FAST_LATENCY_OVERFLOW_DSQ, -1);
-	if (ret)
-		return ret;
+	bpf_for(core_index, 0, SCX_ADAPTIVE_MAX_CPUS) {
+		u32 leader;
+
+		if (core_index >= num_core_leaders)
+			break;
+		leader = immutable_core_leader_at(core_index);
+		if (leader >= num_possible_cpus ||
+		    immutable_core_leader_for_cpu(leader) != leader ||
+		    immutable_domain_for_cpu(leader) >= num_domains)
+			return -EINVAL;
+		ret = scx_bpf_create_dsq(shared_latency_dsq(leader), -1);
+		if (ret)
+			return ret;
+	}
+	bpf_for(domain_id, 0, SCX_ADAPTIVE_MAX_CPUS) {
+		if (domain_id >= num_domains)
+			break;
+		ret = scx_bpf_create_dsq(
+			balanced_overflow_dsq(domain_id), -1);
+		if (ret)
+			return ret;
+	}
 	return 0;
 }
 
@@ -1711,6 +2683,7 @@ SCX_OPS_DEFINE(scx_adaptive,
 	.dispatch		= (void *)adaptive_dispatch,
 	.running		= (void *)adaptive_running,
 	.stopping		= (void *)adaptive_stopping,
+	.tick			= (void *)adaptive_tick,
 	.update_idle		= (void *)adaptive_update_idle,
 	.cpu_online		= (void *)adaptive_cpu_online,
 	.cpu_offline		= (void *)adaptive_cpu_offline,

@@ -23,6 +23,7 @@ use serde_json::{json, Value};
 
 use crate::bpf::DataPlaneStats;
 use crate::identity::{ClassStage, ProcessKey, TaskClass, TaskKey};
+use crate::policy::PolicyStatus;
 use crate::stats::{SchedulerStats, TaskBehaviorWindow};
 
 /// Default local Agent/scheduler control socket.
@@ -152,6 +153,8 @@ pub struct ControlSnapshot {
     pub scheduler: SchedulerStats,
     /// BPF data-plane counters.
     pub data_plane: DataPlaneStats,
+    /// Active atomically published slow-path policy generation.
+    pub policy: PolicyStatus,
     /// Number of possible CPUs represented by the engine.
     pub cpu_count: usize,
     /// Number of live scheduler task records.
@@ -178,10 +181,53 @@ impl Serialize for DataPlaneStats {
             fast_path_events_suppressed: u64,
             fast_path_direct_dispatches: u64,
             fast_path_prev_continuations: u64,
+            fast_path_steal_latency_source_admissions: u64,
+            fast_path_steal_latency_successor_deferrals: u64,
+            fast_path_steal_scan_exhaustions: u64,
+            fast_path_remote_backlog_no_dispatches: u64,
             fast_path_steal_claim_conflicts: u64,
             fast_path_empty_steal_skips: u64,
             fast_path_preemption_throttles: u64,
+            fast_path_preemption_deferrals: u64,
             fast_path_latency_backlog_boosts: u64,
+            fast_path_latency_steal_attempts: u64,
+            fast_path_latency_remote_steals: u64,
+            fast_path_select_migrations_by_class: [u64; 3],
+            fast_path_remote_dispatches_by_class: [u64; 3],
+            fast_path_preemptions_by_class: [u64; 3],
+            fast_path_preemption_victims_by_class: [u64; 3],
+            fast_path_latency_budget_charge_events: u64,
+            fast_path_latency_budget_runtime_ns: u64,
+            fast_path_pipeline_ready_samples: u64,
+            fast_path_pipeline_empty_samples: u64,
+            fast_path_pipeline_normal_depth_sum: u64,
+            fast_path_pipeline_latency_depth_sum: u64,
+            fast_path_throughput_select_migrations_by_locality: [u64; 4],
+            fast_path_throughput_remote_dispatches_by_locality: [u64; 4],
+            fast_path_throughput_preemption_service_bins: [u64; 4],
+            fast_path_throughput_preemption_runtime_bins: [u64; 4],
+            fast_path_throughput_preemption_runtime_ns: u64,
+            fast_path_throughput_preemption_request_ns: u64,
+            fast_path_steal_idle_source_admissions: u64,
+            fast_path_steal_idle_throughput_deferrals: u64,
+            fast_path_latency_select_migrations_by_locality: [u64; 4],
+            fast_path_latency_remote_dispatches_by_locality: [u64; 4],
+            fast_path_latency_remote_steals_preserving_successor: u64,
+            fast_path_latency_remote_steals_fallback: u64,
+            fast_path_latency_idle_source_deferrals: u64,
+            fast_path_latency_selects_by_path: [u64; 4],
+            fast_path_latency_select_migrations_by_path: [u64; 4],
+            fast_path_immediate_preemption_kicks_by_class: [u64; 3],
+            fast_path_select_sync_wakeups_by_class: [u64; 3],
+            fast_path_select_sync_migrations_by_class: [u64; 3],
+            fast_path_shared_balanced_enqueues: u64,
+            fast_path_shared_balanced_dispatch_attempts: u64,
+            fast_path_shared_balanced_dispatches: u64,
+            fast_path_shared_balanced_dispatch_failures: u64,
+            fast_path_shared_latency_enqueues: u64,
+            fast_path_shared_latency_dispatch_attempts: u64,
+            fast_path_shared_latency_dispatches: u64,
+            fast_path_shared_latency_dispatch_failures: u64,
         }
 
         Fields {
@@ -198,10 +244,72 @@ impl Serialize for DataPlaneStats {
             fast_path_events_suppressed: self.fast_path_events_suppressed,
             fast_path_direct_dispatches: self.fast_path_direct_dispatches,
             fast_path_prev_continuations: self.fast_path_prev_continuations,
+            fast_path_steal_latency_source_admissions: self
+                .fast_path_steal_latency_source_admissions,
+            fast_path_steal_latency_successor_deferrals: self
+                .fast_path_steal_latency_successor_deferrals,
+            fast_path_steal_scan_exhaustions: self.fast_path_steal_scan_exhaustions,
+            fast_path_remote_backlog_no_dispatches: self.fast_path_remote_backlog_no_dispatches,
             fast_path_steal_claim_conflicts: self.fast_path_steal_claim_conflicts,
             fast_path_empty_steal_skips: self.fast_path_empty_steal_skips,
             fast_path_preemption_throttles: self.fast_path_preemption_throttles,
+            fast_path_preemption_deferrals: self.fast_path_preemption_deferrals,
             fast_path_latency_backlog_boosts: self.fast_path_latency_backlog_boosts,
+            fast_path_latency_steal_attempts: self.fast_path_latency_steal_attempts,
+            fast_path_latency_remote_steals: self.fast_path_latency_remote_steals,
+            fast_path_select_migrations_by_class: self.fast_path_select_migrations_by_class,
+            fast_path_remote_dispatches_by_class: self.fast_path_remote_dispatches_by_class,
+            fast_path_preemptions_by_class: self.fast_path_preemptions_by_class,
+            fast_path_preemption_victims_by_class: self.fast_path_preemption_victims_by_class,
+            fast_path_latency_budget_charge_events: self.fast_path_latency_budget_charge_events,
+            fast_path_latency_budget_runtime_ns: self.fast_path_latency_budget_runtime_ns,
+            fast_path_pipeline_ready_samples: self.fast_path_pipeline_ready_samples,
+            fast_path_pipeline_empty_samples: self.fast_path_pipeline_empty_samples,
+            fast_path_pipeline_normal_depth_sum: self.fast_path_pipeline_normal_depth_sum,
+            fast_path_pipeline_latency_depth_sum: self.fast_path_pipeline_latency_depth_sum,
+            fast_path_throughput_select_migrations_by_locality: self
+                .fast_path_throughput_select_migrations_by_locality,
+            fast_path_throughput_remote_dispatches_by_locality: self
+                .fast_path_throughput_remote_dispatches_by_locality,
+            fast_path_throughput_preemption_service_bins: self
+                .fast_path_throughput_preemption_service_bins,
+            fast_path_throughput_preemption_runtime_bins: self
+                .fast_path_throughput_preemption_runtime_bins,
+            fast_path_throughput_preemption_runtime_ns: self
+                .fast_path_throughput_preemption_runtime_ns,
+            fast_path_throughput_preemption_request_ns: self
+                .fast_path_throughput_preemption_request_ns,
+            fast_path_steal_idle_source_admissions: self.fast_path_steal_idle_source_admissions,
+            fast_path_steal_idle_throughput_deferrals: self
+                .fast_path_steal_idle_throughput_deferrals,
+            fast_path_latency_select_migrations_by_locality: self
+                .fast_path_latency_select_migrations_by_locality,
+            fast_path_latency_remote_dispatches_by_locality: self
+                .fast_path_latency_remote_dispatches_by_locality,
+            fast_path_latency_remote_steals_preserving_successor: self
+                .fast_path_latency_remote_steals_preserving_successor,
+            fast_path_latency_remote_steals_fallback: self.fast_path_latency_remote_steals_fallback,
+            fast_path_latency_idle_source_deferrals: self.fast_path_latency_idle_source_deferrals,
+            fast_path_latency_selects_by_path: self.fast_path_latency_selects_by_path,
+            fast_path_latency_select_migrations_by_path: self
+                .fast_path_latency_select_migrations_by_path,
+            fast_path_immediate_preemption_kicks_by_class: self
+                .fast_path_immediate_preemption_kicks_by_class,
+            fast_path_select_sync_wakeups_by_class: self.fast_path_select_sync_wakeups_by_class,
+            fast_path_select_sync_migrations_by_class: self
+                .fast_path_select_sync_migrations_by_class,
+            fast_path_shared_balanced_enqueues: self.fast_path_shared_balanced_enqueues,
+            fast_path_shared_balanced_dispatch_attempts: self
+                .fast_path_shared_balanced_dispatch_attempts,
+            fast_path_shared_balanced_dispatches: self.fast_path_shared_balanced_dispatches,
+            fast_path_shared_balanced_dispatch_failures: self
+                .fast_path_shared_balanced_dispatch_failures,
+            fast_path_shared_latency_enqueues: self.fast_path_shared_latency_enqueues,
+            fast_path_shared_latency_dispatch_attempts: self
+                .fast_path_shared_latency_dispatch_attempts,
+            fast_path_shared_latency_dispatches: self.fast_path_shared_latency_dispatches,
+            fast_path_shared_latency_dispatch_failures: self
+                .fast_path_shared_latency_dispatch_failures,
         }
         .serialize(serializer)
     }
@@ -878,6 +986,7 @@ fn invalid_data(message: &str) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::{decode_request, encode_frame, take_frame, ControlRequest, SchedulerMessage};
+    use crate::bpf::DataPlaneStats;
     use serde_json::json;
 
     /// Fixed fixture shared with Agent catches envelope compatibility drift.
@@ -924,5 +1033,56 @@ mod tests {
         )
         .unwrap();
         assert!(frame.len() > 4);
+    }
+
+    /// Diagnostic arrays retain stable names, indexes, and JSON shapes.
+    #[test]
+    fn data_plane_select_diagnostics_serialize() {
+        let value = serde_json::to_value(DataPlaneStats {
+            fast_path_latency_selects_by_path: [1, 2, 3, 4],
+            fast_path_latency_select_migrations_by_path: [5, 6, 7, 8],
+            fast_path_immediate_preemption_kicks_by_class: [9, 10, 0],
+            fast_path_select_sync_wakeups_by_class: [11, 12, 13],
+            fast_path_select_sync_migrations_by_class: [14, 15, 16],
+            fast_path_shared_balanced_enqueues: 17,
+            fast_path_shared_balanced_dispatch_attempts: 18,
+            fast_path_shared_balanced_dispatches: 19,
+            fast_path_shared_balanced_dispatch_failures: 20,
+            fast_path_shared_latency_enqueues: 21,
+            fast_path_shared_latency_dispatch_attempts: 22,
+            fast_path_shared_latency_dispatches: 23,
+            fast_path_shared_latency_dispatch_failures: 24,
+            ..DataPlaneStats::default()
+        })
+        .unwrap();
+
+        assert_eq!(
+            value["fast_path_latency_selects_by_path"],
+            json!([1, 2, 3, 4])
+        );
+        assert_eq!(
+            value["fast_path_latency_select_migrations_by_path"],
+            json!([5, 6, 7, 8])
+        );
+        assert_eq!(
+            value["fast_path_immediate_preemption_kicks_by_class"],
+            json!([9, 10, 0])
+        );
+        assert_eq!(
+            value["fast_path_select_sync_wakeups_by_class"],
+            json!([11, 12, 13])
+        );
+        assert_eq!(
+            value["fast_path_select_sync_migrations_by_class"],
+            json!([14, 15, 16])
+        );
+        assert_eq!(value["fast_path_shared_balanced_enqueues"], 17);
+        assert_eq!(value["fast_path_shared_balanced_dispatch_attempts"], 18);
+        assert_eq!(value["fast_path_shared_balanced_dispatches"], 19);
+        assert_eq!(value["fast_path_shared_balanced_dispatch_failures"], 20);
+        assert_eq!(value["fast_path_shared_latency_enqueues"], 21);
+        assert_eq!(value["fast_path_shared_latency_dispatch_attempts"], 22);
+        assert_eq!(value["fast_path_shared_latency_dispatches"], 23);
+        assert_eq!(value["fast_path_shared_latency_dispatch_failures"], 24);
     }
 }
